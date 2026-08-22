@@ -338,6 +338,24 @@ impl AssistantCommands for WsClient {
         };
         let payload = serde_json::to_string(&request)?;
 
+        // Refuse an oversize request before it is enqueued (#1303). The daemon
+        // caps an inbound WebSocket message at `MAX_WS_MESSAGE_BYTES` and
+        // answers one past the cap by closing the socket, so a single
+        // unsendable request used to fail every request in flight with it.
+        // Failing it here costs the caller that one call and leaves the socket
+        // serving. The UDS client holds itself to the same rule against its own
+        // frame cap. Reachable rather than theoretical: a client-side MCP tool
+        // result is capped at 1 MiB of raw bytes, and JSON escaping multiplies
+        // a control byte by six.
+        if payload.len() > api::MAX_WS_MESSAGE_BYTES {
+            return Err(anyhow!(
+                "request is {} bytes, which is more than the {} byte WebSocket message cap; \
+                 the connection is unaffected",
+                payload.len(),
+                api::MAX_WS_MESSAGE_BYTES
+            ));
+        }
+
         let (tx, rx) = oneshot::channel::<PendingResult>();
         {
             let mut state = self.pending.lock().await;
@@ -816,5 +834,92 @@ mod tests {
             .to_str()
             .expect("base64 header is ASCII");
         assert_eq!(api::decode_client_context(raw), Some(ctx));
+    }
+
+    // --- An oversize request costs one request, not the socket (#1303) -----
+
+    /// A client bound to a channel a test holds, with no socket behind it, so
+    /// a test can see exactly what `send_command` enqueues.
+    fn offline_client(
+        dispatch_timeout: std::time::Duration,
+    ) -> (WsClient, mpsc::UnboundedReceiver<Message>) {
+        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Message>();
+        let (signal_tx, _signal_rx) = mpsc::unbounded_channel();
+        let (drop_tx, _drop_rx) = mpsc::unbounded_channel();
+        (
+            WsClient {
+                conn: Arc::new(Mutex::new(ConnState { outbound_tx })),
+                pending: Arc::new(Mutex::new(PendingState {
+                    map: HashMap::new(),
+                    closed: None,
+                })),
+                signal_tx,
+                drop_tx,
+                dispatch_timeout,
+            },
+            outbound_rx,
+        )
+    }
+
+    /// #1303: a request past the WebSocket message cap fails on the spot. The
+    /// server rejects an oversize message by closing the socket, which fails
+    /// every request in flight - not only the one that was too large. The UDS
+    /// client already refuses before it enqueues; this holds the WebSocket
+    /// client to the same rule.
+    #[tokio::test]
+    async fn an_oversize_websocket_request_fails_before_it_is_enqueued() {
+        let (client, mut outbound_rx) = offline_client(std::time::Duration::from_millis(50));
+
+        let err = client
+            .send_command(api::Command::CreateConversation {
+                title: "t".repeat(api::MAX_WS_MESSAGE_BYTES + 1),
+                tags: Vec::new(),
+            })
+            .await
+            .expect_err("a request past the cap must fail on the spot");
+
+        assert!(
+            err.to_string()
+                .contains(&api::MAX_WS_MESSAGE_BYTES.to_string()),
+            "the failure must name the cap it passed: {err}"
+        );
+        assert!(
+            outbound_rx.try_recv().is_err(),
+            "an oversize request must never reach the writer"
+        );
+        assert!(
+            client.pending.lock().await.map.is_empty(),
+            "a refused request must leave no pending slot behind"
+        );
+        assert!(
+            client.pending.lock().await.closed.is_none(),
+            "one refused request must not close the connection"
+        );
+    }
+
+    /// #1303: the pair of the refusal above. A request inside the cap is
+    /// enqueued exactly as before, so the guard refuses only what the
+    /// transport cannot carry.
+    #[tokio::test]
+    async fn a_websocket_request_inside_the_cap_is_enqueued() {
+        let (client, mut outbound_rx) = offline_client(std::time::Duration::from_millis(50));
+
+        // No reader answers it, so the call ends at its own dispatch timeout.
+        let err = client
+            .send_command(api::Command::CreateConversation {
+                title: "an ordinary title".into(),
+                tags: Vec::new(),
+            })
+            .await
+            .expect_err("nothing answers an offline client");
+
+        assert!(
+            err.to_string().contains("timed out"),
+            "the request must reach the writer and wait, not be refused: {err}"
+        );
+        let sent = outbound_rx
+            .try_recv()
+            .expect("the request must be enqueued");
+        assert!(matches!(sent, Message::Text(_)));
     }
 }

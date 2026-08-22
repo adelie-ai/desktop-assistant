@@ -30,17 +30,22 @@ pub use api::{WsFrame, WsRequest};
 // without taking its own dependency on the dispatcher crate (#728).
 pub use desktop_assistant_transport_dispatch::Capability;
 
-/// Inbound WebSocket message / frame size cap. Mirrors the
-/// length-prefixed frame caps in `crates/uds-interface/src/lib.rs` and
-/// `crates/dbus-bridge/src/transport.rs` so every transport into the
-/// daemon has the same `4 * 1024 * 1024 == 4_194_304`-byte ceiling.
-///
-/// We cap *both* `max_message_size` and `max_frame_size`: the former
-/// keeps an attacker from assembling a giant message out of many
-/// in-cap fragments, and the latter rejects an oversize single frame
-/// before its body is even allocated. Without these, axum defaults to
-/// a 64 MiB message limit (closes SECURITY_AUDIT.md #7).
-pub const MAX_WS_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+/// Inbound WebSocket message / frame size cap, re-exported from the wire-type
+/// crate so the server that enforces it and the client that must not exceed it
+/// name one constant (#1303). Without these caps axum defaults to a 64 MiB
+/// message limit (closes SECURITY_AUDIT.md #7); see
+/// [`api::MAX_WS_MESSAGE_BYTES`] for what the number is and why.
+pub use api::MAX_WS_MESSAGE_BYTES;
+
+// A bounded response must still fit one message, or bounding it would not stop
+// the message being refused (#1303). Both constants live beside the wire types
+// now, and this is the transport that enforces the cap, so the relation is
+// asserted here. Checked at compile time, because a comment stating the
+// relation would not hold anyone to it.
+const _: () = assert!(
+    api::MAX_RESPONSE_BYTES < MAX_WS_MESSAGE_BYTES,
+    "the response byte budget must stay inside the WebSocket message cap"
+);
 
 #[derive(Clone)]
 pub struct WsServerState {
@@ -688,6 +693,53 @@ async fn handle_socket(
     ) -> bool {
         let Ok(text) = serde_json::to_string(&frame) else {
             return true; // unserializable: skip, keep going
+        };
+        // A reply past the message cap fails the ONE request it answers, never
+        // the connection (#1303). A peer reading with the same cap rejects an
+        // oversize message and tears its socket down, so every outstanding
+        // request would fail with it. Responses are bounded where they are
+        // built; this is the backstop under that.
+        let text = if text.len() > MAX_WS_MESSAGE_BYTES {
+            let Some(id) = frame.request_id() else {
+                // An event answers no request, so there is no caller to tell.
+                // Dropping it keeps the connection serving.
+                warn!(
+                    bytes = text.len(),
+                    "dropping an oversize outbound event; no request to fail"
+                );
+                return true;
+            };
+            warn!(
+                bytes = text.len(),
+                request_id = id,
+                "reply exceeds the message cap; failing the request"
+            );
+            let refusal = WsFrame::error(
+                id,
+                format!(
+                    "the reply to this request is {} bytes, past the {MAX_WS_MESSAGE_BYTES} byte transport limit",
+                    text.len()
+                ),
+            );
+            match serde_json::to_string(&refusal) {
+                // The refusal echoes the request id, so it can be oversize
+                // too when the id itself is near the cap. Then there is no
+                // frame that both fits and names the request, and the one
+                // request times out at the caller. Dropping it keeps the
+                // connection serving every other request, which is the whole
+                // point of not tearing down.
+                Ok(t) if t.len() <= MAX_WS_MESSAGE_BYTES => t,
+                Ok(t) => {
+                    warn!(
+                        bytes = t.len(),
+                        "dropping an oversize failure frame; the request id alone is past the cap"
+                    );
+                    return true;
+                }
+                Err(_) => return true,
+            }
+        } else {
+            text
         };
         ws_tx.send(Message::Text(text.into())).await.is_ok()
     }

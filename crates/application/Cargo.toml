@@ -11,6 +11,9 @@ chrono.workspace = true
 desktop-assistant-auth-jwt.workspace = true
 desktop-assistant-core.workspace = true
 desktop-assistant-api-model = { path = "../api-model" }
+# The response byte budget (#1303) is a bound on the bytes the encoder emits,
+# so the helper that measures them is generic over `serde::Serialize`.
+serde.workspace = true
 thiserror.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

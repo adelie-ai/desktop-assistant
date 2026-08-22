@@ -33,7 +33,7 @@ use anyhow::{Result, anyhow};
 use api::{WsFrame, WsRequest};
 use async_trait::async_trait;
 use desktop_assistant_api_model as api;
-use desktop_assistant_frame_codec::{read_frame, write_frame};
+use desktop_assistant_frame_codec::{MAX_FRAME_LEN, exceeds_frame_cap, read_frame, write_frame};
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
@@ -220,6 +220,17 @@ impl UdsClient {
             .map_err(|e| anyhow!("uds handshake write failed: {e}"))?;
 
         // Writer: serialized request bodies -> length-prefixed frames.
+        //
+        // The break needs no signal of its own to the reconnect supervisor.
+        // Leaving this loop drops the write half, which shuts the socket's write
+        // side down; the daemon then reads EOF and closes, the reader below
+        // reaches EOF, and its teardown fails the outstanding requests and fires
+        // `drop_tx`. So the one path that reports a dead connection stays the
+        // reader's, and the writer never reports a second, competing one.
+        //
+        // A body past the frame cap does not reach here: `send_command` refuses
+        // it and fails that one request, so an unsendable request costs the
+        // caller its request and not its connection.
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         tokio::spawn(async move {
             while let Some(body) = outbound_rx.recv().await {
@@ -335,6 +346,22 @@ impl AssistantCommands for UdsClient {
             command,
         };
         let body = serde_json::to_vec(&request)?;
+
+        // Refuse an oversize request here rather than at the writer (#1303).
+        // `write_frame` refuses a body past the cap, and the writer loop breaks
+        // on any error, which costs the connection - so one unsendable request
+        // used to fail every other request in flight with it. Checking before
+        // the request is enqueued keeps the writer and the socket untouched and
+        // fails only the call that cannot be sent. Reachable rather than
+        // theoretical: a client-side MCP tool result is capped at 1 MiB of raw
+        // bytes, and JSON escaping multiplies a control byte by six.
+        if exceeds_frame_cap(&body) {
+            return Err(anyhow!(
+                "request is {} bytes, which is more than the {MAX_FRAME_LEN} byte transport \
+                 frame cap; the connection is unaffected",
+                body.len()
+            ));
+        }
 
         let (tx, rx) = oneshot::channel::<PendingResult>();
         {

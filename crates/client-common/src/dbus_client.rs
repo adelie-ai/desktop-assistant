@@ -569,6 +569,24 @@ impl DbusClient {
         Ok(api::MessagesView {
             total_raw_count: total,
             truncated,
+            // The daemon runs one windowing path for every transport, and the
+            // D-Bus bridge dispatches this call into it, so the window IS cut
+            // to the response byte budget and the daemon DOES set
+            // `size_capped` (#1303). The legacy signature returns
+            // (total, truncated, messages) and has no field to carry it, so
+            // the signal stops at the bridge. `false` here is what this
+            // transport can say, not what the daemon found: a D-Bus caller
+            // cannot tell a cut window from a whole one.
+            size_capped: false,
+            // The legacy signature has no field for the raw index the window
+            // reached either, so the cursor is derived here. It is exact in
+            // cursor mode (`after_count >= 0`) with no role filter. It is
+            // short by the rows a filter removed when one is in force, and it
+            // is wrong in tail mode, where the window ends at the end of the
+            // conversation whatever `after_count` was. A caller that needs an
+            // exact cursor uses a transport that carries `next_after_count`
+            // (UDS or WebSocket).
+            next_after_count: after_count.max(0) as u32 + messages.len() as u32,
             // The D-Bus get_messages predates message ids (#1) and returns only
             // (role, content); leave the id empty — this transport is the
             // producer side, not a windowed-render consumer.
@@ -581,6 +599,14 @@ impl DbusClient {
                     // The legacy D-Bus get_messages path predates persisted
                     // idempotency keys (#570) and returns only (role, content).
                     idempotency_key: None,
+                    // A message larger than the whole response budget comes
+                    // back HEADED from the daemon (#1303), on this path as on
+                    // every other. The legacy signature returns (role, content)
+                    // and has no field for the stored size, so a D-Bus caller
+                    // sees the notice the daemon wrote at the front of the
+                    // content and nothing else. `None` states what this
+                    // transport knows, not that the row is whole.
+                    content_total_bytes: None,
                 })
                 .collect(),
         })

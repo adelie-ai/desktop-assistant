@@ -1309,6 +1309,7 @@ dependencies = [
  "desktop-assistant-api-model",
  "desktop-assistant-auth-jwt",
  "desktop-assistant-core",
+ "serde",
  "serde_json",
  "thiserror 2.0.19",
  "tokio",

@@ -122,7 +122,9 @@ pub type ApiResult<T> = Result<T, ApiError>;
 /// stable code the transport layer needs to build a classified
 /// `api::ErrorDetail` (#804, #895). Used only by the handlers whose service
 /// methods can raise [`desktop_assistant_core::CoreError::InvalidInput`]
-/// today (`CreateConnection`, `UpdateConnection`, `UpsertMcpServer`); every
+/// today (`CreateConnection`, `UpdateConnection`, `UpsertMcpServer`, and the
+/// conversation-title bound on `CreateConversation` / `RenameConversation` /
+/// `SpawnStandaloneAgent`, #1303); every
 /// other `CoreError` variant renders through `Display`, same as the
 /// general, unclassified mapping in
 /// [`DefaultAssistantApiHandler::map_core_err`] — classifying those
@@ -1755,11 +1757,15 @@ where
             }
 
             api::Command::CreateConversation { title, tags } => {
+                // The domain refuses a title past `MAX_TITLE_BYTES` (#1303).
+                // Classified rather than flattened, so a client can tell "your
+                // title is too long" from "the database is down" - the two ask
+                // for different things from whoever is watching.
                 let conv = self
                     .conversations
                     .create_conversation(title, tags)
                     .await
-                    .map_err(Self::map_core_err)?;
+                    .map_err(map_validated_core_err)?;
                 let id = conv.id.0;
                 self.notify_conversation_list_changed(&id);
                 Ok(api::CommandResult::ConversationId { id })
@@ -1774,18 +1780,39 @@ where
                     .list_conversations(max_age_days, include_archived)
                     .await
                     .map_err(Self::map_core_err)?;
-                Ok(api::CommandResult::Conversations(
-                    list.into_iter()
-                        .map(|s| api::ConversationSummary {
+                let summaries: Vec<api::ConversationSummary> = list
+                    .into_iter()
+                    .map(|s| {
+                        // A title is client-written and rides every row, so one
+                        // oversize title used to make the whole list unreadable
+                        // rather than one conversation (#1303).
+                        let title = bound_title(s.title);
+                        api::ConversationSummary {
                             id: s.id.0,
-                            title: s.title,
+                            title: title.text,
                             message_count: s.message_count as u32,
                             updated_at: s.updated_at,
                             archived: s.archived,
                             tags: s.tags,
-                        })
-                        .collect(),
-                ))
+                            title_total_bytes: title.total_bytes,
+                            omitted_trailing_conversations: 0,
+                            omitted_tags: 0,
+                        }
+                    })
+                    .collect();
+                // Bound the ANSWER, not one more field of it (#1303). The title
+                // is bounded above, and `tags` is written by the client too, so
+                // a rule per field leaves the next unbounded field to break the
+                // list the same way. The whole answer is cut to what one
+                // response carries, and says what it left out.
+                let (mut summaries, dropped) = bound_summaries_to_bytes(
+                    summaries,
+                    api::MAX_RESPONSE_BYTES.saturating_sub(conversations_envelope_reservation()),
+                );
+                for summary in &mut summaries {
+                    summary.omitted_trailing_conversations = dropped;
+                }
+                Ok(api::CommandResult::Conversations(summaries))
             }
 
             api::Command::GetConversation { id } => {
@@ -1816,24 +1843,64 @@ where
                     .await
                     .map_err(Self::map_core_err)?;
 
-                Ok(api::CommandResult::Conversation(api::ConversationView {
+                let all: Vec<api::MessageView> = conv
+                    .messages
+                    .into_iter()
+                    .map(|m| api::MessageView {
+                        id: m.id,
+                        role: format!("{:?}", m.role).to_lowercase(),
+                        content: m.content,
+                        idempotency_key: m.idempotency_key,
+                        content_total_bytes: None,
+                    })
+                    .collect();
+
+                // Bound the answer in bytes before it is written (#1303).
+                // Every transport caps one message at 4 MiB, and an answer
+                // past that cap cannot be read at all - the client used to
+                // disconnect on it and the conversation became permanently
+                // unopenable. A partial answer the caller can page is the
+                // better outcome, so the messages are cut to what one
+                // response can carry, newest first.
+                //
+                // The envelope is measured with the widest value the count
+                // can take, so the number this arm is about to write can
+                // never push the answer past the budget.
+                // The one field of the envelope the client writes, so the one
+                // that can take the whole budget (#1303).
+                let title = bound_title(conv.title);
+                let mut view = api::ConversationView {
                     id: conv.id.0,
-                    title: conv.title,
-                    messages: conv
-                        .messages
-                        .into_iter()
-                        .map(|m| api::MessageView {
-                            id: m.id,
-                            role: format!("{:?}", m.role).to_lowercase(),
-                            content: m.content,
-                            idempotency_key: m.idempotency_key,
-                        })
-                        .collect(),
+                    title: title.text,
+                    messages: Vec::new(),
                     warnings: Vec::new(),
                     model_selection,
                     conversation_personality,
                     tool_gate_disabled,
-                }))
+                    omitted_leading_messages: u32::MAX,
+                    title_total_bytes: title.total_bytes,
+                };
+                let envelope = conversation_envelope_reservation(&view);
+                // An envelope past its own cap is a fault, and the reservation
+                // reports the real size rather than a smaller one, so the fault
+                // is visible here (#1303). Answering anyway would give the
+                // messages a share the response cannot hold and put an
+                // unreadable frame on the wire. This one request fails instead,
+                // which costs the caller the request and not the connection.
+                if envelope > MAX_ENVELOPE_BYTES {
+                    return Err(ApiError::Core(format!(
+                        "the conversation's own fields are {envelope} bytes, which is too large \
+                         for one response (the limit is {MAX_ENVELOPE_BYTES} bytes)"
+                    )));
+                }
+                let (messages, dropped) = bound_messages_to_bytes(
+                    all,
+                    api::MAX_RESPONSE_BYTES.saturating_sub(envelope),
+                    KeepEnd::Newest,
+                );
+                view.messages = messages;
+                view.omitted_leading_messages = dropped;
+                Ok(api::CommandResult::Conversation(view))
             }
 
             api::Command::GetMessages {
@@ -1857,6 +1924,7 @@ where
                         role: format!("{:?}", m.role).to_lowercase(),
                         content: m.content,
                         idempotency_key: m.idempotency_key,
+                        content_total_bytes: None,
                     })
                     .collect();
                 Ok(api::CommandResult::Messages(window_messages(
@@ -1864,6 +1932,7 @@ where
                     tail,
                     after_count,
                     &include_roles,
+                    api::MAX_RESPONSE_BYTES,
                 )))
             }
 
@@ -1919,13 +1988,16 @@ where
             }
 
             api::Command::RenameConversation { id, title } => {
+                // Classified for the same reason as `CreateConversation`
+                // above: a title past the cap is refused by the domain, and
+                // the refusal keeps its business code through this layer.
                 self.conversations
                     .rename_conversation(
                         &desktop_assistant_core::domain::ConversationId::from(id.as_str()),
                         title,
                     )
                     .await
-                    .map_err(Self::map_core_err)?;
+                    .map_err(map_validated_core_err)?;
                 self.notify_conversation_list_changed(&id);
                 Ok(api::CommandResult::Ack)
             }
@@ -2810,12 +2882,19 @@ where
                 // the same task-local user scope `handle_command_for`
                 // installed, so the new row is owned by the requesting
                 // user (#105 contract).
-                let title = format!("Standalone: {name}");
+                // The daemon composes this title from a name the client
+                // supplies, so it is bounded rather than refused (#1303):
+                // refusing would fail a spawn over a label the user never saw.
+                // The `Standalone: ` prefix leads, so a cut removes the
+                // client's contribution and the title still says what it is.
+                let title = desktop_assistant_core::domain::bound_generated_title(&format!(
+                    "Standalone: {name}"
+                ));
                 let conv = self
                     .conversations
                     .create_conversation(title.clone(), vec![])
                     .await
-                    .map_err(Self::map_core_err)?;
+                    .map_err(map_validated_core_err)?;
                 let conversation_id = conv.id.0.clone();
 
                 let name_for_kind = name.clone();
@@ -3862,6 +3941,497 @@ fn normalize_empty(value: String) -> Option<String> {
     }
 }
 
+/// Byte length of `value` as JSON, without building the JSON.
+///
+/// The bound in [`bound_messages_to_bytes`] is on **serialized** bytes,
+/// because JSON escaping is the whole difficulty: a control byte costs six
+/// bytes on the wire, so a row well inside the cap in stored bytes can be far
+/// past it once escaped. A raw `content.len()` estimate is not a bound. This
+/// counts what the encoder would actually emit and allocates nothing.
+///
+/// Returns `usize::MAX` for a value that cannot serialize, so a caller treats
+/// it as too large and drops or heads it rather than passing it through
+/// unmeasured. Nothing in `api-model` can fail this way; the arm is here so
+/// the failure cannot become a silent hole in the bound.
+fn serialized_len<T: serde::Serialize>(value: &T) -> usize {
+    struct ByteCounter(usize);
+
+    impl std::io::Write for ByteCounter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = ByteCounter(0);
+    match serde_json::to_writer(&mut counter, value) {
+        Ok(()) => counter.0,
+        Err(_) => usize::MAX,
+    }
+}
+
+/// Which end of a message list survives when the byte budget cannot hold it
+/// all (#1303).
+///
+/// The direction follows the mode, so what the caller keeps is what the caller
+/// can continue from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeepEnd {
+    /// Keep the newest messages and drop the oldest. `GetConversation` and
+    /// `GetMessages` tail mode: a reader opening a conversation reads the end
+    /// of it, and `MessagesView.truncated` already means "older messages were
+    /// dropped".
+    Newest,
+    /// Keep the oldest of the slice and drop the newest. `GetMessages` cursor
+    /// mode (`after_count >= 0`): the caller continues with
+    /// `after_count + returned`, so a gap in the middle would be unreadable.
+    Oldest,
+}
+
+/// Stated at the FRONT of a message this response could only carry the
+/// beginning of (#1303).
+///
+/// At the front, not the end, for the reason `crates/core` states about a
+/// storage-capped tool result: a head is a prefix, so a notice at the front is
+/// the first thing any reader meets, while a notice at the end is reached only
+/// after reading the whole head.
+///
+/// Deliberately offers nothing to read the rest back with. No client-facing
+/// byte-range read exists, and a notice naming a reader with nothing behind it
+/// is worse than one naming none. It says plainly that nothing was destroyed,
+/// because nothing was: this is a read-path bound, and the message is stored
+/// whole.
+fn over_budget_message_notice(total_bytes: usize) -> String {
+    format!(
+        "<message too large to send whole: it is {total_bytes} bytes, which is more \
+         than one response can carry. What follows is the beginning of it. Nothing \
+         was deleted - the whole message is still stored.>\n\n"
+    )
+}
+
+/// Stated at the END of a title this response could only carry the beginning
+/// of (#1303).
+///
+/// At the end, unlike the notice on an over-budget message. A title is an
+/// identifier a reader picks out of a list, so the part that identifies the
+/// conversation must come first; and a bounded title is short enough that a
+/// notice after it is still read. The message notice leads instead, because a
+/// message head can be megabytes and a notice at its end is never reached.
+///
+/// Like the message notice, it offers nothing to read the rest back with, and
+/// it says plainly that nothing was destroyed. The title is stored whole; this
+/// is a bound on what one response carries.
+fn over_budget_title_notice(total_bytes: usize) -> String {
+    format!(
+        " <title cut here: it is {total_bytes} bytes, which is more than a response \
+         carries. Nothing was deleted - the whole title is still stored.>"
+    )
+}
+
+/// The longest prefix of `text` whose serialized length fits `budget`, cut on a
+/// `char` boundary (#1303).
+///
+/// Serialized, not raw: JSON escaping is the whole difficulty, so a raw length
+/// is not a bound. Serialized length never shrinks as the prefix grows, so the
+/// binary search is exact. Returns an empty string when not even one character
+/// fits.
+fn head_string_to_bytes(text: &str, budget: usize) -> &str {
+    if serialized_len(&text) <= budget {
+        return text;
+    }
+    let mut low = 0usize;
+    // Escaping only ever makes a prefix longer than its raw bytes, so the raw
+    // length can never be under the budget once the serialized one is over it.
+    let mut high = text.len().min(budget);
+    while low < high {
+        // Bias up so the loop always makes progress towards `high`.
+        let mut mid = low + (high - low).div_ceil(2);
+        while mid > low && !text.is_char_boundary(mid) {
+            mid -= 1;
+        }
+        if mid == low {
+            break;
+        }
+        if serialized_len(&&text[..mid]) <= budget {
+            low = mid;
+        } else {
+            high = mid - 1;
+            while high > low && !text.is_char_boundary(high) {
+                high -= 1;
+            }
+        }
+    }
+    &text[..low]
+}
+
+/// A conversation title as one response carries it (#1303).
+struct BoundedTitle {
+    /// What the response carries: the stored title when it fits, otherwise a
+    /// head of it with [`over_budget_title_notice`] at the end.
+    text: String,
+    /// The byte length of the STORED title, when `text` is only its head.
+    /// `None` when the title is whole.
+    ///
+    /// The response carries this as `title_total_bytes`, so a cut title is
+    /// machine-readable. The notice inside `text` is prose, and no client can
+    /// tell prose from a title the user typed - so a client that pre-fills a
+    /// rename field would write the cut value back, and
+    /// `rename_conversation` would replace the stored title with it. A
+    /// read-path bound must never become a write.
+    total_bytes: Option<u64>,
+}
+
+/// Cut `title` to [`api::MAX_TITLE_BYTES`] serialized bytes, stating the loss
+/// at the end of what is kept and reporting the stored size (#1303).
+///
+/// A LEGACY BACKSTOP, not the working bound. A title is bounded where it is
+/// written now: `desktop_assistant_core::domain::check_title_bound` refuses a
+/// client-supplied title past the cap, and
+/// `desktop_assistant_core::domain::bound_generated_title` cuts one the daemon
+/// composes for itself. So nothing stored from this change onward can reach
+/// this function's cut.
+///
+/// It stays because a write rule cannot repair a title that is already stored,
+/// and a row written before that rule existed can be any size. One such title
+/// took the whole response budget on its own: every message was dropped and
+/// the answer was oversize anyway, so the conversation failed to open on every
+/// attempt, and the conversation list failed the same way.
+///
+/// A title inside the budget is returned untouched and unmarked, so an
+/// ordinary response is byte-identical to the one it was before.
+fn bound_title(title: String) -> BoundedTitle {
+    if serialized_len(&title) <= api::MAX_TITLE_BYTES {
+        return BoundedTitle {
+            text: title,
+            total_bytes: None,
+        };
+    }
+    let total_bytes = title.len() as u64;
+    let notice = over_budget_title_notice(title.len());
+    // Both lengths count the two quote bytes of their own JSON string, and the
+    // joined string has one pair, so this reserves two bytes more than the
+    // notice needs. Erring high can only make the result smaller.
+    let room = api::MAX_TITLE_BYTES.saturating_sub(serialized_len(&notice));
+    BoundedTitle {
+        text: format!("{}{notice}", head_string_to_bytes(&title, room)),
+        total_bytes: Some(total_bytes),
+    }
+}
+
+/// The longest head of `message` whose serialized size fits `budget`, with
+/// [`over_budget_message_notice`] at the front and the true stored size on
+/// `content_total_bytes`.
+///
+/// Used only when one message alone is past the budget. The alternative -
+/// dropping the row - would leave a conversation of one large message with an
+/// empty response, which is the failure this bound exists to remove.
+///
+/// The cut lands on a `char` boundary, so the head is valid UTF-8. The search
+/// measures real serialized output at each step rather than modelling the
+/// encoder's escape table, so it holds whatever the encoder does with a byte.
+///
+/// One bound worth stating: at a budget too small to hold the notice and the
+/// surrounding JSON, the result is the notice alone and can still exceed the
+/// budget. The real budget is [`api::MAX_RESPONSE_BYTES`] and the notice is a
+/// couple of hundred bytes, so this cannot be reached in service; an empty
+/// response would be the worse answer if it were.
+fn head_message_to_bytes(message: &api::MessageView, budget: usize) -> api::MessageView {
+    let total_bytes = message.content.len();
+    let notice = over_budget_message_notice(total_bytes);
+
+    let candidate = |cut: usize| -> api::MessageView {
+        let mut head = String::with_capacity(notice.len() + cut);
+        head.push_str(&notice);
+        head.push_str(&message.content[..cut]);
+        api::MessageView {
+            content: head,
+            content_total_bytes: Some(total_bytes as u64),
+            ..message.clone()
+        }
+    };
+
+    // Serialized length never shrinks as the head grows, so binary search is
+    // exact. The upper bound is `budget`, because escaping only ever makes the
+    // content longer than its raw bytes.
+    let mut low = 0usize;
+    let mut high = total_bytes.min(budget);
+    while low < high {
+        // Bias up so the loop always makes progress towards `high`.
+        let mut mid = low + (high - low).div_ceil(2);
+        while mid > low && !message.content.is_char_boundary(mid) {
+            mid -= 1;
+        }
+        if mid == low {
+            break;
+        }
+        if serialized_len(&candidate(mid)) <= budget {
+            low = mid;
+        } else {
+            high = mid - 1;
+            while high > low && !message.content.is_char_boundary(high) {
+                high -= 1;
+            }
+        }
+    }
+    candidate(low)
+}
+
+/// Bound `messages` to `budget` serialized bytes, keeping the end named by
+/// `keep` (#1303).
+///
+/// Returns the messages that fit and how many were dropped from the other end.
+/// When not even one message fits, the boundary message is headed rather than
+/// dropped, so the answer is never empty because one row was too large.
+///
+/// Each message is charged its own serialized length plus one byte for the
+/// comma that joins it to the next, which is one byte more than the last
+/// element needs. Erring high by one byte per message keeps the arithmetic
+/// obvious and can only make the result smaller than the budget.
+fn bound_messages_to_bytes(
+    messages: Vec<api::MessageView>,
+    budget: usize,
+    keep: KeepEnd,
+) -> (Vec<api::MessageView>, u32) {
+    let total = messages.len();
+    let mut used = 0usize;
+    let mut fits = 0usize;
+    for offset in 0..total {
+        let index = match keep {
+            KeepEnd::Newest => total - 1 - offset,
+            KeepEnd::Oldest => offset,
+        };
+        let cost = serialized_len(&messages[index]).saturating_add(1);
+        if used.saturating_add(cost) > budget {
+            break;
+        }
+        used += cost;
+        fits += 1;
+    }
+
+    if fits == 0 {
+        let Some(boundary) = (match keep {
+            KeepEnd::Newest => messages.last(),
+            KeepEnd::Oldest => messages.first(),
+        }) else {
+            return (Vec::new(), 0);
+        };
+        // One byte for the comma charge above, so a headed message is measured
+        // the same way a whole one is.
+        let headed = head_message_to_bytes(boundary, budget.saturating_sub(1));
+        return (vec![headed], (total - 1) as u32);
+    }
+
+    let kept = match keep {
+        KeepEnd::Newest => messages[total - fits..].to_vec(),
+        KeepEnd::Oldest => messages[..fits].to_vec(),
+    };
+    (kept, (total - fits) as u32)
+}
+
+/// Bytes to set aside for a [`api::MessagesView`]'s own fields, so the rest of
+/// the budget belongs to its messages (#1303).
+///
+/// Reserved at the WIDEST the envelope can be, because the budget is split
+/// before the flags are known: `window_messages` decides `truncated` and
+/// `size_capped` from how much it had to cut, which it cannot know until after
+/// it has cut. Reserving at a guessed value would let the numbers this code is
+/// about to write push the answer past the budget.
+///
+/// Which boolean value is wider is not obvious and differs per field.
+/// `truncated` is always emitted, so `false` costs one byte MORE than `true`;
+/// `size_capped` is omitted at `false`, so it costs more when `true`. Measuring
+/// every combination removes the guess, and keeps this correct if a field's
+/// serde attributes change. The counters are reserved at `u32::MAX`, which has
+/// as many digits as any value they could take.
+fn messages_envelope_reservation() -> usize {
+    let mut widest = 0;
+    for truncated in [false, true] {
+        for size_capped in [false, true] {
+            widest = widest.max(serialized_len(&api::MessagesView {
+                total_raw_count: u32::MAX,
+                truncated,
+                messages: Vec::new(),
+                size_capped,
+                next_after_count: u32::MAX,
+            }));
+        }
+    }
+    widest
+}
+
+/// Bytes to set aside for the `ListConversations` answer's own JSON, so the
+/// rest of the budget belongs to the summaries (#1303).
+///
+/// Measured from the empty answer rather than stated as a number, so it stays
+/// right if the result variant is renamed or re-shaped.
+fn conversations_envelope_reservation() -> usize {
+    serialized_len(&api::CommandResult::Conversations(Vec::new()))
+}
+
+/// What one summary costs the answer: its widest serialized form, plus one
+/// byte for the comma that joins it to the next (#1303).
+///
+/// Both counters are measured at `u32::MAX`, because neither is known when the
+/// row is charged: `omitted_trailing_conversations` is decided after the whole
+/// list has been cut, and `omitted_tags` after this row has. Charging the
+/// widest value means the numbers this code is about to write cannot push the
+/// answer past the budget. One byte more than the last row needs; erring high
+/// can only make the answer smaller.
+fn summary_charge(summary: &api::ConversationSummary) -> usize {
+    serialized_len(&api::ConversationSummary {
+        omitted_trailing_conversations: u32::MAX,
+        omitted_tags: u32::MAX,
+        ..summary.clone()
+    })
+    .saturating_add(1)
+}
+
+/// The row as it fits `room`, cutting tags from the END of its tag list when
+/// that is what makes it fit; `None` when it does not fit even with no tags
+/// (#1303).
+///
+/// `tags` is written by the client and validated nowhere, so one row's tags
+/// can be larger than a whole response. Cutting them keeps the row in the
+/// list, because a conversation the caller cannot see at all is worse than a
+/// conversation shown with fewer tags - the same reason a single over-budget
+/// message comes back headed rather than dropped.
+///
+/// The charge grows monotonically with the number of tags kept, so the largest
+/// prefix that fits is found by binary search. That measures the real
+/// serialized row a few times rather than modelling what the `tags` field
+/// costs when it is present, and it stays right whatever serde does with an
+/// empty list.
+fn fit_summary(
+    mut summary: api::ConversationSummary,
+    room: usize,
+) -> Option<api::ConversationSummary> {
+    if summary_charge(&summary) <= room {
+        return Some(summary);
+    }
+    let tags = std::mem::take(&mut summary.tags);
+    // With no tags at all the row is as small as it can be. When even that
+    // does not fit, the budget is spent and the row belongs to the part the
+    // answer leaves out.
+    if summary_charge(&summary) > room {
+        return None;
+    }
+    let (mut low, mut high) = (0usize, tags.len());
+    while low < high {
+        // Bias up so the loop always makes progress towards `high`.
+        let mid = low + (high - low).div_ceil(2);
+        summary.tags = tags[..mid].to_vec();
+        if summary_charge(&summary) <= room {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    summary.omitted_tags = (tags.len() - low) as u32;
+    summary.tags = tags.into_iter().take(low).collect();
+    Some(summary)
+}
+
+/// Bound `summaries` to `budget` serialized bytes, keeping the FRONT of the
+/// list (#1303).
+///
+/// Returns the summaries that fit and how many were left out. The front is
+/// kept because the daemon orders the list by how recently each conversation
+/// changed, so the front is what a sidebar shows first and what a reader is
+/// most likely to want.
+///
+/// The whole answer is bounded here, rather than each of its fields where
+/// somebody notices one. The title was bounded and `tags` was not, so the list
+/// stayed breakable through the field beside the bounded one.
+fn bound_summaries_to_bytes(
+    summaries: Vec<api::ConversationSummary>,
+    budget: usize,
+) -> (Vec<api::ConversationSummary>, u32) {
+    let total = summaries.len();
+    let mut used = 0usize;
+    let mut kept: Vec<api::ConversationSummary> = Vec::with_capacity(total);
+
+    for (index, summary) in summaries.into_iter().enumerate() {
+        let Some(row) = fit_summary(summary, budget.saturating_sub(used)) else {
+            return (kept, (total - index) as u32);
+        };
+        used = used.saturating_add(summary_charge(&row));
+        kept.push(row);
+    }
+    (kept, 0)
+}
+
+/// The most of [`api::MAX_RESPONSE_BYTES`] a response's own fields may take,
+/// so the message list is always left a usable share (#1303).
+///
+/// The envelope is measured from real values, and one of those values - the
+/// conversation title - is written by the client. A title past the budget made
+/// the reservation take the whole of it: the message budget fell to zero,
+/// every message was dropped, and the answer was oversize anyway.
+///
+/// This is a LIMIT the measurement is checked against, not a clamp applied to
+/// it. Clamping the measurement down was the same defect wearing the opposite
+/// sign: a 1 MiB envelope reported itself as 384 KiB, so the messages were
+/// given 2.6 MiB the response could not hold and the answer went past the
+/// budget again. A reservation must err high, and an envelope that genuinely
+/// passes this limit is a fault, so `GetConversation` fails that one request
+/// and names the size rather than answering with something no transport can
+/// carry.
+///
+/// Three separate things hold the answer together, and this is the middle one:
+/// `bound_title` keeps the one client-written field small, this limit turns
+/// any other field that grows into one failed request, and the frame codec
+/// refuses an oversize frame so the connection survives either way.
+const MAX_ENVELOPE_BYTES: usize = api::MAX_RESPONSE_BYTES / 8;
+
+// What the limit buys: an envelope inside it always leaves the messages a
+// share of the budget, so the subtraction that gives them their share can
+// never yield zero. An envelope outside it never reaches that subtraction.
+const _: () = assert!(
+    MAX_ENVELOPE_BYTES < api::MAX_RESPONSE_BYTES,
+    "an accepted envelope must always leave budget for messages"
+);
+
+// The bound on the one client-written field sits well under the cap on the
+// whole envelope, so a title can never be what makes the cap fire.
+const _: () = assert!(
+    api::MAX_TITLE_BYTES < MAX_ENVELOPE_BYTES,
+    "a bounded title must fit the envelope with room for the other fields"
+);
+
+// One number, two jobs. The domain decides what a title may be when it is
+// WRITTEN; the constant above decides what a response carries. This crate is
+// the one that sees both, so it is where they are held together. A backstop
+// under the write bound would cut a title the write path had just accepted,
+// which is the read-path loss this work exists to remove.
+const _: () = assert!(
+    desktop_assistant_core::domain::MAX_TITLE_BYTES == api::MAX_TITLE_BYTES,
+    "the title write bound and the response backstop must be one number"
+);
+
+/// Bytes to set aside for a [`api::ConversationView`]'s own fields, so the rest
+/// of the budget belongs to its messages (#1303).
+///
+/// Every field except `messages` and `omitted_leading_messages` is already
+/// known and is measured as it is. `omitted_leading_messages` is not known
+/// until the cut has happened, so it is reserved at `u32::MAX`, which has as
+/// many digits as any count it could take.
+///
+/// The result errs HIGH and is never clamped. A reservation exists to keep the
+/// rest of the answer inside the budget, so one that reads smaller than the
+/// thing it stands for is worse than none: the messages are then given a share
+/// the response cannot hold. The caller checks the result against
+/// [`MAX_ENVELOPE_BYTES`] and fails the one request when it is past it.
+fn conversation_envelope_reservation(view: &api::ConversationView) -> usize {
+    serialized_len(&api::ConversationView {
+        messages: Vec::new(),
+        omitted_leading_messages: u32::MAX,
+        ..view.clone()
+    })
+}
+
 /// Windowed-message slicing for `Command::GetMessages` (CC-5 / #361), mirroring
 /// the D-Bus `get_messages` semantics so the bridge maps the two 1:1:
 /// `after_count >= 0` slices from that raw index onward (a stable position
@@ -3870,34 +4440,78 @@ fn normalize_empty(value: String) -> Option<String> {
 /// the D-Bus method. `total_raw_count` is always the pre-slice message count so
 /// the client knows how much history exists; `truncated` is set only in tail
 /// mode when older messages were dropped.
+///
+/// `budget` is the whole response's serialized byte budget (#1303). The window
+/// is cut to fit it after the position slice, the role filter and the tail
+/// count have been applied, because those decide *which* messages the caller
+/// asked for and this decides how many of them one response can carry. A
+/// window cut this way sets `size_capped`, and in tail mode `truncated` too -
+/// tail mode drops the OLDEST, which is exactly what `truncated` means, while
+/// cursor mode drops the newest so the caller continues forward.
+///
+/// `next_after_count` is the raw index the window ended at, so the caller never
+/// derives its own cursor. Each message keeps its raw index through the role
+/// filter for this: `after_count` counts raw rows while `messages` counts what
+/// the filter let through, so a cursor derived as `after_count + messages.len()`
+/// names an earlier row than the window really reached and re-reads rows.
 fn window_messages(
     all: Vec<api::MessageView>,
     tail: i32,
     after_count: i32,
     include_roles: &[String],
+    budget: usize,
 ) -> api::MessagesView {
     let total = all.len() as u32;
     let use_after = after_count >= 0;
-    let sliced: Vec<api::MessageView> = if use_after {
-        let start = (after_count as usize).min(all.len());
-        all[start..].to_vec()
+    let start = if use_after {
+        (after_count as usize).min(all.len())
     } else {
-        all
+        0
     };
-    let filtered: Vec<api::MessageView> = sliced
+    let indexed: Vec<(usize, api::MessageView)> = all
         .into_iter()
-        .filter(|m| include_roles.is_empty() || include_roles.contains(&m.role))
+        .enumerate()
+        .skip(start)
+        .filter(|(_, m)| include_roles.is_empty() || include_roles.contains(&m.role))
         .collect();
-    let (truncated, messages) = if !use_after && tail > 0 && filtered.len() > tail as usize {
-        let start = filtered.len() - tail as usize;
-        (true, filtered[start..].to_vec())
+    let (truncated, indexed) = if !use_after && tail > 0 && indexed.len() > tail as usize {
+        let start = indexed.len() - tail as usize;
+        (true, indexed[start..].to_vec())
     } else {
-        (false, filtered)
+        (false, indexed)
     };
+    let (raw_indexes, messages): (Vec<usize>, Vec<api::MessageView>) = indexed.into_iter().unzip();
+
+    let envelope = messages_envelope_reservation();
+    let keep = if use_after {
+        KeepEnd::Oldest
+    } else {
+        KeepEnd::Newest
+    };
+    let (messages, dropped) =
+        bound_messages_to_bytes(messages, budget.saturating_sub(envelope), keep);
+
+    // Which raw index the window reached follows the end that survived the cut.
+    // `KeepEnd::Oldest` keeps the front of the slice, so the window ends at the
+    // last message it kept; `KeepEnd::Newest` keeps the back, so it ends at the
+    // last of the slice whatever was dropped from the front. A headed message
+    // is one kept message, so both cases hold when nothing fitted whole.
+    let last_raw = match keep {
+        KeepEnd::Newest => raw_indexes.last().copied(),
+        KeepEnd::Oldest => messages
+            .len()
+            .checked_sub(1)
+            .and_then(|i| raw_indexes.get(i).copied()),
+    };
+
     api::MessagesView {
         total_raw_count: total,
-        truncated,
+        truncated: truncated || (dropped > 0 && !use_after),
         messages,
+        size_capped: dropped > 0,
+        // An empty window has read to the end, so it names the end. Anything
+        // else would send a walk back over rows it has already seen.
+        next_after_count: last_raw.map_or(total, |i| i as u32 + 1),
     }
 }
 
@@ -4188,7 +4802,17 @@ where
                 let _ = sink
                     .emit(api::Event::ConversationTitleChanged {
                         conversation_id,
-                        title: conv.title,
+                        // Bounded like a response title (#1303). An event
+                        // carries no request id, so an oversize one is dropped
+                        // with no substitute and no client learns the title
+                        // changed at all.
+                        //
+                        // This signature carries no `title_total_bytes`, so a
+                        // client cannot tell a cut title from a whole one here.
+                        // A client that pre-fills a rename field must take the
+                        // title from `GetConversation` or `ListConversations`,
+                        // which do carry the marker, and never from this event.
+                        title: bound_title(conv.title).text,
                     })
                     .await;
             }
@@ -5885,6 +6509,125 @@ mod tests {
         }
     }
 
+    /// A conversation service that records every title it was asked to store,
+    /// so a test can read the title the daemon composed for itself (#1303).
+    struct RecordTitleConversations(Arc<Mutex<Vec<String>>>);
+    #[async_trait::async_trait]
+    impl ConversationService for RecordTitleConversations {
+        async fn create_conversation(
+            &self,
+            title: String,
+            _tags: Vec<String>,
+        ) -> Result<Conversation, CoreError> {
+            self.0.lock().unwrap().push(title.clone());
+            Ok(Conversation::new("c1", title))
+        }
+        async fn list_conversations(
+            &self,
+            _max_age_days: Option<u32>,
+            _include_archived: bool,
+        ) -> Result<Vec<ConversationSummary>, CoreError> {
+            Ok(vec![])
+        }
+        async fn get_conversation(&self, id: &ConversationId) -> Result<Conversation, CoreError> {
+            Ok(Conversation::new(id.as_str(), "t"))
+        }
+        async fn delete_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn rename_conversation(
+            &self,
+            _id: &ConversationId,
+            title: String,
+        ) -> Result<(), CoreError> {
+            self.0.lock().unwrap().push(title);
+            Ok(())
+        }
+        async fn archive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn unarchive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn clear_all_history(&self) -> Result<u32, CoreError> {
+            Ok(0)
+        }
+        async fn send_prompt(
+            &self,
+            _conversation_id: &ConversationId,
+            _prompt: String,
+            mut on_chunk: ChunkCallback,
+            _on_status: StatusCallback,
+        ) -> Result<String, CoreError> {
+            on_chunk("ok".into());
+            Ok("ok".into())
+        }
+    }
+
+    /// A conversation service that refuses every title the way the domain
+    /// does, so a test can prove the refusal keeps its business code on the
+    /// way through this layer rather than being flattened to prose (#1303).
+    struct RefusingConversations;
+    #[async_trait::async_trait]
+    impl ConversationService for RefusingConversations {
+        async fn create_conversation(
+            &self,
+            _title: String,
+            _tags: Vec<String>,
+        ) -> Result<Conversation, CoreError> {
+            Err(refusal())
+        }
+        async fn list_conversations(
+            &self,
+            _max_age_days: Option<u32>,
+            _include_archived: bool,
+        ) -> Result<Vec<ConversationSummary>, CoreError> {
+            Ok(vec![])
+        }
+        async fn get_conversation(&self, id: &ConversationId) -> Result<Conversation, CoreError> {
+            Ok(Conversation::new(id.as_str(), "t"))
+        }
+        async fn delete_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn rename_conversation(
+            &self,
+            _id: &ConversationId,
+            _title: String,
+        ) -> Result<(), CoreError> {
+            Err(refusal())
+        }
+        async fn archive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn unarchive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn clear_all_history(&self) -> Result<u32, CoreError> {
+            Ok(0)
+        }
+        async fn send_prompt(
+            &self,
+            _conversation_id: &ConversationId,
+            _prompt: String,
+            mut on_chunk: ChunkCallback,
+            _on_status: StatusCallback,
+        ) -> Result<String, CoreError> {
+            on_chunk("ok".into());
+            Ok("ok".into())
+        }
+    }
+
+    /// The refusal the domain raises for a title past its cap.
+    fn refusal() -> CoreError {
+        CoreError::InvalidInput {
+            code: "conversation_title_too_long",
+            description: "a conversation title is 5000 serialized bytes; the limit is 4096"
+                .to_string(),
+            message: "That title is too long. Use a shorter one.".to_string(),
+        }
+    }
+
     /// A conversation service whose turn reports that the provenance gate
     /// closed (#741), the way the core loop does when a tool result brings in
     /// externally-controlled bytes.
@@ -6188,6 +6931,7 @@ mod tests {
             role: role.into(),
             content: content.into(),
             idempotency_key: None,
+            content_total_bytes: None,
         }
     }
 
@@ -6198,7 +6942,7 @@ mod tests {
             mv("2", "assistant", "b"),
             mv("3", "user", "c"),
         ];
-        let w = window_messages(all, 2, -1, &[]);
+        let w = window_messages(all, 2, -1, &[], usize::MAX);
         assert_eq!(w.total_raw_count, 3, "total is the full pre-slice count");
         assert!(w.truncated, "tail dropped older messages");
         assert_eq!(
@@ -6215,7 +6959,7 @@ mod tests {
             mv("2", "assistant", "b"),
             mv("3", "user", "c"),
         ];
-        let w = window_messages(all, 0, 1, &[]);
+        let w = window_messages(all, 0, 1, &[], usize::MAX);
         assert_eq!(w.total_raw_count, 3);
         assert!(
             !w.truncated,
@@ -6235,7 +6979,7 @@ mod tests {
             mv("3", "user", "c"),
             mv("4", "tool", "d"),
         ];
-        let w = window_messages(all, 0, -1, &["user".to_string()]);
+        let w = window_messages(all, 0, -1, &["user".to_string()], usize::MAX);
         assert_eq!(w.total_raw_count, 4, "total counts every role, pre-filter");
         assert_eq!(
             w.messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
@@ -6247,16 +6991,1416 @@ mod tests {
     #[test]
     fn window_messages_tail_within_limit_is_not_truncated() {
         let all = vec![mv("1", "user", "a"), mv("2", "assistant", "b")];
-        let w = window_messages(all, 5, -1, &[]);
+        let w = window_messages(all, 5, -1, &[], usize::MAX);
         assert!(!w.truncated);
         assert_eq!(w.messages.len(), 2);
     }
 
     #[test]
     fn window_messages_after_count_past_end_is_empty() {
-        let w = window_messages(vec![mv("1", "user", "a")], 0, 9, &[]);
+        let w = window_messages(vec![mv("1", "user", "a")], 0, 9, &[], usize::MAX);
         assert_eq!(w.total_raw_count, 1);
         assert!(w.messages.is_empty());
+    }
+
+    // --- Response byte budget (#1303) --------------------------------------
+    //
+    // Every transport caps one message at 4 MiB, and nothing used to bound a
+    // conversation response against that cap. The daemon wrote the oversize
+    // frame, the client's reader rejected it and tore the connection down, and
+    // the conversation became permanently unopenable. These tests hold the
+    // response to a byte budget so the answer is partial instead.
+
+    /// A conversation service that answers with exactly the messages a test
+    /// gives it, so a test can drive a response past the byte budget.
+    struct SizedConversations {
+        rows: Vec<(Role, String)>,
+        title: String,
+        summaries: Vec<ConversationSummary>,
+        /// The model id the conversation's stored selection carries. A field
+        /// of the response ENVELOPE that no bound of its own holds, so a test
+        /// drives the envelope past its cap through this rather than through
+        /// the title, which `bound_title` already keeps small.
+        model_id: Option<String>,
+    }
+
+    impl SizedConversations {
+        /// `count` messages of `bytes` ASCII bytes each, alternating roles.
+        fn uniform(count: usize, bytes: usize) -> Self {
+            Self {
+                rows: (0..count)
+                    .map(|i| {
+                        let role = if i % 2 == 0 {
+                            Role::User
+                        } else {
+                            Role::Assistant
+                        };
+                        (role, format!("{i:04}").repeat(bytes / 4))
+                    })
+                    .collect(),
+                title: "t".into(),
+                summaries: Vec::new(),
+                model_id: None,
+            }
+        }
+
+        /// One small message under a stored model selection whose model id is
+        /// `model_id`, so a test drives the response envelope past its cap.
+        fn with_model_id(model_id: &str) -> Self {
+            Self {
+                rows: vec![(Role::User, "hello".into())],
+                title: "t".into(),
+                summaries: Vec::new(),
+                model_id: Some(model_id.into()),
+            }
+        }
+
+        /// Exactly the rows given, for a test that needs particular content
+        /// rather than a uniform size.
+        fn with_rows(rows: Vec<(Role, String)>) -> Self {
+            Self {
+                rows,
+                title: "t".into(),
+                summaries: Vec::new(),
+                model_id: None,
+            }
+        }
+
+        /// One small message under `title`, so a test drives the response
+        /// ENVELOPE past the budget rather than the message list.
+        fn with_title(title: &str) -> Self {
+            Self {
+                rows: vec![(Role::User, "hello".into())],
+                title: title.into(),
+                summaries: Vec::new(),
+                model_id: None,
+            }
+        }
+
+        /// The conversation list a `ListConversations` answer is built from.
+        fn with_summaries(summaries: Vec<ConversationSummary>) -> Self {
+            Self {
+                rows: Vec::new(),
+                title: "t".into(),
+                summaries,
+                model_id: None,
+            }
+        }
+    }
+
+    /// A list row with the given id and title, and nothing else of interest.
+    fn summary(id: &str, title: &str) -> ConversationSummary {
+        ConversationSummary {
+            id: ConversationId::from(id),
+            title: title.into(),
+            created_at: "2026-01-01 00:00:00".into(),
+            updated_at: "2026-01-01 00:00:00".into(),
+            message_count: 0,
+            archived: false,
+            tags: Vec::new(),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ConversationService for SizedConversations {
+        async fn create_conversation(
+            &self,
+            title: String,
+            _tags: Vec<String>,
+        ) -> Result<Conversation, CoreError> {
+            Ok(Conversation::new("c1", title))
+        }
+        async fn list_conversations(
+            &self,
+            _max_age_days: Option<u32>,
+            _include_archived: bool,
+        ) -> Result<Vec<ConversationSummary>, CoreError> {
+            Ok(self.summaries.clone())
+        }
+        async fn get_conversation_model_selection(
+            &self,
+            _id: &ConversationId,
+        ) -> Result<Option<ConversationModelSelection>, CoreError> {
+            Ok(self
+                .model_id
+                .as_ref()
+                .map(|model_id| ConversationModelSelection {
+                    connection_id: "conn".into(),
+                    model_id: model_id.clone(),
+                    effort: None,
+                }))
+        }
+        async fn get_conversation(&self, id: &ConversationId) -> Result<Conversation, CoreError> {
+            let mut c = Conversation::new(id.as_str(), &self.title);
+            for (role, content) in &self.rows {
+                c.messages.push(Message::new(role.clone(), content.clone()));
+            }
+            Ok(c)
+        }
+        async fn delete_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn rename_conversation(
+            &self,
+            _id: &ConversationId,
+            _title: String,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn archive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn unarchive_conversation(&self, _id: &ConversationId) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn clear_all_history(&self) -> Result<u32, CoreError> {
+            Ok(0)
+        }
+        async fn send_prompt(
+            &self,
+            _conversation_id: &ConversationId,
+            _prompt: String,
+            mut on_chunk: ChunkCallback,
+            _on_status: StatusCallback,
+        ) -> Result<String, CoreError> {
+            on_chunk("a".into());
+            Ok("a".into())
+        }
+    }
+
+    fn sized_handler(
+        rows: SizedConversations,
+    ) -> DefaultAssistantApiHandler<
+        FakeAssistant,
+        SizedConversations,
+        FakeSettings,
+        FakeConnections,
+        FakeKnowledge,
+    > {
+        DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            Arc::new(rows),
+            Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        )
+    }
+
+    fn user_ctx() -> RequestContext {
+        RequestContext::for_user(UserId::new("alice"))
+    }
+
+    async fn get_conversation_view(
+        h: &impl AssistantApiHandler,
+        id: &str,
+    ) -> api::ConversationView {
+        let res = h
+            .handle_command_for(user_ctx(), api::Command::GetConversation { id: id.into() })
+            .await
+            .expect("GetConversation must answer, not fail");
+        let api::CommandResult::Conversation(view) = res else {
+            panic!("expected a Conversation result");
+        };
+        view
+    }
+
+    async fn get_messages_view(
+        h: &impl AssistantApiHandler,
+        tail: i32,
+        after_count: i32,
+    ) -> api::MessagesView {
+        let res = h
+            .handle_command_for(
+                user_ctx(),
+                api::Command::GetMessages {
+                    conversation_id: "c1".into(),
+                    tail,
+                    after_count,
+                    include_roles: vec![],
+                },
+            )
+            .await
+            .expect("GetMessages must answer, not fail");
+        let api::CommandResult::Messages(view) = res else {
+            panic!("expected a Messages result");
+        };
+        view
+    }
+
+    /// Acceptance (#1303): a `GetConversation` response is bounded in BYTES
+    /// before it is written, not only in message count.
+    #[tokio::test]
+    async fn get_conversation_bounds_the_response_in_serialized_bytes() {
+        // Eight messages of 512 KiB is 4 MiB of content: past the 3 MiB
+        // response budget, and past the 4 MiB transport frame cap once the
+        // JSON envelope is added.
+        let h = sized_handler(SizedConversations::uniform(8, 512 * 1024));
+        let view = get_conversation_view(&h, "c1").await;
+
+        let bytes = serde_json::to_vec(&view).expect("serialize").len();
+        assert!(
+            bytes <= api::MAX_RESPONSE_BYTES,
+            "a conversation response must fit the byte budget: {bytes} > {}",
+            api::MAX_RESPONSE_BYTES
+        );
+    }
+
+    /// Acceptance (#1303): a `GetMessages` response is bounded in BYTES too.
+    /// Windowing by count and by role never bounded the bytes, so a window of
+    /// four large tool results was the same failure.
+    #[tokio::test]
+    async fn get_messages_bounds_the_response_in_serialized_bytes() {
+        let h = sized_handler(SizedConversations::uniform(8, 512 * 1024));
+        let view = get_messages_view(&h, 0, -1).await;
+
+        let bytes = serde_json::to_vec(&view).expect("serialize").len();
+        assert!(
+            bytes <= api::MAX_RESPONSE_BYTES,
+            "a messages response must fit the byte budget: {bytes} > {}",
+            api::MAX_RESPONSE_BYTES
+        );
+    }
+
+    /// Acceptance (#1303): an over-budget response is a normal, complete
+    /// result that STATES it is partial - a business status in the payload,
+    /// not a torn-down connection.
+    #[tokio::test]
+    async fn an_over_budget_conversation_reports_how_many_older_messages_it_omitted() {
+        let h = sized_handler(SizedConversations::uniform(8, 512 * 1024));
+        let view = get_conversation_view(&h, "c1").await;
+
+        assert!(
+            view.omitted_leading_messages > 0,
+            "a cut response must say how many messages it left out"
+        );
+        assert_eq!(
+            view.omitted_leading_messages as usize + view.messages.len(),
+            8,
+            "the omitted count plus what was returned must be the whole conversation"
+        );
+    }
+
+    /// Acceptance (#1303): a cut `GetMessages` window says the size budget cut
+    /// it, so a caller can tell it apart from a window that held everything.
+    #[tokio::test]
+    async fn an_over_budget_messages_window_reports_that_the_size_budget_cut_it() {
+        let h = sized_handler(SizedConversations::uniform(8, 512 * 1024));
+        let view = get_messages_view(&h, 0, -1).await;
+
+        assert!(
+            view.size_capped,
+            "a window cut by the byte budget must say so"
+        );
+        assert_eq!(
+            view.total_raw_count, 8,
+            "the total stays the whole pre-slice count"
+        );
+    }
+
+    /// Acceptance (#1303): the caller can follow a partial conversation to
+    /// read the rest. The omitted count is a raw-index cursor, so
+    /// `GetMessages { after_count }` walks forward over exactly the messages
+    /// the conversation view left out.
+    #[tokio::test]
+    async fn the_omitted_count_is_the_cursor_the_caller_reads_the_rest_from() {
+        let h = sized_handler(SizedConversations::uniform(8, 512 * 1024));
+        let view = get_conversation_view(&h, "c1").await;
+        let omitted = view.omitted_leading_messages as usize;
+        assert!(omitted > 0, "this fixture must produce a partial view");
+
+        // Walk the omitted head forward from index 0, exactly as a caller
+        // would, and check the walk terminates and reaches the returned tail.
+        let mut cursor = 0usize;
+        for _ in 0..16 {
+            if cursor >= omitted {
+                break;
+            }
+            let page = get_messages_view(&h, 0, cursor as i32).await;
+            assert!(
+                !page.messages.is_empty(),
+                "a cursor page inside the conversation must return at least one message"
+            );
+            cursor += page.messages.len();
+        }
+        assert!(
+            cursor >= omitted,
+            "walking after_count forward must reach the messages the conversation view returned"
+        );
+    }
+
+    /// Acceptance (#1303): a single message whose serialized size alone
+    /// exceeds the budget still yields a usable response. The response is
+    /// never empty because one row was too large.
+    #[tokio::test]
+    async fn a_conversation_of_one_over_budget_message_is_never_empty() {
+        let h = sized_handler(SizedConversations::uniform(1, 4 * 1024 * 1024));
+        let view = get_conversation_view(&h, "c1").await;
+
+        assert_eq!(
+            view.messages.len(),
+            1,
+            "the one message must come back headed, not dropped"
+        );
+        assert!(
+            !view.messages[0].content.is_empty(),
+            "a headed message must still carry content"
+        );
+        let bytes = serde_json::to_vec(&view).expect("serialize").len();
+        assert!(
+            bytes <= api::MAX_RESPONSE_BYTES,
+            "a headed single message must still fit the budget: {bytes}"
+        );
+    }
+
+    /// Acceptance (#1303): a `GetMessages` window holding one over-budget
+    /// message is bounded too. The window's own envelope is part of the
+    /// budget, so a headed message sized against the whole budget would push
+    /// the answer past it - a byte the message list must not be given.
+    #[tokio::test]
+    async fn a_messages_window_of_one_over_budget_message_fits_the_budget() {
+        let h = sized_handler(SizedConversations::uniform(1, 4 * 1024 * 1024));
+        let view = get_messages_view(&h, 0, -1).await;
+
+        assert_eq!(
+            view.messages.len(),
+            1,
+            "the row must be headed, not dropped"
+        );
+        assert!(
+            view.messages[0].content_total_bytes.is_some(),
+            "this fixture must be past the budget, or the test proves nothing"
+        );
+        let bytes = serde_json::to_vec(&view).expect("serialize").len();
+        assert!(
+            bytes <= api::MAX_RESPONSE_BYTES,
+            "a headed window must still fit the byte budget: {bytes} > {}",
+            api::MAX_RESPONSE_BYTES
+        );
+    }
+
+    /// Acceptance (#1303): a headed message states the loss at the FRONT of
+    /// its content and reports its true stored size, so a reader meets the
+    /// truth on its first read of the row.
+    #[tokio::test]
+    async fn a_single_message_over_the_whole_budget_comes_back_headed_not_dropped() {
+        let content_bytes = 4 * 1024 * 1024;
+        let h = sized_handler(SizedConversations::uniform(1, content_bytes));
+        let view = get_conversation_view(&h, "c1").await;
+
+        let m = &view.messages[0];
+        assert_eq!(
+            m.content_total_bytes,
+            Some(content_bytes as u64),
+            "a headed row must report the true size of what is stored"
+        );
+        assert!(
+            m.content.starts_with('<'),
+            "the loss must be stated at the front of the content, not at the end: {:?}",
+            &m.content[..m.content.len().min(120)]
+        );
+        assert!(
+            m.content.len() < content_bytes,
+            "a headed row must be shorter than the whole row"
+        );
+    }
+
+    /// Acceptance (#1303): the bound is on SERIALIZED bytes. JSON escaping
+    /// inflates content by up to six times, so a raw `content.len()` estimate
+    /// is not a bound. This content is well under the budget in stored bytes
+    /// and well over it once escaped.
+    #[tokio::test]
+    async fn the_budget_holds_when_json_escaping_inflates_the_content() {
+        // 2 MiB of newlines: 2 MiB raw, 4 MiB serialized (each byte escapes
+        // to two). A response bounded by raw length would pass this whole.
+        let raw = 2 * 1024 * 1024;
+        let h = sized_handler(SizedConversations::with_rows(vec![(
+            Role::User,
+            "\n".repeat(raw),
+        )]));
+        let view = get_conversation_view(&h, "c1").await;
+
+        let bytes = serde_json::to_vec(&view).expect("serialize").len();
+        assert!(
+            bytes <= api::MAX_RESPONSE_BYTES,
+            "escaped content must be measured as it goes on the wire: {bytes} > {}",
+            api::MAX_RESPONSE_BYTES
+        );
+        assert!(
+            !view.messages.is_empty(),
+            "the response must still carry the message"
+        );
+    }
+
+    /// #1303: a headed message must remain valid UTF-8, so the cut lands on a
+    /// character boundary rather than inside a multi-byte character.
+    #[tokio::test]
+    async fn a_headed_message_is_cut_on_a_character_boundary() {
+        // Three-byte characters, so a byte-aligned cut lands mid-character
+        // two times in three.
+        let h = sized_handler(SizedConversations::with_rows(vec![(
+            Role::User,
+            "\u{4e2d}".repeat(2 * 1024 * 1024),
+        )]));
+        let view = get_conversation_view(&h, "c1").await;
+
+        // Reaching a `String` at all proves validity; assert the row really
+        // was headed, and that it round-trips through JSON unchanged.
+        let m = &view.messages[0];
+        assert!(
+            m.content_total_bytes.is_some(),
+            "this fixture must be past the budget, or the test proves nothing"
+        );
+        assert!(!m.content.is_empty());
+        let json = serde_json::to_string(&view).expect("serialize");
+        let back: api::ConversationView = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(back.messages[0].content, m.content);
+    }
+
+    /// #1303: the direction of the cut follows the mode. `GetConversation`
+    /// keeps the NEWEST messages, because that is what a caller opening a
+    /// conversation reads first.
+    #[tokio::test]
+    async fn get_conversation_keeps_the_newest_messages_when_the_budget_cuts() {
+        let h = sized_handler(SizedConversations::uniform(8, 512 * 1024));
+        let whole = SizedConversations::uniform(8, 512 * 1024);
+        let view = get_conversation_view(&h, "c1").await;
+
+        assert!(
+            view.omitted_leading_messages > 0,
+            "this fixture must be past the budget, or the test proves nothing"
+        );
+        let last = &whole.rows[7].1;
+        assert_eq!(
+            view.messages.last().expect("at least one message").content,
+            *last,
+            "the newest message must survive the cut, whole"
+        );
+    }
+
+    /// #1303: `GetMessages` tail mode keeps the newest, matching the meaning
+    /// `MessagesView.truncated` already carries.
+    #[tokio::test]
+    async fn get_messages_tail_mode_keeps_the_newest_when_the_budget_cuts() {
+        let h = sized_handler(SizedConversations::uniform(8, 512 * 1024));
+        let whole = SizedConversations::uniform(8, 512 * 1024);
+        let view = get_messages_view(&h, 8, -1).await;
+
+        assert!(
+            view.truncated,
+            "a tail window cut by bytes dropped older messages, which is what `truncated` means"
+        );
+        assert_eq!(
+            view.messages.last().expect("at least one message").content,
+            whole.rows[7].1,
+            "tail mode keeps the newest"
+        );
+    }
+
+    /// #1303: `GetMessages` cursor mode (`after_count >= 0`) keeps the FRONT
+    /// of the slice and drops the tail, so the caller continues with
+    /// `after_count + returned` rather than skipping a gap.
+    #[tokio::test]
+    async fn get_messages_cursor_mode_keeps_the_front_so_the_caller_continues_forward() {
+        let h = sized_handler(SizedConversations::uniform(8, 512 * 1024));
+        let whole = SizedConversations::uniform(8, 512 * 1024);
+        let view = get_messages_view(&h, 0, 0).await;
+
+        assert!(
+            view.size_capped,
+            "this window must be cut by the byte budget"
+        );
+        assert!(
+            !view.truncated,
+            "a cursor window drops the NEWEST end, so it is not the `truncated` case"
+        );
+        assert_eq!(
+            view.messages.first().expect("at least one message").content,
+            whole.rows[0].1,
+            "cursor mode keeps the front of the slice, starting at after_count"
+        );
+    }
+
+    /// #1303: a value that cannot serialize measures as too large, never as
+    /// small. The budget is enforced by this measurement, so a failure that
+    /// read as zero bytes would be a silent hole in the bound - every
+    /// unmeasurable message would pass the check and the response could go
+    /// past the cap again.
+    #[test]
+    fn an_unserializable_value_measures_as_too_large_to_fit() {
+        struct NeverSerializes;
+        impl serde::Serialize for NeverSerializes {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("cannot serialize"))
+            }
+        }
+        assert_eq!(
+            serialized_len(&NeverSerializes),
+            usize::MAX,
+            "an unmeasurable value must never read as small enough to fit"
+        );
+    }
+
+    /// #1303: the envelope reservation must cover the widest the partial-ness
+    /// flags can be. The budget is split between the envelope and the
+    /// messages BEFORE the flags are known, so a reservation measured at the
+    /// flags' default would let the numbers this code is about to write push
+    /// the answer past the budget.
+    #[test]
+    fn the_conversation_envelope_reservation_covers_the_widest_partial_count() {
+        let probe = |omitted: u32| api::ConversationView {
+            id: "c1".into(),
+            title: "t".into(),
+            messages: Vec::new(),
+            warnings: Vec::new(),
+            model_selection: None,
+            conversation_personality: None,
+            tool_gate_disabled: false,
+            omitted_leading_messages: omitted,
+            title_total_bytes: None,
+        };
+        let reserved = conversation_envelope_reservation(&probe(0));
+        for omitted in [0u32, 1, 9, 10, 4_294_967_294, u32::MAX] {
+            assert!(
+                serialized_len(&probe(omitted)) <= reserved,
+                "an omitted count of {omitted} must fit the reserved envelope"
+            );
+        }
+    }
+
+    /// #1303: the same for a messages window. Both flags are wider when set,
+    /// and both counters - the total and the continuation cursor - are widest
+    /// at `u32::MAX`.
+    #[test]
+    fn the_messages_envelope_reservation_covers_the_widest_partial_flags() {
+        let probe = |count: u32, truncated: bool, size_capped: bool| api::MessagesView {
+            total_raw_count: count,
+            truncated,
+            messages: Vec::new(),
+            size_capped,
+            next_after_count: count,
+        };
+        let reserved = messages_envelope_reservation();
+        for count in [0u32, 7, 4_294_967_294, u32::MAX] {
+            for truncated in [false, true] {
+                for size_capped in [false, true] {
+                    assert!(
+                        serialized_len(&probe(count, truncated, size_capped)) <= reserved,
+                        "({count}, {truncated}, {size_capped}) must fit the reserved envelope"
+                    );
+                }
+            }
+        }
+    }
+
+    /// #1303: the bound is tight, not merely safe. A response that dropped
+    /// messages must have had no room for the next one, or the budget would be
+    /// cutting more history than it needs to.
+    #[test]
+    fn the_bound_keeps_every_message_that_fits() {
+        let all: Vec<api::MessageView> = (0..64)
+            .map(|i| mv(&format!("m{i}"), "user", &"a".repeat(1024)))
+            .collect();
+        let budget = 40 * 1024;
+        let (kept, dropped) = bound_messages_to_bytes(all.clone(), budget, KeepEnd::Newest);
+        assert!(dropped > 0, "this budget must force a cut");
+
+        let used: usize = kept.iter().map(|m| serialized_len(m) + 1).sum();
+        let next = &all[all.len() - kept.len() - 1];
+        assert!(
+            used + serialized_len(next) + 1 > budget,
+            "one more message would have fitted, so the bound cut too much"
+        );
+    }
+
+    /// #1303: a conversation that fits is unchanged - returned whole, with
+    /// nothing marked partial. The budget must not cut a normal response.
+    #[tokio::test]
+    async fn a_conversation_inside_the_budget_is_returned_whole() {
+        let h = sized_handler(SizedConversations::uniform(4, 1024));
+        let view = get_conversation_view(&h, "c1").await;
+
+        assert_eq!(view.messages.len(), 4, "every message must come back");
+        assert_eq!(
+            view.omitted_leading_messages, 0,
+            "nothing was omitted, so the count stays zero"
+        );
+        assert!(
+            view.messages
+                .iter()
+                .all(|m| m.content_total_bytes.is_none()),
+            "no message was headed, so none reports a stored size"
+        );
+        let messages = get_messages_view(&h, 0, -1).await;
+        assert!(
+            !messages.size_capped,
+            "a window inside the budget is not size-capped"
+        );
+    }
+
+    // --- The envelope is bounded too (#1303 review) ------------------------
+    //
+    // The byte budget bounded the message LIST, and reserved the rest of the
+    // response as an envelope measured from real values. One of those values -
+    // the title - is written by the client and validated nowhere. A large
+    // enough title made the reservation take the whole budget: every message
+    // was dropped and the answer was oversize anyway, so the conversation
+    // failed to open on every attempt. That is the failure this work removes,
+    // reached through a different field.
+
+    /// #1303: a conversation whose TITLE alone is past the budget still comes
+    /// back readable - inside the budget, and carrying its messages.
+    #[tokio::test]
+    async fn a_conversation_title_past_the_budget_still_returns_a_readable_response() {
+        let h = sized_handler(SizedConversations::with_title(&"t".repeat(4 * 1024 * 1024)));
+        let view = get_conversation_view(&h, "c1").await;
+
+        let bytes = serde_json::to_vec(&view).expect("serialize").len();
+        assert!(
+            bytes <= api::MAX_RESPONSE_BYTES,
+            "a title must not push the answer past the byte budget: {bytes} > {}",
+            api::MAX_RESPONSE_BYTES
+        );
+        assert_eq!(
+            view.messages.len(),
+            1,
+            "the message must survive a large title, or the conversation is unreadable"
+        );
+    }
+
+    /// #1303: the reservation never leaves the messages a zero budget, for any
+    /// envelope. Two mechanisms hold that between them, and the test drives
+    /// both, because the name says "never" and one mechanism alone does not.
+    ///
+    /// A title is cut by `bound_title` before it is measured, so a stored
+    /// title of any size leaves the envelope far inside its limit. Every OTHER
+    /// envelope field has no bound of its own, and one of them can reserve
+    /// more than the whole response budget - a `model_id` of 4 MiB does. The
+    /// budget would then be zero, so that request is refused instead of
+    /// answered with something no transport can carry.
+    #[tokio::test]
+    async fn the_envelope_reservation_never_leaves_a_zero_message_budget() {
+        // 1. A title of any stored size leaves the messages their share.
+        let view = get_conversation_view(
+            &sized_handler(SizedConversations::with_title(&"t".repeat(4 * 1024 * 1024))),
+            "c1",
+        )
+        .await;
+        let reserved = conversation_envelope_reservation(&view);
+        assert!(
+            reserved <= MAX_ENVELOPE_BYTES,
+            "a bounded title must leave the envelope inside its limit: \
+             {reserved} > {MAX_ENVELOPE_BYTES}"
+        );
+        assert!(
+            api::MAX_RESPONSE_BYTES - reserved > 0,
+            "the messages must always be left a share of the budget"
+        );
+        assert_eq!(
+            view.messages.len(),
+            1,
+            "a share of the budget the messages actually got"
+        );
+
+        // 2. The state the name forbids, built on purpose: an envelope field
+        //    the title bound cannot reach, reserving more than the whole
+        //    response budget. Checked first, or the case would prove nothing.
+        let oversize = api::ConversationView {
+            id: "c1".into(),
+            title: "t".into(),
+            messages: Vec::new(),
+            warnings: Vec::new(),
+            model_selection: Some(api::ConversationModelSelectionView {
+                connection_id: "conn".into(),
+                model_id: "m".repeat(4 * 1024 * 1024),
+                effort: None,
+            }),
+            conversation_personality: None,
+            tool_gate_disabled: false,
+            omitted_leading_messages: 0,
+            title_total_bytes: None,
+        };
+        assert!(
+            conversation_envelope_reservation(&oversize) > api::MAX_RESPONSE_BYTES,
+            "this case must drive the reservation past the WHOLE budget, \
+             or it does not reach the zero-budget state at all"
+        );
+
+        // The handler refuses it rather than answering on a zero budget.
+        let err = sized_handler(SizedConversations::with_model_id(
+            &"m".repeat(4 * 1024 * 1024),
+        ))
+        .handle_command_for(
+            user_ctx(),
+            api::Command::GetConversation { id: "c1".into() },
+        )
+        .await
+        .expect_err("an envelope that leaves the messages nothing must fail the request");
+        assert!(
+            err.to_string().contains("too large"),
+            "the failure must say what happened: {err}"
+        );
+    }
+
+    /// #1303: `ListConversations` carries the same client-written title, so an
+    /// oversize one used to make the whole sidebar unreadable rather than one
+    /// conversation. The other rows must still come back.
+    #[tokio::test]
+    async fn list_conversations_bounds_an_oversize_title_and_keeps_the_other_summaries() {
+        let mut rows: Vec<ConversationSummary> = (0..4)
+            .map(|i| summary(&format!("c{i}"), "an ordinary title"))
+            .collect();
+        rows.insert(2, summary("big", &"t".repeat(4 * 1024 * 1024)));
+        let h = sized_handler(SizedConversations::with_summaries(rows));
+
+        let res = h
+            .handle_command_for(
+                user_ctx(),
+                api::Command::ListConversations {
+                    max_age_days: None,
+                    include_archived: false,
+                },
+            )
+            .await
+            .expect("ListConversations must answer, not fail");
+        let api::CommandResult::Conversations(list) = res else {
+            panic!("expected a Conversations result");
+        };
+
+        assert_eq!(list.len(), 5, "every summary must still come back");
+        let bytes = serde_json::to_vec(&list).expect("serialize").len();
+        assert!(
+            bytes <= api::MAX_RESPONSE_BYTES,
+            "one title must not make the whole list unreadable: {bytes} > {}",
+            api::MAX_RESPONSE_BYTES
+        );
+        assert!(
+            list.iter()
+                .filter(|s| s.id != "big")
+                .all(|s| s.title == "an ordinary title"),
+            "an ordinary title must come back untouched"
+        );
+    }
+
+    /// #1303: a title cut for size is cut on a `char` boundary, so it stays
+    /// valid UTF-8 and opens with the real title rather than a broken glyph.
+    #[tokio::test]
+    async fn a_bounded_title_is_cut_on_a_character_boundary() {
+        // Three-byte characters, so every cut that ignores boundaries lands
+        // inside one.
+        let stored = "\u{3042}".repeat(2 * 1024 * 1024);
+        let h = sized_handler(SizedConversations::with_title(&stored));
+        let view = get_conversation_view(&h, "c1").await;
+
+        assert!(
+            view.title.len() < stored.len(),
+            "an oversize title must be cut"
+        );
+        let head: String = view
+            .title
+            .chars()
+            .take_while(|c| *c == '\u{3042}')
+            .collect();
+        assert!(
+            !head.is_empty(),
+            "the cut title must still open with the stored title"
+        );
+        assert!(
+            stored.starts_with(&head),
+            "what is kept must be a prefix of what is stored"
+        );
+    }
+
+    /// #1303: the title-changed event carries the same client-written title,
+    /// and an event has no request id - so an oversize one is dropped with no
+    /// substitute and no client ever learns the title changed. The event is
+    /// bounded where it is built, the same as a response view.
+    #[tokio::test]
+    async fn an_oversize_title_is_bounded_on_the_title_changed_event() {
+        let h = sized_handler(SizedConversations::with_title(&"t".repeat(4 * 1024 * 1024)));
+        let sink = Arc::new(CollectSink(tokio::sync::Mutex::new(vec![])));
+        h.handle_send_message("c1".into(), "hi".into(), "r1".into(), sink.clone())
+            .await
+            .expect("the turn must run");
+
+        let events = sink.0.lock().await.clone();
+        let title = events
+            .iter()
+            .find_map(|e| match e {
+                api::Event::ConversationTitleChanged { title, .. } => Some(title.clone()),
+                _ => None,
+            })
+            .expect("the turn must announce the conversation title");
+        let bytes = serde_json::to_vec(&title).expect("serialize").len();
+        assert!(
+            bytes <= api::MAX_TITLE_BYTES,
+            "an event title must be bounded like a response title: {bytes} > {}",
+            api::MAX_TITLE_BYTES
+        );
+    }
+
+    // --- The title is bounded where it is WRITTEN (#1303) -----------------
+    //
+    // The bound above is a READ-path cut, and a client that pre-fills a rename
+    // field from a served title writes the cut value back - so the cut becomes
+    // permanent loss. The cure is to keep an over-cap title out of storage:
+    // a client-supplied title past the cap is refused as a business outcome,
+    // and a title the daemon composes for itself is bounded where it is
+    // composed, because refusing there would fail an operation the user did
+    // not ask for.
+
+    /// #1303: `SpawnStandaloneAgent` composes its conversation title from a
+    /// name the CLIENT supplies, so the daemon's own title is bounded where it
+    /// is composed. The prefix leads, so what a cut removes is the client's
+    /// contribution and the title still says what it is.
+    #[tokio::test]
+    async fn a_standalone_agent_title_is_bounded_where_it_is_composed() {
+        let titles = Arc::new(Mutex::new(Vec::new()));
+        let h = DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            Arc::new(RecordTitleConversations(Arc::clone(&titles))),
+            Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        )
+        .with_registry(Arc::new(
+            crate::background_tasks::BackgroundTaskRegistry::new(),
+        ));
+
+        h.handle_command_for(
+            user_ctx(),
+            api::Command::SpawnStandaloneAgent {
+                name: "n".repeat(4 * 1024 * 1024),
+                initial_prompt: "do the thing".into(),
+                override_selection: None,
+                tools: None,
+            },
+        )
+        .await
+        .expect("a spawn must not fail because the name was long");
+
+        let recorded = titles.lock().unwrap().clone();
+        let title = recorded
+            .first()
+            .expect("the spawn must create a conversation");
+        let bytes = serialized_len(&title);
+        assert!(
+            bytes <= api::MAX_TITLE_BYTES,
+            "a generated title must be bounded at generation: {bytes} > {}",
+            api::MAX_TITLE_BYTES
+        );
+        assert!(
+            title.starts_with("Standalone: "),
+            "a cut must remove the client's contribution, not the label: {title:.40}"
+        );
+    }
+
+    /// #1303: a refused title keeps its business code, its description and its
+    /// user-facing message on the way through this layer. Flattening it to
+    /// prose would leave a client no way to tell "your title is too long" from
+    /// "the database is down", which is the difference that decides whether
+    /// the person retypes or the operator is paged.
+    #[tokio::test]
+    async fn an_over_cap_rename_is_declined_with_a_business_code_and_a_user_message() {
+        let h = DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            Arc::new(RefusingConversations),
+            Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        );
+
+        let err = h
+            .handle_command_for(
+                user_ctx(),
+                api::Command::RenameConversation {
+                    id: "c1".into(),
+                    title: "t".repeat(api::MAX_TITLE_BYTES),
+                },
+            )
+            .await
+            .expect_err("a title past the cap must be refused");
+
+        match err {
+            ApiError::InvalidInput {
+                code,
+                description,
+                message,
+            } => {
+                assert_eq!(code, "conversation_title_too_long");
+                assert!(description.contains("4096"), "{description}");
+                assert_eq!(message, "That title is too long. Use a shorter one.");
+            }
+            other => panic!("expected a classified refusal, got {other:?}"),
+        }
+    }
+
+    /// #1303: `CreateConversation` writes the same field, so its refusal is
+    /// classified the same way.
+    #[tokio::test]
+    async fn an_over_cap_create_is_declined_with_a_business_code() {
+        let h = DefaultAssistantApiHandler::new(
+            Arc::new(FakeAssistant),
+            Arc::new(RefusingConversations),
+            Arc::new(FakeSettings),
+            Arc::new(FakeConnections),
+            Arc::new(FakeKnowledge),
+        );
+
+        let err = h
+            .handle_command_for(
+                user_ctx(),
+                api::Command::CreateConversation {
+                    title: "t".repeat(api::MAX_TITLE_BYTES),
+                    tags: vec![],
+                },
+            )
+            .await
+            .expect_err("a title past the cap must be refused");
+
+        assert!(
+            matches!(err, ApiError::InvalidInput { ref code, .. } if code == "conversation_title_too_long"),
+            "expected a classified refusal, got {err:?}"
+        );
+    }
+
+    /// #1303: the read-path cut is now a BACKSTOP for a title that was stored
+    /// before the write bound existed. The write bound cannot reach a row that
+    /// is already written, so the cut stays and still fires on one.
+    ///
+    /// Green from the start, and named here rather than quietly kept: the
+    /// read-path behaviour is unchanged, and this test is what holds it in
+    /// place now that its reason has changed.
+    #[tokio::test]
+    async fn the_read_path_backstop_still_cuts_a_title_stored_before_the_write_bound() {
+        let stored = "t".repeat(4 * 1024 * 1024);
+        let h = sized_handler(SizedConversations::with_title(&stored));
+
+        let view = get_conversation_view(&h, "c1").await;
+
+        assert!(
+            view.title.len() < stored.len(),
+            "a title stored over the cap must still be cut on the way out"
+        );
+        assert_eq!(
+            view.title_total_bytes,
+            Some(stored.len() as u64),
+            "the backstop must still say how large the stored title is"
+        );
+    }
+
+    // --- The continuation cursor (#1303 review) ---------------------------
+    //
+    // `after_count` indexes RAW messages, while `messages` counts the messages
+    // left after the `include_roles` filter. A caller that continued with
+    // `after_count + messages.len()` therefore re-read rows whenever a role
+    // filter was in force. The window states the raw index it reached instead,
+    // so the caller never derives the cursor.
+
+    /// #1303: the continuation cursor is a RAW message index, not a count of
+    /// what the filter let through.
+    #[test]
+    fn the_continuation_cursor_indexes_raw_messages_not_the_filtered_ones() {
+        let all = vec![
+            mv("m0", "user", "a"),
+            mv("m1", "tool", "a"),
+            mv("m2", "user", "a"),
+        ];
+        let w = window_messages(all, 0, 0, &["user".to_string()], usize::MAX);
+
+        assert_eq!(w.messages.len(), 2, "the filter keeps the two user rows");
+        assert_eq!(
+            w.next_after_count, 3,
+            "the window ended at raw index 2, so the caller continues from 3"
+        );
+    }
+
+    /// #1303: an empty window points at the end of the conversation, so a walk
+    /// terminates instead of returning to where it started.
+    #[test]
+    fn an_empty_window_continues_from_the_end_of_the_conversation() {
+        let all = vec![mv("m0", "user", "a"), mv("m1", "user", "a")];
+        let w = window_messages(all, 0, 5, &[], usize::MAX);
+
+        assert!(w.messages.is_empty());
+        assert_eq!(
+            w.next_after_count, 2,
+            "nothing is left to read, so the cursor names the end"
+        );
+    }
+
+    /// #1303: a role filter combined with a byte cut walks to completion -
+    /// every matching row exactly once, none repeated and none missed.
+    #[test]
+    fn a_role_filtered_window_walks_to_completion_without_repeating_or_missing_a_row() {
+        // user / tool / user / tool / user.
+        let all: Vec<api::MessageView> = (0..5)
+            .map(|i| {
+                let role = if i % 2 == 0 { "user" } else { "tool" };
+                mv(&format!("m{i}"), role, &"a".repeat(256))
+            })
+            .collect();
+        // Room for two messages per page, so five rows need more than one page.
+        let budget = messages_envelope_reservation() + 2 * (serialized_len(&all[0]) + 1);
+        let roles = vec!["user".to_string()];
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor = 0i32;
+        for _ in 0..8 {
+            let page = window_messages(all.clone(), 0, cursor, &roles, budget);
+            seen.extend(page.messages.iter().map(|m| m.id.clone()));
+            if !page.size_capped {
+                break;
+            }
+            assert!(
+                page.next_after_count as i32 > cursor,
+                "a cut page must move the cursor forward, or the walk cannot end"
+            );
+            cursor = page.next_after_count as i32;
+        }
+
+        assert_eq!(
+            seen,
+            vec!["m0".to_string(), "m2".to_string(), "m4".to_string()],
+            "the walk must return each matching row exactly once"
+        );
+    }
+
+    /// #1303: `omitted_leading_messages` at zero means no message was LEFT
+    /// OUT. It does not mean the response is whole: a conversation of one
+    /// over-budget message comes back with the count at zero and the row
+    /// headed, so a reader must check `content_total_bytes` as well.
+    #[tokio::test]
+    async fn a_zero_omitted_count_can_still_come_with_a_headed_message() {
+        let h = sized_handler(SizedConversations::uniform(1, 6 * 1024 * 1024));
+        let view = get_conversation_view(&h, "c1").await;
+
+        assert_eq!(
+            view.omitted_leading_messages, 0,
+            "there was one message and it was returned, so none was left out"
+        );
+        assert_eq!(view.messages.len(), 1);
+        assert!(
+            view.messages[0].content_total_bytes.is_some(),
+            "the row is headed, which is the other way a response is partial"
+        );
+    }
+
+    // --- The bound is on the RESPONSE, not on a field (#1303 review 3) ------
+    //
+    // Two of the findings below are one defect shape: a bound was applied to
+    // the field somebody noticed rather than to the answer. `ListConversations`
+    // still had an unbounded field beside the bounded one, and the envelope
+    // reservation reported a large envelope as SMALLER than it is.
+
+    /// The conversation list a `ListConversations` answer returns.
+    async fn list_conversations(h: &impl AssistantApiHandler) -> Vec<api::ConversationSummary> {
+        let res = h
+            .handle_command_for(
+                user_ctx(),
+                api::Command::ListConversations {
+                    max_age_days: None,
+                    include_archived: false,
+                },
+            )
+            .await
+            .expect("ListConversations must answer, not fail");
+        let api::CommandResult::Conversations(list) = res else {
+            panic!("expected a Conversations result");
+        };
+        list
+    }
+
+    /// #1303: a tag is written by the client and validated nowhere, so one
+    /// oversize tag pushed the whole `ListConversations` answer past the
+    /// transport cap and the conversation list could not be read at all -
+    /// through the field beside the one that was bounded. The answer is
+    /// bounded as a whole now, so the row survives with fewer tags.
+    #[tokio::test]
+    async fn list_conversations_bounds_the_response_when_one_tag_is_oversize() {
+        let mut rows: Vec<ConversationSummary> = (0..3)
+            .map(|i| summary(&format!("c{i}"), "an ordinary title"))
+            .collect();
+        rows[1].tags = vec!["t".repeat(4 * 1024 * 1024)];
+        let list =
+            list_conversations(&sized_handler(SizedConversations::with_summaries(rows))).await;
+
+        let bytes = serde_json::to_vec(&list).expect("serialize").len();
+        assert!(
+            bytes <= api::MAX_RESPONSE_BYTES,
+            "one tag must not make the whole list unreadable: {bytes} > {}",
+            api::MAX_RESPONSE_BYTES
+        );
+        assert_eq!(
+            list.len(),
+            3,
+            "cutting a tag must not cost the row, nor the rows after it"
+        );
+        assert_eq!(
+            list[1].omitted_tags, 1,
+            "a row whose tags were cut must say how many it left out"
+        );
+        assert!(
+            list[1].tags.is_empty(),
+            "the oversize tag is the one that was left out"
+        );
+    }
+
+    /// #1303: many summaries can pass the budget with no single field past it.
+    /// The answer is cut at the END of the list - the least recently updated
+    /// part - and says how many conversations it left out.
+    #[tokio::test]
+    async fn list_conversations_bounds_the_response_when_many_summaries_exceed_the_budget() {
+        // Each row is about a kilobyte of title, so a few thousand rows pass
+        // the 3 MiB budget with no single row anywhere near it.
+        let rows: Vec<ConversationSummary> = (0..6000)
+            .map(|i| summary(&format!("c{i:05}"), &"t".repeat(900)))
+            .collect();
+        let list =
+            list_conversations(&sized_handler(SizedConversations::with_summaries(rows))).await;
+
+        let bytes = serde_json::to_vec(&list).expect("serialize").len();
+        assert!(
+            bytes <= api::MAX_RESPONSE_BYTES,
+            "a long list must be bounded in bytes: {bytes} > {}",
+            api::MAX_RESPONSE_BYTES
+        );
+        assert!(
+            !list.is_empty() && list.len() < 6000,
+            "the answer must be cut, not emptied: {} rows",
+            list.len()
+        );
+        let omitted = (6000 - list.len()) as u32;
+        assert!(
+            list.iter()
+                .all(|s| s.omitted_trailing_conversations == omitted),
+            "every row must carry the count of what the answer left out"
+        );
+        assert_eq!(
+            list.first().map(|s| s.id.as_str()),
+            Some("c00000"),
+            "the cut takes the END of the list, so the front survives"
+        );
+    }
+
+    /// #1303: a list inside the budget keeps the wire bytes it always had.
+    /// Every new field is omitted at its default, so an older client parses
+    /// the answer exactly as before.
+    #[tokio::test]
+    async fn an_ordinary_conversation_list_keeps_the_wire_bytes_it_had() {
+        let rows = vec![summary("c0", "an ordinary title")];
+        let list =
+            list_conversations(&sized_handler(SizedConversations::with_summaries(rows))).await;
+
+        let json = serde_json::to_string(&list).expect("serialize");
+        assert_eq!(
+            json,
+            r#"[{"id":"c0","title":"an ordinary title","message_count":0,"updated_at":"2026-01-01 00:00:00","archived":false}]"#,
+            "an ordinary list must carry no new field on the wire"
+        );
+    }
+
+    /// #1303: a cut title carries a structured marker, the way a headed
+    /// message carries `content_total_bytes`. Prose inside the value cannot be
+    /// told apart from a title the user typed, so a client that pre-fills a
+    /// rename field from a served title would write the cut value back and
+    /// destroy the stored one.
+    #[tokio::test]
+    async fn a_cut_title_says_how_large_the_stored_title_is() {
+        let stored = "t".repeat(4 * 1024 * 1024);
+        let h = sized_handler(SizedConversations::with_title(&stored));
+        let view = get_conversation_view(&h, "c1").await;
+
+        assert!(view.title.len() < stored.len(), "the title must be cut");
+        assert_eq!(
+            view.title_total_bytes,
+            Some(stored.len() as u64),
+            "a cut title must state the stored size, so a client can refuse to write it back"
+        );
+    }
+
+    /// #1303: the same marker on a list row, which is what a sidebar renders
+    /// and what a rename dialog pre-fills from.
+    #[tokio::test]
+    async fn a_cut_list_title_says_how_large_the_stored_title_is() {
+        let stored = "t".repeat(4 * 1024 * 1024);
+        let rows = vec![summary("c0", "an ordinary title"), summary("big", &stored)];
+        let list =
+            list_conversations(&sized_handler(SizedConversations::with_summaries(rows))).await;
+
+        assert_eq!(
+            list[1].title_total_bytes,
+            Some(stored.len() as u64),
+            "a cut list title must state the stored size"
+        );
+        assert_eq!(
+            list[0].title_total_bytes, None,
+            "a title inside the budget carries no marker, so it stays writable"
+        );
+    }
+
+    /// #1303: a title inside the budget is returned untouched and unmarked, so
+    /// a rename dialog pre-fills from it exactly as it always did.
+    #[tokio::test]
+    async fn a_title_inside_the_budget_carries_no_cut_marker() {
+        let h = sized_handler(SizedConversations::with_title("an ordinary title"));
+        let view = get_conversation_view(&h, "c1").await;
+
+        assert_eq!(view.title, "an ordinary title");
+        assert_eq!(
+            view.title_total_bytes, None,
+            "an untouched title must carry no marker"
+        );
+    }
+
+    /// #1303: `size_capped` at `false` means the byte budget removed no
+    /// message from the window. It does NOT mean the window is whole: a window
+    /// whose only message is past the whole budget comes back with that row
+    /// HEADED and nothing sets the flag, so a caller must read
+    /// `content_total_bytes` as well.
+    #[tokio::test]
+    async fn a_window_that_is_not_size_capped_can_still_carry_a_headed_message() {
+        let h = sized_handler(SizedConversations::uniform(1, 6 * 1024 * 1024));
+        let view = get_messages_view(&h, 0, 0).await;
+
+        assert_eq!(view.total_raw_count, 1);
+        assert!(
+            !view.size_capped,
+            "no message was removed from the window, so the flag stays false"
+        );
+        assert_eq!(view.messages.len(), 1);
+        assert_eq!(
+            view.messages[0].content_total_bytes,
+            Some(6 * 1024 * 1024),
+            "the row is headed, which is the other way a window is partial"
+        );
+    }
+
+    /// #1303: the documented walk belongs to CURSOR mode. In tail mode the
+    /// cursor already names the END of the window, so a walk that follows
+    /// `next_after_count` reads an empty page and would claim it had
+    /// everything. `truncated` is the signal a tail caller reads, and the cut
+    /// sets it whatever dropped the older messages.
+    #[test]
+    fn a_tail_window_cut_by_the_budget_says_truncated_so_a_walk_cannot_claim_completeness() {
+        let all: Vec<api::MessageView> = (0..100)
+            .map(|i| mv(&format!("m{i:03}"), "user", &"a".repeat(4 * 1024)))
+            .collect();
+        // Room for 30 of the 50 the tail asks for, so the budget drops 20.
+        let budget = messages_envelope_reservation() + 30 * (serialized_len(&all[0]) + 1);
+
+        let page = window_messages(all.clone(), 50, -1, &[], budget);
+        assert!(page.size_capped, "the budget cut the window");
+        assert!(
+            page.truncated,
+            "a tail window that lost its oldest messages must say so"
+        );
+        assert_eq!(
+            page.messages.first().map(|m| m.id.as_str()),
+            Some("m070"),
+            "tail mode keeps the newest, so raw 50..69 were never returned"
+        );
+
+        // The cursor walk documented for cursor mode ends here, and says
+        // nothing about the twenty rows the tail window dropped.
+        let next = window_messages(all, 0, page.next_after_count as i32, &[], budget);
+        assert!(next.messages.is_empty());
+        assert!(
+            !next.size_capped,
+            "an empty window is not size-capped, so only `truncated` on the first \
+             page tells a tail caller that rows are missing"
+        );
+    }
+
+    /// #1303: a tail window that only the byte budget cut says `truncated`
+    /// too. The tail slice itself dropped nothing here - the request asked for
+    /// every message the conversation has - so the flag comes from the budget
+    /// alone. That is what a tail caller reads, because the cursor names the
+    /// end of the conversation in tail mode and says nothing about the rows the
+    /// budget took.
+    #[test]
+    fn a_tail_window_the_budget_alone_cut_says_truncated() {
+        let all: Vec<api::MessageView> = (0..100)
+            .map(|i| mv(&format!("m{i:03}"), "user", &"a".repeat(4 * 1024)))
+            .collect();
+        let budget = messages_envelope_reservation() + 30 * (serialized_len(&all[0]) + 1);
+
+        let page = window_messages(all, 100, -1, &[], budget);
+
+        assert_eq!(page.messages.len(), 30, "the budget kept what it could");
+        assert!(page.size_capped, "the budget cut the window");
+        assert!(
+            page.truncated,
+            "the budget dropped the oldest messages, which is what `truncated` means"
+        );
+    }
+
+    /// #1303: the envelope reservation must err HIGH. Clamping it DOWN made a
+    /// large envelope measure smaller than it is, so the message list was
+    /// given a share the response could not hold and the answer went past the
+    /// budget - the failure this work removes, reached through the reservation
+    /// itself.
+    #[test]
+    fn the_envelope_reservation_never_understates_what_the_envelope_costs() {
+        let view = api::ConversationView {
+            id: "c1".into(),
+            title: "t".into(),
+            messages: Vec::new(),
+            warnings: Vec::new(),
+            model_selection: Some(api::ConversationModelSelectionView {
+                connection_id: "conn".into(),
+                model_id: "m".repeat(1024 * 1024),
+                effort: None,
+            }),
+            conversation_personality: None,
+            tool_gate_disabled: false,
+            omitted_leading_messages: 0,
+            title_total_bytes: None,
+        };
+        let real = serialized_len(&api::ConversationView {
+            messages: Vec::new(),
+            omitted_leading_messages: u32::MAX,
+            ..view.clone()
+        });
+
+        assert!(
+            conversation_envelope_reservation(&view) >= real,
+            "the reservation must never be smaller than the envelope it stands for: \
+             {} < {real}",
+            conversation_envelope_reservation(&view)
+        );
+    }
+
+    /// #1303: an envelope past its own cap is a fault. The one request fails
+    /// and names what happened, rather than answering with a response the
+    /// transport cannot carry. The connection and every other request are
+    /// untouched, because a refusal here is one command's result.
+    #[tokio::test]
+    async fn a_conversation_whose_envelope_is_past_its_cap_fails_the_one_request() {
+        let h = sized_handler(SizedConversations::with_model_id(&"m".repeat(1024 * 1024)));
+
+        let err = h
+            .handle_command_for(
+                user_ctx(),
+                api::Command::GetConversation { id: "c1".into() },
+            )
+            .await
+            .expect_err("an envelope past its cap must fail the request, not answer oversize");
+
+        assert!(
+            err.to_string().contains("too large"),
+            "the failure must say what happened: {err}"
+        );
+    }
+
+    /// #1303: an ordinary envelope is measured and answered, so the refusal
+    /// above is a backstop and not the working path.
+    #[tokio::test]
+    async fn an_ordinary_envelope_answers_and_leaves_the_messages_their_share() {
+        let h = sized_handler(SizedConversations::with_model_id("an-ordinary-model-id"));
+        let view = get_conversation_view(&h, "c1").await;
+
+        assert_eq!(view.messages.len(), 1, "the message must come back");
+        assert_eq!(view.omitted_leading_messages, 0);
     }
 
     #[tokio::test]

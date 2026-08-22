@@ -293,6 +293,9 @@ mod tests {
             updated_at: "2026-06-13T00:00:00Z".into(),
             archived: false,
             tags: vec![],
+            title_total_bytes: None,
+            omitted_trailing_conversations: 0,
+            omitted_tags: 0,
         }]);
         let transport = FakeTransport::replying(reply.clone());
         let adapter = adapter(Arc::clone(&transport));

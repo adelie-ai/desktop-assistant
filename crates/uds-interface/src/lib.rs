@@ -594,6 +594,55 @@ async fn handle_connection(
                 Ok(b) => b,
                 Err(_) => continue,
             };
+            // A reply past the frame cap fails the ONE request it answers,
+            // never the connection (#1303). The peer's reader rejects an
+            // oversize frame and breaks its loop, so writing one used to fail
+            // every outstanding request and leave the conversation unopenable.
+            // Responses are bounded where they are built; this is the backstop
+            // under that, and it must not become a teardown.
+            let body = if desktop_assistant_frame_codec::exceeds_frame_cap(&body) {
+                let Some(id) = frame.request_id() else {
+                    // An event answers no request, so there is no caller to
+                    // tell. Dropping it keeps the connection serving.
+                    warn!(
+                        bytes = body.len(),
+                        "dropping an oversize outbound event; no request to fail"
+                    );
+                    continue;
+                };
+                warn!(
+                    bytes = body.len(),
+                    request_id = id,
+                    "reply exceeds the frame cap; failing the request"
+                );
+                let refusal = WsFrame::error(
+                    id,
+                    format!(
+                        "the reply to this request is {} bytes, past the {} byte transport limit",
+                        body.len(),
+                        desktop_assistant_frame_codec::MAX_FRAME_LEN
+                    ),
+                );
+                match serde_json::to_vec(&refusal) {
+                    // The refusal echoes the request id, so it can be oversize
+                    // too when the id itself is near the cap. Then there is no
+                    // frame that both fits and names the request, and the one
+                    // request times out at the caller. Dropping it keeps the
+                    // connection serving every other request, which is the
+                    // whole point of not tearing down.
+                    Ok(b) if !desktop_assistant_frame_codec::exceeds_frame_cap(&b) => b,
+                    Ok(b) => {
+                        warn!(
+                            bytes = b.len(),
+                            "dropping an oversize failure frame; the request id alone is past the cap"
+                        );
+                        continue;
+                    }
+                    Err(_) => continue,
+                }
+            } else {
+                body
+            };
             if write_frame(&mut write_half, &body).await.is_err() {
                 break;
             }
@@ -665,6 +714,17 @@ where
 // here under the historical `read_frame`/`write_frame` names this crate's
 // integration tests import.
 pub use desktop_assistant_frame_codec::{read_frame, write_frame};
+
+// A bounded response must still fit one frame, or bounding it would not stop
+// the frame being refused (#1303). The two constants live in different crates
+// - the budget beside the wire types, the cap beside the codec - so this is
+// the one place both are visible. Checked at compile time, because a comment
+// stating the relation would not hold anyone to it.
+const _: () = assert!(
+    desktop_assistant_api_model::MAX_RESPONSE_BYTES
+        < desktop_assistant_frame_codec::MAX_FRAME_LEN as usize,
+    "the response byte budget must stay inside the transport frame cap"
+);
 
 #[cfg(test)]
 mod tests {
