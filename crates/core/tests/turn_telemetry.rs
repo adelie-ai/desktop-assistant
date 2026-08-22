@@ -2509,9 +2509,10 @@ fn a_conversation_id_cannot_forge_a_log_line() {
 // ---------------------------------------------------------------------------
 
 /// The turn-span field each part of an assembled prompt is reported under.
-const PROMPT_PART_FIELDS: [&str; 10] = [
+const PROMPT_PART_FIELDS: [&str; 11] = [
     "prompt.system_tokens",
     "prompt.summary_tokens",
+    "prompt.turn_index_tokens",
     "prompt.current_task_tokens",
     "prompt.working_state_tokens",
     "prompt.plan_tokens",
@@ -2545,9 +2546,10 @@ const PROMPT_MEASURED_METRIC: &str = "llm.prompt.measured";
 
 /// The `part` label values [`PROMPT_PART_TOKENS_METRIC`] may carry - the whole
 /// bounded set.
-const PROMPT_PART_LABELS: [&str; 10] = [
+const PROMPT_PART_LABELS: [&str; 11] = [
     "system",
     "summary",
+    "turn_index",
     "current_task",
     "working_state",
     "plan",

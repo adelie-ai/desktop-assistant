@@ -33,7 +33,8 @@
 //!    `{child_task_id, child_conversation_id}` so the UI can drill in.
 //! 6. If `wait=true`, awaits the child via `registry.wait` (cancelling
 //!    the child if the parent's cancellation token fires) and returns
-//!    the child's final assistant text via the helper's result sink.
+//!    the child's final assistant text via the helper's result sink,
+//!    beside the ids that open the child's own record (#1206).
 //!    If `wait=false`, returns a JSON object with the child's task id
 //!    immediately.
 //!
@@ -144,11 +145,15 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         ToolDefinition::new(
             TOOL_SPAWN_SUBAGENT,
             "Spawn a subagent: a child conversation that runs an LLM turn on a fresh \
-             prompt and either returns its final answer (wait=true) or runs in the \
-             background (wait=false). The child inherits your user identity and is \
-             cancelled if you are cancelled. Use this to delegate sub-tasks that \
-             need their own context (search, summarisation, multi-step research) \
-             without polluting your own conversation history.",
+             prompt. With wait=true it blocks and answers \
+             {child_task_id, child_conversation_id, result}, where `result` is the \
+             child's final answer and the two ids open the child's own record - read \
+             them with get_subagent_status when a thin answer might be all there was. \
+             With wait=false it returns the same two ids immediately and the child runs \
+             in the background. The child inherits your user identity and is cancelled \
+             if you are cancelled. Use this to delegate sub-tasks that need their own \
+             context (search, summarisation, multi-step research) without polluting \
+             your own conversation history.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -430,7 +435,19 @@ impl<C: ?Sized + ConversationService + Send + Sync + 'static> SubagentTools<C> {
 
         let slot = result_slot.lock().await;
         match slot.as_ref() {
-            Some(Ok(text)) => Ok(text.clone()),
+            // The answer carries the ids that open the child's own record
+            // (#1206). An answer on its own leaves the parent unable to tell a
+            // thin answer from a complete one, which is the same gap the index
+            // tier closes for the parent's own dropped turns: what looks like
+            // "there was nothing more" and what is "there is more, elsewhere"
+            // are indistinguishable without a handle. The spawn path already
+            // minted both ids, so this is surfacing rather than new storage.
+            Some(Ok(text)) => Ok(serde_json::json!({
+                "child_task_id": child_task_id.0,
+                "child_conversation_id": child_conversation_id,
+                "result": text,
+            })
+            .to_string()),
             Some(Err(reason)) => Err(CoreError::ToolExecution(format!(
                 "subagent failed: {reason}"
             ))),

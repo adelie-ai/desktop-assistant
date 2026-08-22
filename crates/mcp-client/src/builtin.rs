@@ -1075,23 +1075,27 @@ impl BuiltinToolService {
             ToolDefinition::new(
                 TOOL_TRANSCRIPT_GET,
                 format!(
-                    "Read one message of THIS conversation back by its id, exactly as it was \
-                     stored. Use it when a tool result has left your working view, or arrived \
-                     larger than your view can hold, and a notice names its message id - a \
-                     \"<compacted to scratchpad ...>\" pointer, an \"<earlier tool output \
-                     omitted ...>\" notice, or a \"<tool output truncated ...>\" notice - \
-                     instead of running the tool again. Re-running is the wrong move when \
-                     the tool changes something, when its answer moves with time, or when \
-                     the call was \
+                    "Read THIS conversation back, exactly as it was stored - one message by \
+                     `message_id`, or a whole earlier turn by `turn_id`. Use `message_id` \
+                     when a tool result has left your working view, or arrived larger than \
+                     your view can hold, and a notice names its message id - a \"<compacted \
+                     to scratchpad ...>\" pointer, a \"<recall reduced ...>\" header, an \
+                     \"<earlier tool output omitted ...>\" notice, or a \"<tool output \
+                     truncated ...>\" notice - instead of running the tool again. Re-running \
+                     is the wrong move when the tool changes something, when its answer \
+                     moves with time, or when the call was \
                      slow or expensive; this returns the very bytes the earlier round \
-                     reasoned about. Reads are partial and you page through them: give \
-                     `offset` and `length`, and the response carries `total_bytes`, the \
-                     `offset` it actually started at, `returned_bytes`, and `next_offset` \
-                     (null once you have reached the end, and null for a read that \
-                     returned no bytes). One read returns at most \
+                     reasoned about. Use `turn_id` when the `[Earlier turns]` index names a \
+                     turn that is not in view: it returns what was asked, what ran and what \
+                     was answered, so you never have to guess what an earlier turn said. Any \
+                     message id inside a turn opens that whole turn. Reads are partial and \
+                     you page through them: give `offset` and `length`, and the response \
+                     carries `total_bytes`, the `offset` it actually started at, \
+                     `returned_bytes`, and `next_offset` (null once you have reached the end, \
+                     and null for a read that returned no bytes). One read returns at most \
                      {max} bytes, and a larger `length` is cut to that with \
-                     `truncated: true`. Only this conversation's messages are readable, and \
-                     an id it does not hold returns ok:false with a `code`, not an error.",
+                     `truncated: true`. Only this conversation is readable, and an id it does \
+                     not hold returns ok:false with a `code`, not an error.",
                     max = desktop_assistant_core::ports::transcript::TRANSCRIPT_READ_MAX_BYTES,
                 ),
                 serde_json::json!({
@@ -1099,7 +1103,11 @@ impl BuiltinToolService {
                     "properties": {
                         "message_id": {
                             "type": "string",
-                            "description": "The message id named by the pointer you are reading back."
+                            "description": "The message id named by the pointer you are reading back. Give this or `turn_id`, not both."
+                        },
+                        "turn_id": {
+                            "type": "string",
+                            "description": "The turn id named by a line of the `[Earlier turns]` index. Returns the whole turn - what was asked, what ran and what was answered. Give this or `message_id`, not both."
                         },
                         "offset": {
                             "type": "integer",
@@ -1112,7 +1120,15 @@ impl BuiltinToolService {
                             "description": "How many bytes to return. Defaults to the per-read cap, and a larger value is cut to it. A `length` of 0 returns no bytes and no `next_offset`, so ask for at least one byte."
                         }
                     },
-                    "required": ["message_id"]
+                    // No top-level `anyOf`/`oneOf`. Four connectors strip
+                    // those before sending - bedrock, google, and azure and
+                    // openrouter through the openai-compat tool mapper - which
+                    // would leave a schema with no requirement at all, and the
+                    // rest forward them raw to providers that have rejected
+                    // the shape before. Which id to give is stated in the
+                    // description, and the handler answers a call that gives
+                    // neither or both.
+                    "required": []
                 }),
             ),
             ToolDefinition::new(
@@ -2241,17 +2257,40 @@ impl BuiltinToolService {
     /// answer it gives for an id the conversation does not hold.
     fn transcript_get(arguments: &serde_json::Value) -> Result<String, CoreError> {
         use desktop_assistant_core::ports::transcript::{
-            TranscriptReadRequest, read_transcript_message,
+            TranscriptReadRequest, read_transcript_message, read_transcript_turn,
         };
 
-        let message_id = required_string(arguments, "message_id")?;
+        // One id, one shape of answer. Both given is a call that cannot be
+        // served as asked, and picking one silently would return a whole turn
+        // to a caller that asked for a message, or the reverse.
+        let turn_id = optional_string(arguments, "turn_id");
+        let message_id = optional_string(arguments, "message_id");
+        let (id, whole_turn) = match (message_id, turn_id) {
+            (Some(_), Some(_)) => {
+                return Err(CoreError::ToolExecution(
+                    "give message_id or turn_id, not both".to_string(),
+                ));
+            }
+            (Some(id), None) => (id, false),
+            (None, Some(id)) => (id, true),
+            (None, None) => {
+                return Err(CoreError::ToolExecution(
+                    "transcript get requires `message_id` or `turn_id`".to_string(),
+                ));
+            }
+        };
         let offset = optional_usize(arguments, "offset")?.unwrap_or(0);
         let length = optional_usize(arguments, "length")?;
-        Ok(read_transcript_message(&TranscriptReadRequest {
-            message_id,
+        let request = TranscriptReadRequest {
+            message_id: id,
             offset,
             length,
-        }))
+        };
+        Ok(if whole_turn {
+            read_transcript_turn(&request)
+        } else {
+            read_transcript_message(&request)
+        })
     }
 
     async fn conversation_search(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
@@ -5175,6 +5214,98 @@ mod tests {
             ),
         )
         .await
+    }
+
+    /// A two-turn transcript, with the first turn's opening id handed to
+    /// `body`. What the `[Earlier turns]` index names.
+    async fn with_two_turns<T>(body: impl AsyncFnOnce(String) -> T) -> T {
+        use desktop_assistant_core::domain::{Message, Role, ToolCall};
+        use desktop_assistant_core::ports::auth::{UserId, with_user_id};
+        use desktop_assistant_core::ports::transcript::{TranscriptView, with_transcript};
+
+        let messages = vec![
+            Message::new(Role::User, "how do I deploy the fleet image"),
+            Message::assistant_with_tool_calls(vec![ToolCall::new("c1", "read_file", "{}")]),
+            Message::tool_result("c1", "the deploy notes"),
+            Message::new(Role::Assistant, "push the tag"),
+            Message::new(Role::User, "and the web ui?"),
+        ];
+        let turn_id = messages[0].id.clone();
+        let user = UserId::new("u");
+        let conversation = ConversationId::from("c1");
+        let mut view = TranscriptView::new(user.clone(), conversation.clone());
+        view.absorb(&messages);
+
+        with_user_id(
+            user,
+            with_conversation_id(
+                conversation,
+                with_transcript(view, async move { body(turn_id).await }),
+            ),
+        )
+        .await
+    }
+
+    /// A top-level `oneOf`/`anyOf` is the shape that once made every Bedrock
+    /// turn fail: two connectors strip it, leaving a schema that requires
+    /// nothing, and the rest forward it to providers that have rejected it.
+    /// No builtin may advertise one.
+    #[test]
+    fn no_builtin_schema_carries_a_top_level_combinator() {
+        for tool in BuiltinToolService::new().tool_definitions() {
+            let schema = &tool.parameters;
+            for combinator in ["anyOf", "oneOf", "allOf"] {
+                assert!(
+                    schema.get(combinator).is_none(),
+                    "{} advertises a top-level `{combinator}`",
+                    tool.name
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn transcript_get_returns_a_whole_turn_through_the_tool() {
+        let service = BuiltinToolService::new();
+        let out = with_two_turns(async |turn_id| {
+            service
+                .execute_tool(TOOL_TRANSCRIPT_GET, serde_json::json!({"turn_id": turn_id}))
+                .await
+                .expect("a turn read is a normal tool call")
+        })
+        .await;
+
+        let got: serde_json::Value = serde_json::from_str(&out).expect("JSON");
+        assert_eq!(got["ok"], true, "{out}");
+        let content = got["content"].as_str().expect("content");
+        assert!(
+            content.contains("how do I deploy the fleet image"),
+            "{content}"
+        );
+        assert!(content.contains("the deploy notes"), "{content}");
+        assert!(content.contains("push the tag"), "{content}");
+        assert!(
+            !content.contains("and the web ui?"),
+            "the turn ends where the next one begins: {content}"
+        );
+    }
+
+    /// One id, one shape of answer. Serving a call that named both would give
+    /// a whole turn to a caller that asked for a message, or the reverse.
+    #[tokio::test]
+    async fn transcript_get_refuses_a_call_that_names_both_ids() {
+        let service = BuiltinToolService::new();
+        let err = with_two_turns(async |turn_id| {
+            service
+                .execute_tool(
+                    TOOL_TRANSCRIPT_GET,
+                    serde_json::json!({"message_id": turn_id.clone(), "turn_id": turn_id}),
+                )
+                .await
+                .expect_err("both ids is a call that cannot be served as asked")
+        })
+        .await;
+        assert!(err.to_string().contains("not both"), "{err}");
     }
 
     #[tokio::test]

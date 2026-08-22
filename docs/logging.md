@@ -313,6 +313,7 @@ prompt the turn opened with, part by part.
 |---|---|
 | `prompt.system_tokens` | the cached system instruction - standing guidance, personality, client context, machine topology, the tool-listing note, any one-turn refinement - and the ambient `[Now]` line |
 | `prompt.summary_tokens` | the `[Summary of earlier conversation]` block |
+| `prompt.turn_index_tokens` | the `[Earlier turns]` index: one line per turn before this one |
 | `prompt.current_task_tokens` | the `[Current task]` anchor |
 | `prompt.working_state_tokens` | the `[Working state]` line |
 | `prompt.plan_tokens` | the `[Plan]` block |

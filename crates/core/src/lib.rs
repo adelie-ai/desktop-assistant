@@ -24,6 +24,7 @@ pub mod tool_provenance;
 pub(crate) mod tool_repeat;
 pub mod tool_routing;
 pub mod tools;
+pub(crate) mod turn_index;
 
 use thiserror::Error;
 

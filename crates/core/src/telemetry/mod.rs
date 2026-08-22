@@ -263,6 +263,7 @@ pub(crate) fn turn_span(
         // lists together.
         prompt.system_tokens = tracing::field::Empty,
         prompt.summary_tokens = tracing::field::Empty,
+        prompt.turn_index_tokens = tracing::field::Empty,
         prompt.current_task_tokens = tracing::field::Empty,
         prompt.working_state_tokens = tracing::field::Empty,
         prompt.plan_tokens = tracing::field::Empty,

@@ -15,6 +15,14 @@
 //! content of one message, addressed by [`crate::domain::Message::id`], which
 //! is already a stable monotonic UUIDv7 preserved across load and clone.
 //!
+//! It reads a whole TURN by the same door (#1206). The index tier names each
+//! earlier turn by the id of the message that opened it, and one message is
+//! not what the model wants back there - it wants what was asked and what came
+//! of it. [`read_transcript_turn`] renders the turn as text and pages through
+//! it under the same cap. Any id inside a turn opens that turn, so a caller
+//! holding a pointer's message id can widen to its turn without first working
+//! out where the turn began.
+//!
 //! ## Why a task-local
 //!
 //! The read has to see the turn's own messages, not only what storage holds:
@@ -213,6 +221,24 @@ impl TranscriptView {
             .and_then(|i| self.data.entries.get(*i))
     }
 
+    /// The half-open range of entries making up the turn that holds
+    /// `message_id`.
+    ///
+    /// A turn runs from a `Role::User` message to the message before the next
+    /// one. `None` when no entry holds the id, or when the entry sits ahead of
+    /// the conversation's first user message and therefore belongs to no turn.
+    fn turn_range(&self, message_id: &str) -> Option<std::ops::Range<usize>> {
+        let at = *self.data.by_id.get(message_id)?;
+        let start = self.data.entries[..=at]
+            .iter()
+            .rposition(|e| e.role == Role::User)?;
+        let end = self.data.entries[start + 1..]
+            .iter()
+            .position(|e| e.role == Role::User)
+            .map_or(self.data.entries.len(), |offset| start + 1 + offset);
+        Some(start..end)
+    }
+
     /// Whether this view was minted for the scope now in force.
     fn matches_current_scope(&self) -> bool {
         current_user_id() == self.user_id
@@ -273,6 +299,10 @@ impl TranscriptReadRequest {
 const CODE_OUT_OF_SCOPE: &str = "TRANSCRIPT_OUT_OF_SCOPE";
 /// Business code for a message id the transcript in scope does not hold.
 const CODE_NOT_FOUND: &str = "MESSAGE_NOT_FOUND";
+/// Business code for an id that resolves to no turn: it sits ahead of the
+/// conversation's first user message, so nothing opened the turn it would be
+/// part of.
+const CODE_NOT_IN_A_TURN: &str = "NOT_IN_A_TURN";
 
 /// Read one message of the transcript in scope, as the tool's JSON payload.
 ///
@@ -345,14 +375,129 @@ pub fn read_transcript_message(request: &TranscriptReadRequest) -> String {
     // bytes. Only a tool result is graded this way - the rest of the
     // transcript is the conversation itself, which every turn replays
     // untainted.
-    let external = match entry.tool_name.as_deref() {
-        Some(name) => result_is_externally_controlled(name, &entry.content),
-        None => entry.role == Role::Tool,
-    };
-    if external {
+    if entry_is_externally_controlled(entry) {
         payload["provenance"] = serde_json::json!(EXTERNAL_CONTENT_MARKER);
     }
     payload.to_string()
+}
+
+/// Read the whole turn that holds `request.message_id`, as the tool's JSON
+/// payload (#1206).
+///
+/// The index tier names an earlier turn by the id of the message that opened
+/// it, and what the model wants back is the exchange: what was asked, what ran,
+/// and what was answered. So this renders the turn's messages as one text and
+/// pages through it exactly as [`read_transcript_message`] pages through one
+/// message - same cap, same `offset`/`next_offset` contract.
+///
+/// **Any id inside a turn opens that turn.** A caller holding an eviction
+/// pointer's message id can widen to the turn around it without first working
+/// out where the turn began. An id ahead of the conversation's first user
+/// message belongs to no turn and declines with `NOT_IN_A_TURN`.
+///
+/// Provenance is decided over the WHOLE turn: if any message in it is
+/// externally controlled, the payload is stamped. A turn that carried one
+/// fetched page is a turn whose replay re-enters those bytes, and grading the
+/// rendered text message by message would let a caller take the marked half
+/// without the mark.
+#[must_use]
+pub fn read_transcript_turn(request: &TranscriptReadRequest) -> String {
+    let Some(view) = current_transcript().filter(TranscriptView::matches_current_scope) else {
+        return decline(
+            CODE_OUT_OF_SCOPE,
+            "no conversation transcript is readable here",
+            "There is no transcript to read from in this context.",
+        );
+    };
+    if view.get(&request.message_id).is_none() {
+        return decline(
+            CODE_NOT_FOUND,
+            "no message in this conversation has that id",
+            "This conversation holds no message with that id. Check the id in the line you \
+             read it from.",
+        );
+    }
+    let Some(range) = view.turn_range(&request.message_id) else {
+        return decline(
+            CODE_NOT_IN_A_TURN,
+            "that message sits ahead of the first thing the user said",
+            "That message belongs to no turn, because nothing opened one before it. Read it \
+             on its own with `message_id`.",
+        );
+    };
+
+    let entries = &view.data.entries[range.clone()];
+    let rendered = render_turn(entries);
+    let total = rendered.len();
+    let requested = request.length.unwrap_or(TRANSCRIPT_READ_MAX_BYTES);
+    let capped = requested.min(TRANSCRIPT_READ_MAX_BYTES);
+    let start = rendered.floor_char_boundary(request.offset);
+    let end = slice_end(&rendered, start, capped);
+    let slice = &rendered[start..end];
+
+    let advanced = end > start;
+    let unread_remain = end < total;
+    let mut payload = serde_json::json!({
+        "ok": true,
+        "turn_id": entries[0].id,
+        "messages": entries.len(),
+        "total_bytes": total,
+        "offset": start,
+        "returned_bytes": slice.len(),
+        "next_offset": if unread_remain && advanced { Some(end) } else { None },
+        "content": slice,
+    });
+    if requested > TRANSCRIPT_READ_MAX_BYTES {
+        payload["truncated"] = serde_json::Value::Bool(true);
+        payload["message"] = serde_json::json!(format!(
+            "`length` was cut to the {TRANSCRIPT_READ_MAX_BYTES}-byte cap on one read. Read \
+             the rest from `next_offset`."
+        ));
+    } else if unread_remain && !advanced {
+        payload["message"] = serde_json::json!(format!(
+            "`length` was 0, so this read returned no bytes and there is no `next_offset` to \
+             follow. Read again from offset {start} with a `length` of at least one byte."
+        ));
+    }
+    if entries.iter().any(entry_is_externally_controlled) {
+        payload["provenance"] = serde_json::json!(EXTERNAL_CONTENT_MARKER);
+    }
+    payload.to_string()
+}
+
+/// Render one turn's messages as the text a read pages through.
+///
+/// Role-tagged, one block per message, with the producing tool named where
+/// there is one - the same facts [`read_transcript_message`] returns as
+/// fields, laid out as prose because a turn is several messages and a caller
+/// reading it back is reading, not parsing.
+fn render_turn(entries: &[TranscriptEntry]) -> String {
+    let mut out = String::new();
+    for entry in entries {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        let who = match entry.role {
+            Role::User => "user".to_string(),
+            Role::Assistant => "assistant".to_string(),
+            Role::System => "system".to_string(),
+            Role::Tool => match &entry.tool_name {
+                Some(name) => format!("tool ({name})"),
+                None => "tool".to_string(),
+            },
+        };
+        out.push_str(&format!("{who}: {}", entry.content));
+    }
+    out
+}
+
+/// Whether one entry's bytes are externally controlled, on the same terms
+/// [`read_transcript_message`] decides it.
+fn entry_is_externally_controlled(entry: &TranscriptEntry) -> bool {
+    match entry.tool_name.as_deref() {
+        Some(name) => result_is_externally_controlled(name, &entry.content),
+        None => entry.role == Role::Tool,
+    }
 }
 
 /// A refusal that carries no bytes: a stable code, a description, a line for
@@ -436,6 +581,210 @@ mod tests {
 
     fn parse(payload: &str) -> serde_json::Value {
         serde_json::from_str(payload).expect("the tool payload must be JSON")
+    }
+
+    // -----------------------------------------------------------------------
+    // Reading a whole turn back (#1206).
+    // -----------------------------------------------------------------------
+
+    fn user(text: &str) -> Message {
+        Message::new(Role::User, text)
+    }
+
+    fn assistant(text: &str) -> Message {
+        Message::new(Role::Assistant, text)
+    }
+
+    /// Two turns: the first ran a tool, the second is plain.
+    fn two_turns() -> Vec<Message> {
+        vec![
+            user("how do I deploy the fleet image"),
+            requested("c1", "read_file"),
+            tool_result("c1", "the deploy notes"),
+            assistant("push the tag, then apply the kustomization"),
+            user("and the web ui?"),
+            assistant("same tag"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn an_indexed_turn_can_be_fetched_by_id_and_returns_the_stored_content() {
+        let messages = two_turns();
+        let turn_id = messages[0].id.clone();
+        let v = view("u", "conv", &messages);
+
+        let payload = scoped("u", "conv", v, async {
+            read_transcript_turn(&TranscriptReadRequest::new(&turn_id))
+        })
+        .await;
+
+        let got = parse(&payload);
+        assert_eq!(got["ok"], true, "{payload}");
+        assert_eq!(got["turn_id"], turn_id);
+        assert_eq!(got["messages"], 4, "the turn ends at the next user message");
+        let content = got["content"].as_str().expect("content");
+        assert!(
+            content.contains("how do I deploy the fleet image"),
+            "{content}"
+        );
+        assert!(content.contains("the deploy notes"), "{content}");
+        assert!(
+            content.contains("push the tag, then apply the kustomization"),
+            "{content}"
+        );
+        assert!(
+            !content.contains("and the web ui?"),
+            "the next turn is not part of this one: {content}"
+        );
+        assert!(
+            content.contains("tool (read_file)"),
+            "a result names the tool that produced it: {content}"
+        );
+    }
+
+    /// A caller holding an eviction pointer's message id can widen to the turn
+    /// around it without first working out where the turn began.
+    #[tokio::test]
+    async fn any_id_inside_a_turn_opens_that_turn() {
+        let messages = two_turns();
+        let inside = messages[2].id.clone();
+        let v = view("u", "conv", &messages);
+
+        let payload = scoped("u", "conv", v, async {
+            read_transcript_turn(&TranscriptReadRequest::new(&inside))
+        })
+        .await;
+
+        let got = parse(&payload);
+        assert_eq!(got["ok"], true, "{payload}");
+        assert_eq!(got["turn_id"], messages[0].id);
+    }
+
+    #[tokio::test]
+    async fn a_turn_read_pages_through_the_turn_under_the_same_cap() {
+        let messages = two_turns();
+        let turn_id = messages[0].id.clone();
+        let v = view("u", "conv", &messages);
+
+        let (first, total) = scoped("u", "conv", v.clone(), async {
+            let got = parse(&read_transcript_turn(&TranscriptReadRequest {
+                message_id: turn_id.clone(),
+                offset: 0,
+                length: Some(10),
+            }));
+            (
+                got["next_offset"].as_u64().expect("more to read"),
+                got["total_bytes"].as_u64().expect("a total"),
+            )
+        })
+        .await;
+        assert_eq!(first, 10);
+
+        let rest = scoped("u", "conv", v, async {
+            parse(&read_transcript_turn(&TranscriptReadRequest {
+                message_id: turn_id.clone(),
+                offset: first as usize,
+                length: None,
+            }))
+        })
+        .await;
+        assert_eq!(rest["offset"], first);
+        assert_eq!(
+            rest["returned_bytes"].as_u64().expect("bytes") + first,
+            total
+        );
+    }
+
+    /// A turn that fetched a page re-enters those bytes when it is replayed,
+    /// so the whole read is graded rather than the half that carries them.
+    #[tokio::test]
+    async fn a_turn_carrying_external_content_is_stamped_as_a_whole() {
+        let messages = vec![
+            user("what does that page say"),
+            requested("c1", "web_fetch"),
+            tool_result("c1", "<html>the page</html>"),
+            assistant("it says this"),
+            user("thanks"),
+        ];
+        let turn_id = messages[0].id.clone();
+        let v = view("u", "conv", &messages);
+
+        let payload = scoped("u", "conv", v, async {
+            read_transcript_turn(&TranscriptReadRequest::new(&turn_id))
+        })
+        .await;
+
+        let got = parse(&payload);
+        assert_eq!(got["provenance"], EXTERNAL_CONTENT_MARKER, "{payload}");
+    }
+
+    #[tokio::test]
+    async fn a_turn_of_the_assistants_own_messages_is_not_stamped() {
+        let messages = two_turns();
+        let turn_id = messages[4].id.clone();
+        let v = view("u", "conv", &messages);
+
+        let payload = scoped("u", "conv", v, async {
+            read_transcript_turn(&TranscriptReadRequest::new(&turn_id))
+        })
+        .await;
+
+        assert!(parse(&payload)["provenance"].is_null(), "{payload}");
+    }
+
+    #[tokio::test]
+    async fn a_message_ahead_of_the_first_prompt_belongs_to_no_turn() {
+        let messages = vec![
+            Message::new(Role::System, "a preamble"),
+            user("the first thing"),
+            assistant("ok"),
+        ];
+        let id = messages[0].id.clone();
+        let v = view("u", "conv", &messages);
+
+        let payload = scoped("u", "conv", v, async {
+            read_transcript_turn(&TranscriptReadRequest::new(&id))
+        })
+        .await;
+
+        let got = parse(&payload);
+        assert_eq!(got["ok"], false, "{payload}");
+        assert_eq!(got["code"], CODE_NOT_IN_A_TURN);
+    }
+
+    #[tokio::test]
+    async fn a_turn_read_out_of_scope_declines_and_carries_no_bytes() {
+        let messages = two_turns();
+        let turn_id = messages[0].id.clone();
+        let v = view("u", "conv", &messages);
+
+        let payload = scoped("someone-else", "conv", v, async {
+            read_transcript_turn(&TranscriptReadRequest::new(&turn_id))
+        })
+        .await;
+
+        let got = parse(&payload);
+        assert_eq!(got["ok"], false, "{payload}");
+        assert_eq!(got["code"], CODE_OUT_OF_SCOPE);
+        assert!(
+            !payload.contains("how do I deploy"),
+            "a refusal carries no bytes: {payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_read_of_an_unknown_id_declines_as_not_found() {
+        let messages = two_turns();
+        let v = view("u", "conv", &messages);
+
+        let payload = scoped("u", "conv", v, async {
+            read_transcript_turn(&TranscriptReadRequest::new("nobody-holds-this"))
+        })
+        .await;
+
+        let got = parse(&payload);
+        assert_eq!(got["ok"], false, "{payload}");
+        assert_eq!(got["code"], CODE_NOT_FOUND);
     }
 
     #[tokio::test]
