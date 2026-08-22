@@ -1,6 +1,7 @@
 //! SQLite-backed persistence for conversations, knowledge, and assistant state.
 
 pub mod background_tasks;
+pub mod context_breakdown;
 pub mod context_window_observations;
 pub mod conversation;
 pub mod conversation_search;

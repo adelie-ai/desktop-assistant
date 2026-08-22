@@ -39,9 +39,13 @@ use desktop_assistant_core::domain::{
     ToolNamespace,
 };
 use desktop_assistant_core::ports::auth::{UserId, with_user_id};
+use desktop_assistant_core::ports::context_breakdown::{
+    ContextBreakdown, ContextBreakdownRecordFn, PromptPart,
+};
 use desktop_assistant_core::ports::inbound::ConversationService;
 use desktop_assistant_core::ports::llm::{
-    ChunkCallback, LlmClient, LlmResponse, ReasoningConfig, TokenUsage,
+    BudgetSource, ChunkCallback, ContextBudget, LlmClient, LlmResponse, ReasoningConfig,
+    TokenUsage, with_context_budget,
 };
 use desktop_assistant_core::ports::store::ConversationStore;
 use desktop_assistant_core::ports::tools::ToolExecutor;
@@ -2782,6 +2786,40 @@ fn every_context_figure_on_the_turn_span_names_its_unit() {
     );
 }
 
+/// A handler whose scratchpad holds a pinned note, an open todo and a
+/// free-form note, so `[Pinned]`, `[Plan]` and `[Scratchpad]` all render.
+///
+/// Three parts carrying real figures rather than one, so a comparison across
+/// two runs can tell a measured figure from a constant in three slots instead
+/// of leaving eight of them zero on both sides.
+fn handler_with_a_full_scratchpad(
+    responses: Vec<Reply>,
+    tools: ScriptedTools,
+) -> ConversationHandler<MemStore, ScriptedLlm, ScriptedTools> {
+    use desktop_assistant_core::domain::ScratchpadNote;
+    use desktop_assistant_core::ports::scratchpad::ScratchpadListFn;
+    let list: ScratchpadListFn = Arc::new(move |conversation_id: String, _note_type, _limit| {
+        let mut pinned = ScratchpadNote::new("sp-1", conversation_id.clone(), "cap", PINNED_NOTE);
+        pinned.pinned = true;
+        let mut todo = ScratchpadNote::new(
+            "sp-2",
+            conversation_id.clone(),
+            "1",
+            "measure the label bounding before widening the metric",
+        );
+        todo.note_type = "todo".to_string();
+        todo.sequence = Some(1);
+        let freeform = ScratchpadNote::new(
+            "sp-3",
+            conversation_id,
+            "registry-eviction",
+            "the registry caps a metric at sixty-four label sets",
+        );
+        Box::pin(async move { Ok(vec![pinned, todo, freeform]) })
+    });
+    handler(responses, tools).with_scratchpad_list(list)
+}
+
 #[test]
 fn turn_span_carries_a_token_figure_for_every_prompt_part() {
     let _serialised = serialised();
@@ -3308,5 +3346,623 @@ fn the_tool_schema_cost_is_counted_per_server_so_an_operator_can_see_which_to_dr
         captured.counter_delta(PROMPT_ROUND_TOOLS_METRIC, &[]),
         2,
         "two rounds advertising one tool each is two, not one"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #588: the per-turn record.
+//
+// The breakdown above is measured on every turn, put on the span, added to the
+// metrics facade - and then dropped. So is the budget tier the daemon resolved,
+// which is what tells a curated 200k from a silent universal-fallback 200k.
+// These tests are the promise that both reach one durable record per turn, and
+// that the record carries the SAME measurement the span does. A second
+// measurement path is how a record of this shape quietly goes wrong: it keeps
+// reporting, and it reports something else.
+// ---------------------------------------------------------------------------
+
+/// A recorder that keeps what the turn hands it, and the slot to read it from.
+fn recording_sink() -> (ContextBreakdownRecordFn, Arc<Mutex<Vec<ContextBreakdown>>>) {
+    let recorded: Arc<Mutex<Vec<ContextBreakdown>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&recorded);
+    let record: ContextBreakdownRecordFn = Arc::new(move |breakdown: ContextBreakdown| {
+        let sink = Arc::clone(&sink);
+        Box::pin(async move {
+            sink.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(breakdown);
+            Ok(())
+        })
+    });
+    (record, recorded)
+}
+
+/// Run one turn per entry in `requests`, all on ONE conversation, each under
+/// its own correlation id - the way a client sends several prompts into a chat.
+async fn turns_on_one_conversation(
+    handler: &ConversationHandler<MemStore, ScriptedLlm, ScriptedTools>,
+    requests: &[&str],
+) {
+    let conv = handler
+        .create_conversation("c".into(), vec![])
+        .await
+        .expect("create the conversation");
+    for request_id in requests {
+        with_user_id(
+            UserId::new(USER_ID),
+            with_request_id(
+                (*request_id).to_string(),
+                with_turn_route(route(), async {
+                    let _ = handler
+                        .send_prompt_with_override(
+                            &conv.id,
+                            PROMPT_SENTINEL.to_string(),
+                            None,
+                            String::new(),
+                            Box::new(|_| true),
+                            Box::new(|_| {}),
+                            CancellationToken::new(),
+                        )
+                        .await;
+                }),
+            ),
+        )
+        .await;
+    }
+}
+
+/// One turn, run with `budget` installed the way the daemon's dispatch wrapper
+/// installs it, and what it recorded.
+fn turn_under_budget(budget: ContextBudget) -> ContextBreakdown {
+    let (record, recorded) = recording_sink();
+    capture(Level::INFO, async move {
+        let handler = handler(two_round_script(), ScriptedTools::ok())
+            .with_context_breakdown_recorder(record);
+        with_context_budget(budget, one_turn(&handler)).await;
+    });
+    let rows = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    rows.into_iter()
+        .next()
+        .expect("the turn recorded its context breakdown")
+}
+
+#[test]
+fn context_breakdown_persisted_per_turn() {
+    let _serialised = serialised();
+    let (record, recorded) = recording_sink();
+    capture(Level::INFO, async move {
+        let handler =
+            handler(Vec::new(), ScriptedTools::ok()).with_context_breakdown_recorder(record);
+        turns_on_one_conversation(&handler, &["req-first", "req-second"]).await;
+    });
+
+    let rows = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(
+        rows.len(),
+        2,
+        "two turns write two records - one per turn, not one per conversation \
+         and not one per round: {rows:?}"
+    );
+    let ids: Vec<&str> = rows.iter().map(|r| r.request_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["req-first", "req-second"],
+        "each record is keyed by its own turn's correlation id"
+    );
+    for row in &rows {
+        assert_eq!(
+            row.conversation_id, CONVERSATION_ID,
+            "the record names the conversation it belongs to"
+        );
+        assert_eq!(
+            row.model, MODEL,
+            "the record names the model the turn actually ran on"
+        );
+    }
+    assert!(
+        rows[1].turn_ordinal > rows[0].turn_ordinal,
+        "the second turn sits later in the conversation, and the ordinal is \
+         what lets a reader line the record up against the transcript: {rows:?}"
+    );
+}
+
+#[test]
+fn context_breakdown_parts_match_the_assembler() {
+    let _serialised = serialised();
+    let (record, recorded) = recording_sink();
+    // A scratchpad holding a pinned note, an open todo and a free-form note, so
+    // three parts carry real figures and a part written to the wrong slot has
+    // somewhere to show.
+    let captured = capture(Level::INFO, async move {
+        let handler = handler_with_a_full_scratchpad(two_round_script(), ScriptedTools::ok())
+            .with_context_breakdown_recorder(record);
+        one_turn(&handler).await;
+    });
+
+    let rows = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let row = rows.first().expect("the turn recorded its breakdown");
+    let turn = captured.span("turn");
+
+    // The span fields come from the assembler's own `PromptBreakdown`. If the
+    // record were built by measuring anything a second time - re-reading the
+    // stored prompt, re-estimating the blocks, summing what the rounds sent -
+    // the two would part company here and nowhere else.
+    for (part, field) in PromptPart::ALL.iter().zip(PROMPT_PART_FIELDS) {
+        assert_eq!(
+            row.parts.tokens(*part),
+            prompt_field(turn, field),
+            "the record's `{}` figure is not the one the assembler measured \
+             and put on `{field}`",
+            part.as_label()
+        );
+    }
+    assert_eq!(
+        row.parts.tool_count() as u64,
+        prompt_field(turn, PROMPT_TOOL_COUNT_FIELD),
+        "the advertised tool count is the assembler's own"
+    );
+    assert_eq!(
+        row.estimated_total_tokens(),
+        prompt_field(turn, PROMPT_TOTAL_FIELD),
+        "the estimated total is the sum of the recorded parts, which is the \
+         span's total"
+    );
+    // The scratchpad this turn reads renders three blocks - `[Pinned]`,
+    // `[Plan]` and the `[Working state]` line - so the comparison below moves
+    // three slots rather than one. The remaining seven stay zero in both runs,
+    // so for those the comparison shows only that the record invented nothing;
+    // what rules out a second measurement path for all ten is the span identity
+    // checked above.
+    let scratchpad_driven = [
+        PromptPart::Pinned,
+        PromptPart::Plan,
+        PromptPart::WorkingState,
+    ];
+    for part in scratchpad_driven {
+        assert!(
+            row.parts.tokens(part) > 0,
+            "precondition: this turn assembles a `{}` block",
+            part.as_label()
+        );
+    }
+
+    // The comparison above proves the record and the span read one field. This
+    // proves that field tracks the prompt rather than sitting at a constant:
+    // the same turn with an empty scratchpad records zero for each of those
+    // three parts, and leaves the rest where they were. A record wired to a
+    // constant passes the first check and fails this one, and so does one that
+    // wrote a figure into the wrong slot, in either direction.
+    let (bare_record, bare_recorded) = recording_sink();
+    capture(Level::INFO, async move {
+        let handler = handler(two_round_script(), ScriptedTools::ok())
+            .with_context_breakdown_recorder(bare_record);
+        one_turn(&handler).await;
+    });
+    let bare_rows = bare_recorded
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let bare = bare_rows
+        .first()
+        .expect("the bare turn recorded its breakdown");
+
+    for part in scratchpad_driven {
+        assert_eq!(
+            bare.parts.tokens(part),
+            0,
+            "with an empty scratchpad `{}` is zero, which is a measurement",
+            part.as_label()
+        );
+    }
+    for part in PromptPart::ALL {
+        if scratchpad_driven.contains(&part) {
+            continue;
+        }
+        assert_eq!(
+            row.parts.tokens(part),
+            bare.parts.tokens(part),
+            "the scratchpad changed `{}`, so the parts are not separable the \
+             way an operator's fix is",
+            part.as_label()
+        );
+    }
+}
+
+#[test]
+fn budget_source_surfaced() {
+    let _serialised = serialised();
+    // The case the tier exists for. Both turns resolve the same number, and
+    // only the tier says whether it is a curated limit for this model or the
+    // conservative fallback used when nothing supplied one.
+    let curated = turn_under_budget(ContextBudget {
+        max_input_tokens: 200_000,
+        source: BudgetSource::ConnectorTable,
+    });
+    let fallback = turn_under_budget(ContextBudget {
+        max_input_tokens: 200_000,
+        source: BudgetSource::UniversalFallback,
+    });
+
+    assert_eq!(curated.budget_tokens, Some(200_000));
+    assert_eq!(
+        fallback.budget_tokens, curated.budget_tokens,
+        "precondition: the two turns resolved the same number"
+    );
+    assert_eq!(
+        curated.budget_source,
+        Some(BudgetSource::ConnectorTable),
+        "the resolved tier reaches the record rather than being discarded in \
+         the daemon"
+    );
+    assert_eq!(
+        fallback.budget_source,
+        Some(BudgetSource::UniversalFallback),
+        "a curated limit and the universal fallback must not read alike"
+    );
+}
+
+#[test]
+fn the_provider_count_and_the_estimate_reach_the_record_as_two_figures() {
+    let _serialised = serialised();
+    // `two_round_script` reports 100 input tokens on the first round. The
+    // estimate is measured here, from the blocks the assembler laid out, and
+    // agreeing with the provider is not something either one owes the other.
+    let row = turn_under_budget(ContextBudget {
+        max_input_tokens: 200_000,
+        source: BudgetSource::ConnectorTable,
+    });
+    assert_eq!(
+        row.provider_used_tokens,
+        Some(100),
+        "the record carries the count the provider reported for the prompt the \
+         estimate describes"
+    );
+    assert!(
+        row.estimated_total_tokens() > 0,
+        "the estimate is measured here and stands whatever the provider said"
+    );
+    assert_ne!(
+        row.provider_used_tokens,
+        Some(row.estimated_total_tokens()),
+        "the two are separate measurements of one prompt; a record that made \
+         them agree by construction would be reporting one of them twice"
+    );
+}
+
+#[test]
+fn a_provider_that_reports_no_count_leaves_the_field_absent() {
+    let _serialised = serialised();
+    // Zero would invent a measurement. An absent count is the one thing a
+    // reader must be able to tell apart from a prompt that cost nothing.
+    let (record, recorded) = recording_sink();
+    capture(Level::INFO, async move {
+        let handler = handler(
+            vec![LlmResponse::text(REPLY_SENTINEL).into()],
+            ScriptedTools::ok(),
+        )
+        .with_context_breakdown_recorder(record);
+        one_turn(&handler).await;
+    });
+    let rows = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let row = rows.first().expect("the turn recorded its breakdown");
+    assert_eq!(row.provider_used_tokens, None);
+    assert!(
+        row.estimated_total_tokens() > 0,
+        "the parts are measured here, so they do not go missing with the \
+         provider's count"
+    );
+}
+
+#[test]
+fn a_later_rounds_count_is_never_recorded_beside_the_first_rounds_parts() {
+    let _serialised = serialised();
+    // A round that reports no usage followed by one that does. The second
+    // round's prompt carries the first round's tool traffic, so filing its
+    // count beside the first round's parts would read as an estimator that is
+    // wildly wrong - the record would show a small prompt and a large bill for
+    // it, and an operator would go looking for a fault that is not there.
+    let (record, recorded) = recording_sink();
+    capture(Level::INFO, async move {
+        let handler = handler(
+            vec![
+                // Round one: a tool call, and the provider says nothing about
+                // what the prompt cost.
+                LlmResponse::with_tool_calls("", vec![tool_call("c1")]).into(),
+                // Round two: an answer, and a count for its own larger prompt.
+                LlmResponse::text(REPLY_SENTINEL)
+                    .with_usage(usage(15_000, 20))
+                    .into(),
+            ],
+            ScriptedTools::ok(),
+        )
+        .with_context_breakdown_recorder(record);
+        one_turn(&handler).await;
+    });
+
+    let rows = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let row = rows.first().expect("the turn recorded its breakdown");
+    assert_eq!(
+        row.provider_used_tokens, None,
+        "the opening round reported no count, so the record has none - it does \
+         not borrow the second round's figure for the first round's prompt"
+    );
+    assert!(
+        row.estimated_total_tokens() > 0,
+        "the parts are measured here, so they stand whatever the provider said"
+    );
+}
+
+#[test]
+fn a_refused_prompts_parts_are_never_filed_beside_the_retrys_count() {
+    let _serialised = serialised();
+    // The turn this feature gets opened for. The provider refuses the opening
+    // prompt for overflow, the recovery ladder shrinks it, and the retry
+    // succeeds and reports a count for the SMALLER prompt. The record keeps the
+    // refused prompt's parts, so adopting that count would present the gap
+    // between two different prompts as tokenizer disagreement - which is the
+    // one comparison the record exists to support.
+    let (record, recorded) = recording_sink();
+    let captured = capture(Level::INFO, async move {
+        let handler = handler(
+            vec![
+                Reply::Fail(CoreError::ContextOverflow {
+                    prompt_tokens: Some(300_000),
+                    max_tokens: Some(200_000),
+                    detail: "input is too long".to_string(),
+                }),
+                LlmResponse::text(REPLY_SENTINEL)
+                    .with_usage(usage(120_000, 20))
+                    .into(),
+            ],
+            ScriptedTools::ok(),
+        )
+        .with_context_breakdown_recorder(record);
+        with_context_budget(
+            ContextBudget {
+                max_input_tokens: 200_000,
+                source: BudgetSource::ConnectorTable,
+            },
+            one_turn(&handler),
+        )
+        .await;
+    });
+
+    assert!(
+        captured.console.contains("running recovery ladder"),
+        "precondition: the refusal has to reach the ladder\n--- console ---\n{}",
+        captured.console
+    );
+    let finished = captured
+        .console
+        .lines()
+        .find(|l| l.contains("turn finished"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the turn wrote no completion line\n--- console ---\n{}",
+                captured.console
+            )
+        });
+    assert!(
+        !finished.contains("input_tokens=-"),
+        "precondition: the retry DID report a count, so `None` on the record is \
+         the pairing rule at work rather than a retry that never happened; the \
+         turn reported {finished}"
+    );
+    let rows = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let row = rows.first().expect("the turn recorded its breakdown");
+    assert_eq!(
+        row.provider_used_tokens, None,
+        "the provider reported no count for the prompt this record describes, \
+         and the retry's count belongs to a prompt it does not"
+    );
+}
+
+/// A handler whose store already holds a long conversation, so the assembler's
+/// pre-flight budget check has a window to narrow and a range to fold.
+///
+/// The conversation is inserted directly rather than created through the
+/// handler, because `create_conversation` starts an empty one and the pre-flight
+/// fold has nothing to do on an empty conversation.
+fn handler_with_history(
+    messages: usize,
+    responses: Vec<Reply>,
+    tools: ScriptedTools,
+) -> ConversationHandler<MemStore, ScriptedLlm, ScriptedTools> {
+    let store = MemStore::default();
+    let mut conv = Conversation::new(CONVERSATION_ID, "c");
+    for i in 0..messages {
+        conv.messages.push(Message::new(
+            if i % 2 == 0 {
+                desktop_assistant_core::domain::Role::User
+            } else {
+                desktop_assistant_core::domain::Role::Assistant
+            },
+            format!("history message {i}"),
+        ));
+    }
+    store
+        .data
+        .lock()
+        .unwrap()
+        .insert(CONVERSATION_ID.to_string(), conv);
+    ConversationHandler::with_tools(
+        store,
+        ScriptedLlm::new(responses),
+        tools,
+        Box::new(|| CONVERSATION_ID.to_string()),
+    )
+}
+
+/// Run one turn against the conversation `handler_with_history` seeded, without
+/// creating a fresh one first.
+async fn one_turn_on_the_seeded_conversation(
+    handler: &ConversationHandler<MemStore, ScriptedLlm, ScriptedTools>,
+) {
+    with_user_id(
+        UserId::new(USER_ID),
+        with_request_id(
+            REQUEST_ID.to_string(),
+            with_turn_route(route(), async {
+                let _ = handler
+                    .send_prompt_with_override(
+                        &ConversationId(CONVERSATION_ID.to_string()),
+                        PROMPT_SENTINEL.to_string(),
+                        None,
+                        String::new(),
+                        Box::new(|_| true),
+                        Box::new(|_| {}),
+                        CancellationToken::new(),
+                    )
+                    .await;
+            }),
+        ),
+    )
+    .await;
+}
+
+#[test]
+fn a_turn_that_compacted_to_recover_from_an_overflow_records_that_it_compacted() {
+    let _serialised = serialised();
+    // The third rung of the overflow ladder halves the window and folds what
+    // that drops into the rolling summary - the same operation the proactive
+    // path performs. A record reading `compaction_active: false` for such a
+    // turn sits beside a `[Summary of earlier conversation]` block that has
+    // just grown, which reads as a summary that arrived on its own.
+    let (record, recorded) = recording_sink();
+    let captured = capture(Level::INFO, async move {
+        let handler = handler(
+            vec![
+                Reply::Fail(CoreError::ContextOverflow {
+                    prompt_tokens: Some(300_000),
+                    max_tokens: Some(200_000),
+                    detail: "input is too long".to_string(),
+                }),
+                LlmResponse::text(REPLY_SENTINEL)
+                    .with_usage(usage(120_000, 20))
+                    .into(),
+            ],
+            ScriptedTools::ok(),
+        )
+        .with_context_breakdown_recorder(record);
+        with_context_budget(
+            ContextBudget {
+                max_input_tokens: 200_000,
+                source: BudgetSource::ConnectorTable,
+            },
+            one_turn(&handler),
+        )
+        .await;
+    });
+
+    assert!(
+        captured.console.contains("running recovery ladder"),
+        "precondition: the provider's refusal has to reach the ladder, or this \
+         test is measuring an ordinary turn\n--- console ---\n{}",
+        captured.console
+    );
+    let rows = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let row = rows.first().expect("the turn recorded its breakdown");
+    assert!(
+        row.compaction_active,
+        "the ladder narrowed the window and summarised what it dropped, and \
+         the record has to say so\n--- console ---\n{}",
+        captured.console
+    );
+}
+
+#[test]
+fn a_turn_that_compacted_at_pre_flight_records_that_it_compacted() {
+    let _serialised = serialised();
+    // The assembler's own budget check can narrow the window and fold what it
+    // dropped into the rolling summary before the provider is called at all. A
+    // record reading `compaction_active: false` for such a turn would say the
+    // summary appeared on its own.
+    //
+    // The script is empty, so every provider call answers with plain text and
+    // NO usage. That is what isolates the path: the round-loop compaction
+    // branch needs a reported input-token count and cannot run at all here, so
+    // only the pre-flight fold can set the field.
+    let (record, recorded) = recording_sink();
+    let captured = capture(Level::INFO, async move {
+        let handler = handler_with_history(60, Vec::new(), ScriptedTools::ok())
+            .with_context_breakdown_recorder(record);
+        with_context_budget(
+            ContextBudget {
+                max_input_tokens: 1,
+                source: BudgetSource::PurposeOverride,
+            },
+            one_turn_on_the_seeded_conversation(&handler),
+        )
+        .await;
+    });
+
+    // What isolates the pre-flight path is that NO round reported usage, so the
+    // round-loop branch - which needs a reported input count - could not have
+    // run. The record's own `provider_used_tokens` cannot stand in for that: it
+    // closes at the opening round, so a later round reporting usage would leave
+    // it `None` while the round-loop branch fired. The turn's completion line
+    // sums every round, so it is what says no count arrived at all.
+    let finished = captured
+        .console
+        .lines()
+        .find(|l| l.contains("turn finished"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the turn wrote no completion line\n--- console ---\n{}",
+                captured.console
+            )
+        });
+    assert!(
+        finished.contains("input_tokens=-"),
+        "precondition: no round may report a token count, or the round-loop \
+         compaction branch could have set the field instead; the turn reported \
+         {finished}"
+    );
+
+    let rows = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let row = rows.first().expect("the turn recorded its breakdown");
+    assert!(
+        row.compaction_active,
+        "the turn compacted before its first call, and the record has to say so"
+    );
+}
+
+#[test]
+fn a_turn_with_no_correlation_id_records_nothing_rather_than_a_row_nobody_can_name() {
+    let _serialised = serialised();
+    // An agent run and a scheduled job reach the turn loop without a
+    // correlation id. The record is keyed by that id, so there is no key to
+    // write under, and inventing one would put a row in the log that no client
+    // can ask for and no second write can replace.
+    let (record, recorded) = recording_sink();
+    capture(Level::INFO, async move {
+        let handler = handler(two_round_script(), ScriptedTools::ok())
+            .with_context_breakdown_recorder(record);
+        let conv = handler
+            .create_conversation("c".into(), vec![])
+            .await
+            .expect("create the conversation");
+        with_user_id(
+            UserId::new(USER_ID),
+            with_turn_route(route(), async {
+                let _ = handler
+                    .send_prompt_with_override(
+                        &conv.id,
+                        PROMPT_SENTINEL.to_string(),
+                        None,
+                        String::new(),
+                        Box::new(|_| true),
+                        Box::new(|_| {}),
+                        CancellationToken::new(),
+                    )
+                    .await;
+            }),
+        )
+        .await;
+    });
+    let rows = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert!(
+        rows.is_empty(),
+        "a turn with no correlation id has no key to record under: {rows:?}"
     );
 }

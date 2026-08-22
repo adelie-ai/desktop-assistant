@@ -172,6 +172,17 @@ which arrives from an authenticated client connection and never from a turn,
 and no tool the model is offered reaches it. An assistant able to approve its
 own procedures would be recording the user's consent on the user's behalf.
 
+`ListContextBreakdowns` and `GetContextBreakdown` are tenant work. Each reads
+what filled the caller's own turns, scoped by user id in storage the same way
+their conversations are, and a turn's correlation id grants nothing: another
+user's turn reads as absent rather than as a refusal. `docs/WEBSOCKET_API.md`
+documents the payload, including the one rule an integrator must not break -
+the assembler's per-part estimate and the provider's own reported count are two
+measurements of one prompt and are never summed or derived from each other.
+Both commands reach every transport, D-Bus included, because
+`org.desktopAssistant.Commands.SendCommand` forwards any command it does not
+explicitly refuse.
+
 Every other command is tenant work, including `ClearAllHistory`, which clears
 only the calling user's conversations.
 

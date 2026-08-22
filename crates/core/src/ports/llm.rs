@@ -440,6 +440,41 @@ pub enum BudgetSource {
     LearnedCap,
 }
 
+impl BudgetSource {
+    /// Every tier, so a caller can enumerate them without repeating the set.
+    pub const ALL: [BudgetSource; 4] = [
+        Self::PurposeOverride,
+        Self::ConnectorTable,
+        Self::UniversalFallback,
+        Self::LearnedCap,
+    ];
+
+    /// The stable name for this tier, used wherever the tier crosses a
+    /// boundary that is not Rust: a stored column, a wire field, a log.
+    ///
+    /// Stable is the whole contract. A stored row outlives the build that
+    /// wrote it, so renaming a value here silently reclassifies every row
+    /// already written - add a variant instead.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::PurposeOverride => "purpose_override",
+            Self::ConnectorTable => "connector_table",
+            Self::UniversalFallback => "universal_fallback",
+            Self::LearnedCap => "learned_cap",
+        }
+    }
+
+    /// The tier a label names, or `None` for a label from no tier.
+    ///
+    /// `None` rather than a default tier: an unknown label is a tier this
+    /// build cannot name, and answering "universal fallback" would report a
+    /// curated budget as an unconfigured one, which is the exact confusion
+    /// the tier exists to remove.
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.as_label() == label)
+    }
+}
+
 /// Run `fut` with `budget` installed as the resolved per-turn context
 /// budget. The dispatch loop in [`crate::service::ConversationHandler`]
 /// reads this via [`current_context_budget`] to drive token-pressure
@@ -1501,6 +1536,32 @@ impl<L: LlmClient> HostedToolSearch for RetryingLlmClient<L> {
 mod tests {
     use super::*;
     use crate::domain::Role;
+
+    #[test]
+    fn every_budget_tier_has_its_own_label_and_reads_back_as_itself() {
+        // A stored row outlives the build that wrote it. Two tiers sharing a
+        // label would reclassify one as the other on every read, with the row
+        // itself unchanged and nothing else amiss.
+        let labels: std::collections::HashSet<&str> =
+            BudgetSource::ALL.iter().map(|s| s.as_label()).collect();
+        assert_eq!(
+            labels.len(),
+            BudgetSource::ALL.len(),
+            "two tiers rendering to one label would merge them"
+        );
+        for tier in BudgetSource::ALL {
+            assert_eq!(BudgetSource::from_label(tier.as_label()), Some(tier));
+        }
+    }
+
+    #[test]
+    fn an_unknown_budget_label_names_no_tier_rather_than_the_fallback() {
+        // Answering "universal fallback" for a label this build cannot name
+        // would report a curated budget as an unconfigured one, which is the
+        // confusion the tier exists to remove.
+        assert_eq!(BudgetSource::from_label("some_later_tier"), None);
+        assert_eq!(BudgetSource::from_label(""), None);
+    }
 
     struct MockLlm {
         chunks: Vec<String>,

@@ -241,6 +241,10 @@ const MIGRATIONS: &[Migration] = &[
     // content from outside the trust boundary. The record keeps its words; the
     // model-facing render is what withholds them.
     migration!("053_record_after_outside_read.sql"),
+    // #588: one row per turn saying what filled its prompt, and which tier
+    // resolved the budget it ran under. Both were measured on every turn and
+    // then discarded.
+    migration!("054_context_breakdown.sql"),
 ];
 
 /// Second half of the advisory-lock key: the schema the migrations write to.

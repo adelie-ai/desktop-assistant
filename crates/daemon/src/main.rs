@@ -1804,6 +1804,16 @@ async fn main() -> Result<()> {
     let mut scratchpad_handler_fns: Option<SpHandlerFns> = None;
     // #599: tool-usage cost aggregate; only available with a Postgres pool.
     let mut tool_usage_fn: Option<desktop_assistant_core::ports::tool_usage::ToolUsageFn> = None;
+    // #588: the per-turn context breakdown - one write at the end of every turn
+    // and two reads. All three need a Postgres pool; without one the
+    // measurement is still taken and reported to the span and the metrics
+    // facade, and nothing is kept.
+    type CbFns = (
+        desktop_assistant_core::ports::context_breakdown::ContextBreakdownRecordFn,
+        desktop_assistant_core::ports::context_breakdown::ContextBreakdownListFn,
+        desktop_assistant_core::ports::context_breakdown::ContextBreakdownGetFn,
+    );
+    let mut context_breakdown_fns: Option<CbFns> = None;
 
     if let Some(pool) = &pg_pool {
         tracing::info!("wiring database query into builtin tools");
@@ -1836,6 +1846,33 @@ async fn main() -> Result<()> {
             let store = Arc::clone(&tu_store);
             Box::pin(async move { store.tool_usage(&conversation_id).await })
         }));
+
+        // Issue #588: wire the per-turn context breakdown. The turn loop takes
+        // the write; the API handler takes the two reads.
+        let cb_store = Arc::new(
+            desktop_assistant_storage::context_breakdown::PgContextBreakdownStore::new(
+                pool.clone(),
+            ),
+        );
+        use desktop_assistant_core::ports::context_breakdown::{
+            ContextBreakdown, ContextBreakdownStore,
+        };
+        let cb_record = Arc::clone(&cb_store);
+        let cb_list = Arc::clone(&cb_store);
+        context_breakdown_fns = Some((
+            Arc::new(move |breakdown: ContextBreakdown| {
+                let store = Arc::clone(&cb_record);
+                Box::pin(async move { store.record(&breakdown).await })
+            }),
+            Arc::new(move |conversation_id: String, limit: u32, offset: u32| {
+                let store = Arc::clone(&cb_list);
+                Box::pin(async move { store.list(&conversation_id, limit, offset).await })
+            }),
+            Arc::new(move |request_id: String| {
+                let store = Arc::clone(&cb_store);
+                Box::pin(async move { store.get(&request_id).await })
+            }),
+        ));
 
         // Issue #184: wire the per-conversation scratchpad store.
         use desktop_assistant_core::ports::scratchpad::ScratchpadStore;
@@ -2897,6 +2934,13 @@ async fn main() -> Result<()> {
     if let Some(list_fn) = scratchpad_list_fn {
         handler = handler.with_scratchpad_list(list_fn);
     }
+    // #588: keep what each turn measured about its own prompt, and which tier
+    // resolved the budget it ran under. Additive - without a database the
+    // measurement still reaches the span and the metrics facade, and nothing
+    // about the turn changes.
+    if let Some((record, _, _)) = &context_breakdown_fns {
+        handler = handler.with_context_breakdown_recorder(Arc::clone(record));
+    }
     // #1104: resolve the knowledge entries pinned notes attach, one batched read
     // per round, and repair a note whose entry has gone. Both need a database;
     // without one a note cannot carry an attachment in the first place.
@@ -3163,6 +3207,10 @@ async fn main() -> Result<()> {
     ));
     if let Some(tu) = tool_usage_fn {
         api_handler_impl = api_handler_impl.with_tool_usage(tu);
+    }
+    if let Some((_, list, get)) = &context_breakdown_fns {
+        api_handler_impl =
+            api_handler_impl.with_context_breakdowns(Arc::clone(list), Arc::clone(get));
     }
     if let Some((write, get_many, list, delete_many, clear)) = scratchpad_handler_fns {
         api_handler_impl =

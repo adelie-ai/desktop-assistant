@@ -187,7 +187,7 @@ pub(crate) const TOOL_CARRIED_PCT_FIELD: &str = "context.tool_carried_pct";
 /// parts sum to the whole prompt and nothing hides in an unmeasured
 /// remainder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PromptPart {
+pub enum PromptPart {
     /// The cached system instruction - standing guidance, the personality
     /// blurb, the client-context block, the machine topology, the tool-listing
     /// note and any one-turn refinement - plus the ambient `[Now]` line.
@@ -229,7 +229,7 @@ pub(crate) enum PromptPart {
 
 impl PromptPart {
     /// Every part, in the order a prompt renders them.
-    pub(crate) const ALL: [PromptPart; 11] = [
+    pub const ALL: [PromptPart; 11] = [
         Self::System,
         Self::Summary,
         Self::TurnIndex,
@@ -244,7 +244,7 @@ impl PromptPart {
     ];
 
     /// The `part` label value. Bounded by its type.
-    pub(crate) fn as_label(self) -> &'static str {
+    pub fn as_label(self) -> &'static str {
         match self {
             Self::System => "system",
             Self::Summary => "summary",
@@ -258,6 +258,16 @@ impl PromptPart {
             Self::Transcript => "transcript",
             Self::ToolSchemas => "tool_schemas",
         }
+    }
+
+    /// The part a label names, or `None` for a label from no part.
+    ///
+    /// The inverse of [`Self::as_label`], and the read side of a stored
+    /// breakdown. `None` rather than a fallback part: a label this build does
+    /// not know is a figure it cannot attribute, and attributing it anywhere
+    /// would report one part's cost as another's.
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|part| part.as_label() == label)
     }
 
     /// The turn-span field this part is recorded under. Always ends in
@@ -304,14 +314,37 @@ impl PromptPart {
 /// the prompt back. Recovering it would mean matching on the `[..]` tag the
 /// block happens to open with, which nothing holds stable.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct PromptBreakdown {
+pub struct PromptBreakdown {
     tokens: [u64; PromptPart::ALL.len()],
     tool_count: usize,
 }
 
 impl PromptBreakdown {
+    /// Rebuild a breakdown from figures already measured, for the read side of
+    /// a stored record.
+    ///
+    /// Each figure is **assigned** to its part, not added, so re-reading a row
+    /// twice yields the same breakdown. A part absent from `figures` keeps its
+    /// zero, which is what a part that did not render recorded in the first
+    /// place. A part named twice keeps the last figure given.
+    ///
+    /// `tool_count` travels with the schema figure in `figures` for the reason
+    /// [`Self::set_tools`] takes both together: a schema bill without its count
+    /// says nothing about whether to drop a server.
+    pub fn from_parts(
+        figures: impl IntoIterator<Item = (PromptPart, u64)>,
+        tool_count: usize,
+    ) -> Self {
+        let mut breakdown = Self::default();
+        for (part, tokens) in figures {
+            breakdown.tokens[part.index()] = tokens;
+        }
+        breakdown.tool_count = tool_count;
+        breakdown
+    }
+
     /// Add what one block of `part` cost.
-    pub(crate) fn add(&mut self, part: PromptPart, tokens: u64) {
+    pub fn add(&mut self, part: PromptPart, tokens: u64) {
         let slot = &mut self.tokens[part.index()];
         *slot = slot.saturating_add(tokens);
     }
@@ -321,29 +354,29 @@ impl PromptBreakdown {
     ///
     /// One call for both, because the pair is the whole point - a schema bill
     /// without a tool count says nothing about whether to drop a server.
-    pub(crate) fn set_tools(&mut self, count: usize, schema_tokens: u64) {
+    pub fn set_tools(&mut self, count: usize, schema_tokens: u64) {
         self.tool_count = count;
         self.tokens[PromptPart::ToolSchemas.index()] = schema_tokens;
     }
 
     /// What `part` cost. Zero for a block that did not render, which is a
     /// measurement and not an absence.
-    pub(crate) fn tokens(&self, part: PromptPart) -> u64 {
+    pub fn tokens(&self, part: PromptPart) -> u64 {
         self.tokens[part.index()]
     }
 
     /// How many tools this prompt advertised.
-    pub(crate) fn tool_count(&self) -> usize {
+    pub fn tool_count(&self) -> usize {
         self.tool_count
     }
 
     /// What those schemas cost, in estimated tokens.
-    pub(crate) fn tool_schema_tokens(&self) -> u64 {
+    pub fn tool_schema_tokens(&self) -> u64 {
         self.tokens(PromptPart::ToolSchemas)
     }
 
     /// Every part summed: the whole prompt, plus its out-of-band schemas.
-    pub(crate) fn total_tokens(&self) -> u64 {
+    pub fn total_tokens(&self) -> u64 {
         self.tokens
             .iter()
             .fold(0u64, |sum, part| sum.saturating_add(*part))
@@ -560,6 +593,53 @@ mod tests {
         breakdown.add(PromptPart::System, 120);
         assert_eq!(breakdown.tokens(PromptPart::Pinned), 0);
         assert_eq!(breakdown.total_tokens(), 120);
+    }
+
+    #[test]
+    fn every_label_reads_back_as_the_part_that_wrote_it() {
+        // The read side of a stored breakdown. A label mapping back to the
+        // wrong part would report one part's cost under another's name, with
+        // the total still right - which is what makes it hard to see.
+        for part in PromptPart::ALL {
+            assert_eq!(PromptPart::from_label(part.as_label()), Some(part));
+        }
+        assert_eq!(
+            PromptPart::from_label("some_later_part"),
+            None,
+            "a label this build cannot name is a figure it cannot attribute"
+        );
+    }
+
+    #[test]
+    fn a_breakdown_rebuilt_from_its_own_figures_is_the_same_breakdown() {
+        let mut original = PromptBreakdown::default();
+        for (i, part) in PromptPart::ALL.iter().enumerate() {
+            original.add(*part, i as u64 + 1);
+        }
+        original.set_tools(9, 40);
+
+        let rebuilt = PromptBreakdown::from_parts(
+            PromptPart::ALL.map(|part| (part, original.tokens(part))),
+            original.tool_count(),
+        );
+        assert_eq!(rebuilt, original);
+    }
+
+    #[test]
+    fn rebuilding_assigns_rather_than_adds_so_a_second_read_is_the_same_read() {
+        // `add` accumulates, which is right while a prompt is being laid out
+        // and wrong when a stored row is read back: a row read twice would
+        // double.
+        let figures = [(PromptPart::Transcript, 100)];
+        let once = PromptBreakdown::from_parts(figures, 1);
+        let twice = PromptBreakdown::from_parts(figures, 1);
+        assert_eq!(once, twice);
+        assert_eq!(once.tokens(PromptPart::Transcript), 100);
+        assert_eq!(
+            once.tokens(PromptPart::Pinned),
+            0,
+            "a part absent from the figures keeps the zero it recorded"
+        );
     }
 
     #[test]

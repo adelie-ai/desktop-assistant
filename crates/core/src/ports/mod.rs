@@ -51,6 +51,13 @@ pub mod skill_index;
 pub mod skill_use;
 pub mod tool_observer;
 pub mod tool_usage;
+
+// One durable record per turn of what filled its prompt, and what the turn was
+// allowed to spend (#588). The measurement already happens on every turn; this
+// is where it stops being discarded. The module carries its own `//!` header,
+// so this stays a plain comment: a `///` here would merge with that header and
+// resolve its links against THIS module.
+pub mod context_breakdown;
 pub mod transcript;
 pub mod transport;
 pub mod turn_capability;
@@ -74,5 +81,6 @@ mod tests {
         fn _assert_scratchpad_exists<T: super::scratchpad::ScratchpadStore>() {}
         fn _assert_tool_registry_exists<T: super::tool_registry::ToolRegistryStore>() {}
         fn _assert_skill_index_exists<T: super::skill_index::SkillIndexStore>() {}
+        fn _assert_context_breakdown_exists<T: super::context_breakdown::ContextBreakdownStore>() {}
     }
 }

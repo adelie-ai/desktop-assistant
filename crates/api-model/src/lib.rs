@@ -517,6 +517,24 @@ pub enum Command {
     GetToolUsage {
         conversation_id: String,
     },
+    /// What filled each turn's prompt in one conversation (#588), oldest turn
+    /// first.
+    ///
+    /// Conversation order rather than newest-first so the pages stay stable
+    /// while the conversation grows: a new turn appends past the end of every
+    /// page already read.
+    ListContextBreakdowns {
+        conversation_id: String,
+        #[serde(default = "default_context_breakdown_limit")]
+        limit: u32,
+        #[serde(default)]
+        offset: u32,
+    },
+    /// What filled one turn's prompt (#588), by the correlation id the client
+    /// already holds - the same id every event of that turn carried.
+    GetContextBreakdown {
+        request_id: String,
+    },
     ListKnowledgeEntries {
         #[serde(default = "default_kb_limit")]
         limit: u32,
@@ -876,6 +894,13 @@ fn default_kb_limit() -> u32 {
     50
 }
 
+/// Turns per page for `ListContextBreakdowns`. A long conversation runs to
+/// hundreds of turns, and a client asking "what has this conversation been
+/// spending" wants a page, not the history.
+fn default_context_breakdown_limit() -> u32 {
+    50
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandResult {
@@ -920,6 +945,15 @@ pub enum CommandResult {
 
     KnowledgeEntries(Vec<KnowledgeEntryView>),
     ToolUsage(Vec<ToolUsageView>),
+    /// Response to `ListContextBreakdowns` (#588): one entry per turn.
+    ContextBreakdowns(Vec<ContextBreakdownView>),
+    /// Response to `GetContextBreakdown` (#588). `None` for a turn this user
+    /// has no record of - a correlation id is not a capability.
+    ///
+    /// Boxed for the reason `Purposes` is: the view is a wide struct and this
+    /// variant is rare, so an unboxed one would widen every `CommandResult`.
+    /// `Box<T>` serializes transparently, so the wire format is unchanged.
+    ContextBreakdown(Option<Box<ContextBreakdownView>>),
     KnowledgeEntry(Option<KnowledgeEntryView>),
     KnowledgeEntryWritten(KnowledgeEntryView),
 
@@ -1167,6 +1201,99 @@ pub struct TurnCapabilityChange {
     /// in one of these tiers returns a refusal in its tool result; the turn
     /// itself keeps running.
     pub closed_tool_tiers: Vec<ToolTier>,
+}
+
+/// What filled one turn's prompt, and what the turn was allowed to spend
+/// (#588).
+///
+/// ## Two measurements, side by side, never summed
+///
+/// `estimated_parts` is measured by the daemon's own context assembler, with
+/// the estimator the context budget itself uses. `provider_used_tokens` is what
+/// the provider reported for that same prompt. They are two counters over one
+/// thing and they do not agree; the difference between them is itself the
+/// signal, so a client shows both and never adds one to the other or presents
+/// either as a component of the other.
+///
+/// The absence rules differ, and both are deliberate. A part that did not
+/// render reports zero, because the daemon always knows whether it emitted the
+/// block. A provider that declined to report leaves `provider_used_tokens` off
+/// the payload, because a zero there would invent a measurement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextBreakdownView {
+    /// The turn's correlation id: the value stamped on every event that turn
+    /// streamed, and the key `GetContextBreakdown` reads one turn back by.
+    pub request_id: String,
+    pub conversation_id: String,
+    /// Where the turn begins in the conversation: the message ordinal its user
+    /// prompt took. A position a client can navigate to.
+    pub turn_ordinal: i32,
+    /// The model the turn actually ran on.
+    pub model: String,
+    /// Prompt tokens the PROVIDER reported. Absent when the provider reported
+    /// no count, which is not the same as zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_used_tokens: Option<u64>,
+    /// The input-token budget this turn resolved. Absent for a turn that ran
+    /// with no budget installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<u64>,
+    /// Which tier resolved `budget_tokens`, as a stable label:
+    /// `purpose_override`, `connector_table`, `universal_fallback` or
+    /// `learned_cap`.
+    ///
+    /// A string rather than an enum so a tier added later does not break a
+    /// client that has not been rebuilt. Absent with `budget_tokens`, and also
+    /// absent when the daemon stored a tier this build cannot name - which is
+    /// honest, because naming it wrongly would report a curated limit as an
+    /// unconfigured one, and telling those apart is what the field is for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_source: Option<String>,
+    /// Whether proactive compaction ran on this turn: the window was shrunk
+    /// under token pressure and the dropped range summarised.
+    pub compaction_active: bool,
+    /// ESTIMATED tokens for each part of the prompt, in the order a prompt
+    /// renders them.
+    ///
+    /// A list rather than named fields because the daemon owns the set of
+    /// parts: a part added later appears here without changing the wire shape,
+    /// and a client renders whatever it is handed. Names come from one closed
+    /// set - see `PromptPartView::part`.
+    pub estimated_parts: Vec<PromptPartView>,
+    /// Every part summed. The ESTIMATE, and never comparable with
+    /// `provider_used_tokens` as an equality.
+    pub estimated_total_tokens: u64,
+    /// How many tool schemas the prompt advertised. A count, not a token
+    /// figure; what those schemas cost is the `tool_schemas` part.
+    pub advertised_tool_count: u32,
+    /// How many messages this prompt read as something other than their stored
+    /// content: a compaction pointer for a result an earlier step distilled
+    /// into a note, the head of a result too large to read inline, or a
+    /// truncation notice from overflow recovery.
+    ///
+    /// What the transcript figure is NOT charging for. The stored transcript
+    /// still holds every byte.
+    pub projected_messages: u32,
+    /// When the daemon recorded the turn, RFC3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_at: Option<String>,
+}
+
+/// One part of an assembled prompt and what it cost, in estimated tokens
+/// (#588).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptPartView {
+    /// The part's stable name, from a closed set the daemon owns. The set is
+    /// not repeated here: a second copy of it would be able to drift from the
+    /// one the daemon emits, and would then name a part nothing sends.
+    ///
+    /// A client renders whatever name it is handed, including one it does not
+    /// recognize. An unrendered part is prompt cost that appears to have come
+    /// from nowhere.
+    pub part: String,
+    /// What the part cost, in ESTIMATED tokens. Zero means the part rendered
+    /// nothing, which is a measurement.
+    pub estimated_tokens: u64,
 }
 
 /// Per-tool cost for one conversation — the Context Inspector's tool-usage view

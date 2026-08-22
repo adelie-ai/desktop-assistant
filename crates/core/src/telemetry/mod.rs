@@ -75,7 +75,13 @@
 //! instead - a name the turn did not advertise is recorded as [`UNKNOWN_TOOL`].
 //! A conversation id, a user id or a request id is never a label.
 
-mod prompt;
+// What filled a turn's input, part by part. `pub` inside a `pub(crate)` module
+// so `ports::context_breakdown` can re-export the two measurement types to the
+// crate's public surface: one definition of the ten parts is the property the
+// durable record depends on, and a second copy at the port boundary is the
+// drift it exists to prevent. A plain comment rather than a `///` summary,
+// because the module carries its own `//!` header and the two would merge.
+pub mod prompt;
 mod tokens;
 
 pub(crate) use prompt::{PromptBreakdown, PromptPart, record_round_tool_cost};
@@ -577,6 +583,11 @@ pub(crate) struct TurnGuard {
     /// turn assembles a prompt, which a turn cancelled before its first round
     /// never does - and an unrecorded part is exactly what that is.
     prompt: Option<PromptBreakdown>,
+    /// How many messages that prompt read as a replacement rather than as
+    /// their stored content (#588). Travels with the breakdown above, from the
+    /// same round, because it is what the transcript figure is NOT charging
+    /// for.
+    projected_messages: u32,
     /// The largest tool block any of the turn's rounds sent (#1212). The field
     /// above keeps the turn's opening figure, which is the floor of a set that
     /// only grows within a turn; this is its ceiling.
@@ -586,6 +597,36 @@ pub(crate) struct TurnGuard {
     /// that answered without calling a tool never does - and having held no
     /// tool bytes is exactly what that is.
     tool_bytes: Option<crate::planning::ToolByteCensus>,
+    /// What the provider said the prompt above cost (#588). Kept beside the
+    /// estimate and never merged with it: the provider tokenises its own way,
+    /// so the two are two measurements of one prompt.
+    provider_used_tokens: Option<u64>,
+    /// Whether the round carrying the recorded prompt has answered yet.
+    ///
+    /// The count and the estimate must describe the SAME prompt, and the field
+    /// above cannot say so on its own - `None` reads both as "not observed yet"
+    /// and as "observed, and the provider said nothing". Without this the first
+    /// LATER round to report a count would be adopted, and the record would
+    /// show one prompt's parts beside another prompt's total.
+    provider_count_open: bool,
+    /// Whether proactive compaction ran on this turn.
+    compaction_active: bool,
+    /// Where the turn begins in the conversation: the message ordinal its user
+    /// prompt took.
+    turn_ordinal: i32,
+}
+
+/// What a turn measured about its own prompt, for the durable record (#588).
+///
+/// `None` from [`TurnGuard::recorded_prompt`] when the turn never assembled a
+/// prompt, which a turn cancelled before its first round never does - and an
+/// unmeasured turn is exactly what that is.
+pub(crate) struct RecordedPrompt {
+    pub(crate) parts: PromptBreakdown,
+    pub(crate) projected_messages: u32,
+    pub(crate) provider_used_tokens: Option<u64>,
+    pub(crate) compaction_active: bool,
+    pub(crate) turn_ordinal: i32,
 }
 
 impl TurnGuard {
@@ -598,8 +639,13 @@ impl TurnGuard {
             outcome: TurnOutcome::Failed,
             tokens: TokenTotals::default(),
             prompt: None,
+            projected_messages: 0,
             tool_peak: prompt::ToolBlockPeak::default(),
             tool_bytes: None,
+            provider_used_tokens: None,
+            provider_count_open: false,
+            compaction_active: false,
+            turn_ordinal: 0,
         }
     }
 
@@ -613,12 +659,72 @@ impl TurnGuard {
     /// cost before it did anything - the standing bill for the system prompt,
     /// the pinned notes, the recall offer and the tool fleet. What the rounds
     /// then add to it is a separate measurement.
-    pub(crate) fn set_prompt_breakdown(&mut self, breakdown: PromptBreakdown) {
+    ///
+    /// `projected_messages` is taken in the same call rather than in one of
+    /// its own, because it belongs to the same prompt: how many of that
+    /// prompt's messages were read as a pointer, a head or a notice instead of
+    /// as what the transcript stores. Two setters could record two rounds.
+    pub(crate) fn set_prompt_breakdown(
+        &mut self,
+        breakdown: PromptBreakdown,
+        projected_messages: usize,
+    ) {
         self.tool_peak.observe(
             breakdown.tool_count(),
             breakdown.tokens(PromptPart::ToolSchemas),
         );
-        self.prompt.get_or_insert(breakdown);
+        if self.prompt.is_none() {
+            self.prompt = Some(breakdown);
+            self.projected_messages = u32::try_from(projected_messages).unwrap_or(u32::MAX);
+            // This prompt is the one the record describes, and the round
+            // sending it has not answered yet.
+            self.provider_count_open = true;
+        }
+    }
+
+    /// Note what the provider reported for the round carrying the recorded
+    /// prompt, and close the question.
+    ///
+    /// The FIRST observation wins, not the first non-empty one, and that is the
+    /// pairing rather than defensiveness. A later round's prompt carries the
+    /// tool traffic the rounds before it produced, so adopting its count would
+    /// put one prompt's parts beside another prompt's total and read as an
+    /// estimator that is wildly wrong.
+    ///
+    /// Call it with `None` on every path where the recorded prompt's round
+    /// ended without a count - a provider that reports no usage, and a prompt
+    /// the provider refused. The field then stays absent, which says the
+    /// provider did not report a count for THIS prompt; a zero would invent a
+    /// measurement, and a later round's figure would answer a question nobody
+    /// asked.
+    pub(crate) fn observe_provider_input_tokens(&mut self, input_tokens: Option<u64>) {
+        if self.provider_count_open {
+            self.provider_used_tokens = input_tokens;
+            self.provider_count_open = false;
+        }
+    }
+
+    /// Note that proactive compaction ran on this turn. Sticky: a turn that
+    /// compacted once compacted.
+    pub(crate) fn note_compaction(&mut self) {
+        self.compaction_active = true;
+    }
+
+    /// Note where the turn begins in the conversation.
+    pub(crate) fn set_turn_ordinal(&mut self, ordinal: usize) {
+        self.turn_ordinal = i32::try_from(ordinal).unwrap_or(i32::MAX);
+    }
+
+    /// What the turn measured about its prompt, or `None` when it assembled
+    /// none.
+    pub(crate) fn recorded_prompt(&self) -> Option<RecordedPrompt> {
+        self.prompt.map(|parts| RecordedPrompt {
+            parts,
+            projected_messages: self.projected_messages,
+            provider_used_tokens: self.provider_used_tokens,
+            compaction_active: self.compaction_active,
+            turn_ordinal: self.turn_ordinal,
+        })
     }
 
     /// Note what the turn's tool traffic weighs, as of the round that just

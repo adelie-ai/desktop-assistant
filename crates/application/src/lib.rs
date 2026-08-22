@@ -545,6 +545,14 @@ where
     /// configured; the command then reports it is unavailable rather than
     /// pretending the conversation used no tools.
     tool_usage: Option<desktop_assistant_core::ports::tool_usage::ToolUsageFn>,
+    /// The per-turn context breakdown reads (#588). Absent when no Postgres
+    /// pool is configured; the commands then report they are unavailable rather
+    /// than answering that the conversation has no record, which is what a
+    /// conversation whose turns simply were not recorded also looks like.
+    context_breakdown_list:
+        Option<desktop_assistant_core::ports::context_breakdown::ContextBreakdownListFn>,
+    context_breakdown_get:
+        Option<desktop_assistant_core::ports::context_breakdown::ContextBreakdownGetFn>,
     /// Optional idempotency-key store (#204). When attached, a `SendMessage`
     /// carrying an `idempotency_key` whose turn already completed replays the
     /// stored reply instead of re-running the LLM/tools (crash-safe
@@ -661,6 +669,8 @@ where
             scratchpad_delete_many: None,
             scratchpad_clear: None,
             tool_usage: None,
+            context_breakdown_list: None,
+            context_breakdown_get: None,
             idempotency: None,
             inflight: Arc::new(InFlightRegistry::default()),
             client_tools: None,
@@ -738,6 +748,19 @@ where
         tool_usage: desktop_assistant_core::ports::tool_usage::ToolUsageFn,
     ) -> Self {
         self.tool_usage = Some(tool_usage);
+        self
+    }
+
+    /// Wire the per-turn context breakdown reads (#588). Both together, because
+    /// a deployment that can list the turns of a conversation and cannot open
+    /// one of them serves half a view.
+    pub fn with_context_breakdowns(
+        mut self,
+        list: desktop_assistant_core::ports::context_breakdown::ContextBreakdownListFn,
+        get: desktop_assistant_core::ports::context_breakdown::ContextBreakdownGetFn,
+    ) -> Self {
+        self.context_breakdown_list = Some(list);
+        self.context_breakdown_get = Some(get);
         self
     }
 
@@ -1506,6 +1529,41 @@ fn capability_reason_to_view(
     }
 }
 
+/// Map one turn's record to its wire view (#588).
+///
+/// The part list is built from the daemon's own `PromptPart` set, in the order
+/// a prompt renders them, so the wire never carries a second list of parts that
+/// could drift from the one the assembler measures against. The estimated total
+/// is summed here, at the boundary, so every client shows the same figure
+/// rather than each summing the list itself - and so no client is tempted to
+/// reach for the provider's count when it wants a total.
+fn context_breakdown_to_view(
+    b: desktop_assistant_core::ports::context_breakdown::ContextBreakdown,
+) -> api::ContextBreakdownView {
+    use desktop_assistant_core::ports::context_breakdown::PromptPart;
+    api::ContextBreakdownView {
+        estimated_parts: PromptPart::ALL
+            .iter()
+            .map(|part| api::PromptPartView {
+                part: part.as_label().to_string(),
+                estimated_tokens: b.parts.tokens(*part),
+            })
+            .collect(),
+        estimated_total_tokens: b.estimated_total_tokens(),
+        advertised_tool_count: b.advertised_tool_count(),
+        request_id: b.request_id,
+        conversation_id: b.conversation_id,
+        turn_ordinal: b.turn_ordinal,
+        model: b.model,
+        provider_used_tokens: b.provider_used_tokens,
+        budget_tokens: b.budget_tokens,
+        budget_source: b.budget_source.map(|s| s.as_label().to_string()),
+        compaction_active: b.compaction_active,
+        projected_messages: b.projected_messages,
+        recorded_at: b.recorded_at,
+    }
+}
+
 /// Map the domain aggregate to its wire view, computing the token estimate at
 /// the boundary so every client shows the same number rather than each deriving
 /// its own from bytes.
@@ -2100,6 +2158,35 @@ where
                 let rows = usage(conversation_id).await.map_err(Self::map_core_err)?;
                 Ok(api::CommandResult::ToolUsage(
                     rows.into_iter().map(tool_usage_to_view).collect(),
+                ))
+            }
+            api::Command::ListContextBreakdowns {
+                conversation_id,
+                limit,
+                offset,
+            } => {
+                let list = self.context_breakdown_list.as_ref().ok_or_else(|| {
+                    // Explicit unavailability rather than an empty list: "this
+                    // conversation has no records" and "this deployment keeps
+                    // none" are different answers, and the empty list is the
+                    // one a client would render as a finished, empty view.
+                    ApiError::Unsupported
+                })?;
+                let rows = list(conversation_id, limit, offset)
+                    .await
+                    .map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::ContextBreakdowns(
+                    rows.into_iter().map(context_breakdown_to_view).collect(),
+                ))
+            }
+            api::Command::GetContextBreakdown { request_id } => {
+                let get = self
+                    .context_breakdown_get
+                    .as_ref()
+                    .ok_or(ApiError::Unsupported)?;
+                let row = get(request_id).await.map_err(Self::map_core_err)?;
+                Ok(api::CommandResult::ContextBreakdown(
+                    row.map(|b| Box::new(context_breakdown_to_view(b))),
                 ))
             }
             api::Command::ListKnowledgeEntries {
@@ -4258,6 +4345,142 @@ mod tests {
             view.tool_tier.expect("tier present").is_gated(),
             "an integrator must be able to see that web_read can be refused"
         );
+    }
+
+    // --- The per-turn context breakdown on the wire (issue #588) --------
+
+    fn breakdown_record() -> desktop_assistant_core::ports::context_breakdown::ContextBreakdown {
+        use desktop_assistant_core::ports::context_breakdown::{
+            ContextBreakdown, PromptBreakdown, PromptPart,
+        };
+        ContextBreakdown {
+            request_id: "req-1".to_string(),
+            conversation_id: "conv-1".to_string(),
+            turn_ordinal: 6,
+            model: "a-model".to_string(),
+            provider_used_tokens: Some(41_000),
+            budget_tokens: Some(200_000),
+            budget_source: Some(desktop_assistant_core::ports::llm::BudgetSource::ConnectorTable),
+            compaction_active: true,
+            // Every part a different figure, so a figure published under the
+            // wrong part's name is visible rather than hidden behind equal
+            // values.
+            parts: PromptBreakdown::from_parts(
+                PromptPart::ALL
+                    .iter()
+                    .enumerate()
+                    .map(|(i, part)| (*part, (i as u64 + 1) * 100)),
+                7,
+            ),
+            projected_messages: 3,
+            recorded_at: Some("2026-08-16T00:00:00Z".to_string()),
+        }
+    }
+
+    #[test]
+    fn the_wire_view_publishes_every_part_under_its_own_name_and_figure() {
+        use desktop_assistant_core::ports::context_breakdown::PromptPart;
+        let view = context_breakdown_to_view(breakdown_record());
+
+        let published: Vec<(&str, u64)> = view
+            .estimated_parts
+            .iter()
+            .map(|p| (p.part.as_str(), p.estimated_tokens))
+            .collect();
+        let expected: Vec<(&str, u64)> = PromptPart::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, part)| (part.as_label(), (i as u64 + 1) * 100))
+            .collect();
+        assert_eq!(
+            published, expected,
+            "the wire part list is the daemon's own set, in the order a prompt \
+             renders them, with each part's own figure"
+        );
+    }
+
+    #[test]
+    fn the_wire_estimated_total_is_the_parts_and_never_the_providers_count() {
+        // The conflation this record exists to prevent, at the one boundary a
+        // client reads. Publishing the provider's figure under a name that
+        // says "estimated" would make every client report it as the estimate.
+        let record = breakdown_record();
+        let view = context_breakdown_to_view(record.clone());
+
+        let summed: u64 = view
+            .estimated_parts
+            .iter()
+            .map(|p| p.estimated_tokens)
+            .sum();
+        assert_eq!(view.estimated_total_tokens, summed);
+        assert_eq!(view.provider_used_tokens, Some(41_000));
+        assert_ne!(
+            view.estimated_total_tokens, 41_000,
+            "the two figures are separate measurements; a view that made them \
+             agree by construction would be reporting one of them twice"
+        );
+        assert_eq!(
+            view.advertised_tool_count, 7,
+            "the tool count is a count and is published as one, not as tokens"
+        );
+    }
+
+    #[test]
+    fn the_wire_view_publishes_the_resolved_budget_tier() {
+        // A curated limit and the universal fallback are the same number, so
+        // the tier is the only thing that separates them - and a view that
+        // published a constant would pass every other assertion here.
+        use desktop_assistant_core::ports::llm::BudgetSource;
+        for tier in BudgetSource::ALL {
+            let mut record = breakdown_record();
+            record.budget_source = Some(tier);
+            let view = context_breakdown_to_view(record);
+            assert_eq!(
+                view.budget_source.as_deref(),
+                Some(tier.as_label()),
+                "the tier the daemon resolved must reach the wire as itself"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreported_provider_count_is_absent_from_the_wire_rather_than_zero() {
+        // Zero would invent a measurement, and an integrator cannot tell an
+        // invented zero from a prompt that cost nothing.
+        let mut record = breakdown_record();
+        record.provider_used_tokens = None;
+        record.budget_tokens = None;
+        record.budget_source = None;
+        let view = context_breakdown_to_view(record);
+
+        assert_eq!(view.provider_used_tokens, None);
+        assert_eq!(view.budget_tokens, None);
+        assert_eq!(view.budget_source, None);
+        let json = serde_json::to_value(&view).expect("serialize the view");
+        for absent in ["provider_used_tokens", "budget_tokens", "budget_source"] {
+            assert!(
+                json.get(absent).is_none(),
+                "`{absent}` must be omitted from the payload, not sent as null \
+                 or zero"
+            );
+        }
+        assert!(
+            view.estimated_total_tokens > 0,
+            "the estimate is measured by the daemon and stands whatever the \
+             provider said"
+        );
+    }
+
+    #[test]
+    fn the_wire_view_carries_the_turns_own_identity_and_position() {
+        let view = context_breakdown_to_view(breakdown_record());
+        assert_eq!(view.request_id, "req-1");
+        assert_eq!(view.conversation_id, "conv-1");
+        assert_eq!(view.turn_ordinal, 6);
+        assert_eq!(view.model, "a-model");
+        assert!(view.compaction_active);
+        assert_eq!(view.projected_messages, 3);
+        assert_eq!(view.recorded_at.as_deref(), Some("2026-08-16T00:00:00Z"));
     }
 
     /// The one knowledge id [`FakeKnowledge`] holds an entry for.

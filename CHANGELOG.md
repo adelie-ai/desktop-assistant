@@ -8,6 +8,35 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## Unreleased
 
+### Added
+
+- Two commands report what filled a turn's prompt:
+  `list_context_breakdowns { conversation_id, limit?, offset? }` returns one
+  entry per turn of a conversation, oldest first, and
+  `get_context_breakdown { request_id }` returns one turn by the correlation id
+  its own events carried. Each entry gives the estimated tokens for every part
+  of the prompt - system instruction, summary, plan, pinned notes, scratchpad
+  index, recall, transcript, tool schemas - beside the count the provider
+  reported, the input-token budget the turn ran under, which tier resolved that
+  budget, whether the turn compacted itself, and how many of its messages it
+  read as a pointer, a head or a notice instead of as their stored content. The last of those is what tells a curated limit for the model
+  apart from the conservative fallback the daemon uses when nothing supplied
+  one; the two are the same number and a different situation, and until now
+  nothing outside the daemon could tell them apart.
+
+  **For integrators.** The per-part estimate and the provider's reported count
+  are two measurements of one prompt, taken by different counters. They do not
+  agree, and the difference is worth showing. Do not sum them, and do not
+  present either as a component of the other. An absent `provider_used_tokens`
+  means the provider reported no count, which is not zero.
+
+  **For operators.** A new table, `context_breakdowns`, holds one row per turn.
+  It carries `user_id`, is scoped by it on every read, and has its own
+  row-level-security policy. A deployment with no database keeps no rows and
+  answers both commands with an error rather than an empty list, so "this
+  conversation has no entries" and "this daemon keeps none" stay different
+  answers.
+
 ### Changed
 
 - A tool result too large for the model to read inline is now stored whole

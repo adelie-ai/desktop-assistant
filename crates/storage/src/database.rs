@@ -138,6 +138,11 @@ const PERSONAL_DATA_TABLES: &[&str] = &[
     // doing, before any of the work itself is read.
     "negative_memory",
     "negative_memory_facet",
+    // 054 - one row per turn saying what filled its prompt. It names the
+    // conversations this person holds, the models they run on, and when each
+    // turn happened, which is a record of the person's work before any of the
+    // work itself is read.
+    "context_breakdowns",
 ];
 
 /// The canonical set of personal-data tables (see `PERSONAL_DATA_TABLES`).
