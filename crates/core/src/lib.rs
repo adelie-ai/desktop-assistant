@@ -12,6 +12,7 @@ pub mod planning;
 pub mod ports;
 pub mod prompts;
 pub mod recall;
+pub mod replay_eval;
 pub mod sanitize;
 pub mod service;
 pub mod skill_catalog;

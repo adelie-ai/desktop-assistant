@@ -265,6 +265,35 @@ mod tests {
         );
     }
 
+    /// AC (#1209): a model nothing measured takes the conservative default,
+    /// rather than an assumed value borrowed from a model that was measured.
+    #[test]
+    fn a_model_with_no_measurement_takes_the_conservative_default() {
+        let mut policy = WindowPolicy {
+            enabled: true,
+            ..Default::default()
+        };
+        // One model has been measured and its ceiling is far larger than the
+        // built-in default.
+        policy.by_model.insert(
+            "a-measured-model".to_string(),
+            WindowTarget {
+                ratio: DEFAULT_WINDOW_RATIO,
+                ceiling_tokens: 400_000,
+            },
+        );
+
+        let unmeasured = policy
+            .target_for("a-model-nobody-measured")
+            .expect("the bound is on");
+        assert_eq!(
+            unmeasured,
+            WindowTarget::default(),
+            "an unmeasured model must not inherit a measured one's room"
+        );
+        assert_eq!(unmeasured.ceiling_tokens, DEFAULT_WINDOW_CEILING_TOKENS);
+    }
+
     #[test]
     fn the_target_is_the_lower_of_the_share_and_the_ceiling() {
         let target = WindowTarget {
