@@ -26,6 +26,7 @@ pub mod tool_routing;
 pub mod tools;
 pub mod turn_capture;
 pub(crate) mod turn_index;
+pub mod verbatim_window;
 
 use thiserror::Error;
 

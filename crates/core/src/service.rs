@@ -585,6 +585,11 @@ pub struct ConversationHandler<S, L, T = NoopToolExecutor> {
     /// exactly as before. Wire the daemon's *event-emitting* write closure so
     /// plan changes reach clients via `ScratchpadChanged`.
     scratchpad_write: Option<ScratchpadWriteFn>,
+    /// Whether this daemon bounds the verbatim window by tokens, and to
+    /// what (#1208). Default is off, which leaves the window byte-for-byte as
+    /// it was - though not the whole prompt, since `[Earlier turns]` is gated
+    /// on windowing rather than on this.
+    verbatim_window: crate::verbatim_window::WindowPolicy,
     /// Optional lister for scratchpad notes. When set, the dispatch loop reads
     /// the conversation's `todo` notes each round and surfaces the open plan
     /// as a compact `[Plan]` system message so it stays in view while raw work
@@ -727,6 +732,7 @@ impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
             categorize_lock: tokio::sync::Mutex::new(()),
             scratchpad_get_many: None,
             scratchpad_write: None,
+            verbatim_window: crate::verbatim_window::WindowPolicy::default(),
             skill_search: None,
             skill_get: None,
             skill_write_authored: None,
@@ -950,6 +956,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             categorize_lock: tokio::sync::Mutex::new(()),
             scratchpad_get_many: None,
             scratchpad_write: None,
+            verbatim_window: crate::verbatim_window::WindowPolicy::default(),
             skill_search: None,
             skill_get: None,
             skill_write_authored: None,
@@ -1037,6 +1044,17 @@ impl<S, L, T> ConversationHandler<S, L, T> {
     /// dispatch loop advertises those tools each turn and uses this closure to
     /// record plan todos and distilled step outcomes. Wire the daemon's
     /// *event-emitting* write closure so plan changes reach clients.
+    /// Bound the verbatim window by tokens rather than by message count
+    /// (#1208).
+    ///
+    /// Off unless an operator turns it on: the failure this guards against
+    /// presents as "she forgot", so the switch is one somebody sets rather than
+    /// one they must remember to unset.
+    pub fn with_verbatim_window(mut self, policy: crate::verbatim_window::WindowPolicy) -> Self {
+        self.verbatim_window = policy;
+        self
+    }
+
     pub fn with_scratchpad_write(mut self, write: ScratchpadWriteFn) -> Self {
         self.scratchpad_write = Some(write);
         self
@@ -3474,12 +3492,59 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             // Assembly is a pure function of its inputs, and this round may run
             // it twice, so it takes the conversation as an argument rather than
             // capturing it - the fold between the two passes needs it mutably.
-            // `assembly_window` is a copy of `target_window` for the same
-            // reason: overflow recovery shrinks that one later in the round.
-            // Read it here, before anything in this iteration can change it: the
-            // fold compares against the window the prompt was actually asked
-            // for, and a stale copy would fold a range nothing dropped.
-            let assembly_window = target_window;
+            //
+            // The token bound (#1208) is computed fresh here and combined into
+            // `assembly_window`; it is NEVER written back to `target_window`.
+            //
+            // `target_window` carries what overflow recovery has decided and
+            // nothing else. That one only ever shrinks, because it is the
+            // number that has seen the provider's own count.
+            //
+            // **Writing the bound back would ratchet, and the ratchet breaks
+            // the floor this bound promises.** `messages_within_tokens` answers
+            // at least the whole current turn, and a turn grows two messages a
+            // round; a value stored on round 1 stays at round 1's size while
+            // the turn outgrows it, so by round 5 the window is smaller than
+            // the turn and the turn's own opening prompt sits outside it. The
+            // fresh value tracks the turn instead.
+            //
+            // Recomputed per round for a second reason too: what the model
+            // reads changes as the round evicts, and a result the projection
+            // already reads as a pointer costs the pointer.
+            let token_bound = self
+                .verbatim_window
+                .target_for(current_turn_route().model())
+                .zip(current_context_budget())
+                .map(|(target, budget)| {
+                    let target_tokens = target.tokens(budget.max_input_tokens);
+                    // `window_start` floors at `MIN_CONTEXT_MESSAGES` whatever
+                    // it is asked for, so the effective floor is the larger of
+                    // one complete turn and that. Applied here so the number
+                    // this loop holds is the number the window actually uses.
+                    let fits = crate::verbatim_window::messages_within_tokens(
+                        &conv.messages,
+                        &projection,
+                        &estimate,
+                        target_tokens,
+                    )
+                    .max(crate::context::MIN_CONTEXT_MESSAGES);
+                    tracing::debug!(
+                        conversation_id = %conversation_id.0,
+                        budget = budget.max_input_tokens,
+                        target_tokens,
+                        recovery_window = target_window,
+                        token_window = fits,
+                        "verbatim window bounded by tokens"
+                    );
+                    fits
+                });
+            // The fold below compares against what the loop asked for, which is
+            // the recovery window: a range the token bound dropped is in
+            // neither the prompt nor the rolling summary until something folds
+            // it, and comparing against the narrowed number would report the
+            // window as exactly what was asked for and fold nothing.
+            let window_before_token_bound = target_window;
+            let assembly_window = token_bound.map_or(target_window, |fits| target_window.min(fits));
             let assemble = |conv: &Conversation| {
                 assemble_turn_within_budget(
                     &ConversationView {
@@ -3516,7 +3581,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 match compact_preflight_shrink(
                     &mut conv,
                     assembled.window_from,
-                    assembly_window,
+                    window_before_token_bound,
                     self.task_llm(),
                 )
                 .await
@@ -3746,6 +3811,19 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     // Not measured at this boundary: the ladder's first two
                     // steps free space without reaching the provider at all,
                     // and its last step measures itself inside the summariser.
+                    // Recovery halves `target_window`, and the prompt that
+                    // just overflowed was governed by `assembly_window` -
+                    // `min(target_window, token bound)`. Where the token bound
+                    // was the narrower of the two, halving 40 -> 20 -> 10
+                    // changes nothing about the prompt while still reporting
+                    // progress, so the ladder burns its retries on identical
+                    // requests. Collapse it onto what actually governed first.
+                    //
+                    // This IS a ratchet, and a legitimate one: the provider has
+                    // said the prompt was too big, which is evidence no design
+                    // rule outranks. The token bound's own ratchet was the bug
+                    // because nothing had said anything.
+                    target_window = target_window.min(assembly_window);
                     let outcome = recover_from_overflow(
                         &mut conv,
                         &mut projection,
@@ -3857,6 +3935,12 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // show that summarization is active (#341).
                 let mut compaction_active = false;
                 if input_tokens > threshold {
+                    // Halve what governed the prompt, not the recovery window
+                    // alone - see the ladder above. Reporting
+                    // `compaction_active` while the window the model reads is
+                    // unchanged tells a client that summarisation is working
+                    // when it is not.
+                    target_window = target_window.min(assembly_window);
                     let new_window = (target_window / 2).max(MIN_CONTEXT_MESSAGES);
                     if new_window < target_window {
                         tracing::info!(
@@ -8477,6 +8561,457 @@ mod tests {
     }
 
     // --- Planning + compaction (#240) ---
+
+    // -----------------------------------------------------------------------
+    // The token-bounded verbatim window (#1208).
+    // -----------------------------------------------------------------------
+
+    /// A conversation of `turns` exchanges, each assistant reply about
+    /// `tokens_each` estimated tokens, already stored.
+    async fn stored_conversation(
+        handler: &ConversationHandler<MockStore, ToolCallingLlm, MockToolExecutor>,
+        turns: usize,
+        tokens_each: usize,
+    ) -> ConversationId {
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        let mut stored = handler.get_conversation(&conv.id).await.unwrap();
+        let body = "x".repeat(tokens_each * 4);
+        for i in 0..turns {
+            stored
+                .messages
+                .push(Message::new(Role::User, format!("PROMPT-{i}")));
+            stored
+                .messages
+                .push(Message::new(Role::Assistant, format!("REPLY-{i} {body}")));
+        }
+        handler.store.update(stored).await.unwrap();
+        conv.id
+    }
+
+    /// The prompts of every recorded call, as text.
+    fn prompt_bodies(prompts: &Arc<Mutex<Vec<Vec<Message>>>>) -> Vec<String> {
+        prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                p.iter()
+                    .map(|m| m.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect()
+    }
+
+    /// The turn's own prompt: the longest recorded one, so a side call - the
+    /// summariser, the title generator - is never mistaken for it.
+    fn turn_prompt(prompts: &Arc<Mutex<Vec<Vec<Message>>>>) -> String {
+        prompt_bodies(prompts)
+            .into_iter()
+            .max_by_key(String::len)
+            .expect("the turn made a call")
+    }
+
+    /// Whether the prompt carries the `[Earlier turns]` BLOCK.
+    ///
+    /// Checked as a line opening, because the standing system guidance names
+    /// the block too - a `contains` is satisfied by the instruction that
+    /// describes it and says nothing about whether one rendered.
+    fn has_turn_index(prompt: &str) -> bool {
+        prompt.lines().any(|l| l.starts_with("[Earlier turns]"))
+    }
+
+    fn budget(max_input_tokens: u64) -> crate::ports::llm::ContextBudget {
+        crate::ports::llm::ContextBudget {
+            max_input_tokens,
+            source: crate::ports::llm::BudgetSource::LearnedCap,
+        }
+    }
+
+    fn window_handler(
+        policy: crate::verbatim_window::WindowPolicy,
+    ) -> ConversationHandler<MockStore, ToolCallingLlm, MockToolExecutor> {
+        ConversationHandler::with_tools(
+            MockStore::new(),
+            ToolCallingLlm::new(vec![LlmResponse::text("the answer")]),
+            MockToolExecutor::new(vec![], HashMap::new()),
+            id_gen(),
+        )
+        .with_verbatim_window(policy)
+    }
+
+    fn tokens_policy(ceiling: u64) -> crate::verbatim_window::WindowPolicy {
+        crate::verbatim_window::WindowPolicy {
+            enabled: true,
+            default_target: crate::verbatim_window::WindowTarget {
+                ratio: 0.33,
+                ceiling_tokens: ceiling,
+            },
+            by_model: std::collections::HashMap::new(),
+        }
+    }
+
+    /// One run of `turns` fat exchanges under `policy` and `effective_budget`.
+    /// Answers the turn's own prompt.
+    ///
+    /// **The budget is deliberately far above what the prompt costs.** The
+    /// pre-flight shrink halves the window whenever the assembled prompt passes
+    /// `COMPACTION_TOKEN_RATIO` of the budget, and it produces the same visible
+    /// effect this bound does. A fixture that let it fire would prove nothing
+    /// about the bound - the first cut of these tests passed with the bound
+    /// disabled entirely.
+    async fn window_run(
+        policy: crate::verbatim_window::WindowPolicy,
+        effective_budget: u64,
+        turns: usize,
+        tokens_each: usize,
+    ) -> String {
+        use crate::ports::llm::with_context_budget;
+
+        let handler = window_handler(policy);
+        let prompts = handler.llm.prompts();
+        let id = stored_conversation(&handler, turns, tokens_each).await;
+        with_context_budget(budget(effective_budget), async {
+            handler
+                .send_prompt(&id, "next".into(), noop_callback(), noop_status())
+                .await
+                .unwrap();
+        })
+        .await;
+        turn_prompt(&prompts)
+    }
+
+    /// Eight fat turns, and a budget nothing else in assembly reacts to.
+    const WINDOW_TURNS: usize = 8;
+    const WINDOW_TOKENS_EACH: usize = 2_000;
+    const ROOMY_BUDGET: u64 = 1_000_000;
+
+    /// AC: with the switch off, behaviour is identical to today.
+    #[tokio::test]
+    async fn with_the_token_bound_off_the_window_is_exactly_what_it_was() {
+        let off = window_run(
+            crate::verbatim_window::WindowPolicy::default(),
+            ROOMY_BUDGET,
+            WINDOW_TURNS,
+            WINDOW_TOKENS_EACH,
+        )
+        .await;
+
+        // The precondition every test below depends on: with the bound off,
+        // nothing else in assembly narrows this window, so a difference in a
+        // later test can only be the bound.
+        assert!(
+            off.contains("REPLY-0") && off.contains("REPLY-7"),
+            "with the bound off the whole conversation stays in view"
+        );
+        assert!(
+            !has_turn_index(&off),
+            "nothing left the window, so the index has nothing to say"
+        );
+    }
+
+    /// AC: with it on, a turn whose history exceeds the budget keeps the most
+    /// recent turns that fit.
+    #[tokio::test]
+    async fn the_token_bound_keeps_the_most_recent_turns_that_fit() {
+        let off = window_run(
+            crate::verbatim_window::WindowPolicy::default(),
+            ROOMY_BUDGET,
+            WINDOW_TURNS,
+            WINDOW_TOKENS_EACH,
+        )
+        .await;
+        // A ceiling of 5,000 tokens against ~2,000-token turns: about two fit.
+        let on = window_run(
+            tokens_policy(5_000),
+            ROOMY_BUDGET,
+            WINDOW_TURNS,
+            WINDOW_TOKENS_EACH,
+        )
+        .await;
+
+        assert!(
+            on.len() < off.len(),
+            "the bound must narrow the window: {} vs {}",
+            on.len(),
+            off.len()
+        );
+        assert!(on.contains("REPLY-7"), "the most recent turn stays in view");
+        assert!(
+            !on.contains("REPLY-0"),
+            "the oldest turn must have left the verbatim window"
+        );
+    }
+
+    /// AC: a turn that needs more than the target gets it. The floor is one
+    /// complete turn, so the target never refuses or truncates.
+    #[tokio::test]
+    async fn a_single_turn_larger_than_the_target_is_carried_whole() {
+        // A target of ten tokens against a two-thousand-token turn.
+        let on = window_run(
+            tokens_policy(10),
+            ROOMY_BUDGET,
+            WINDOW_TURNS,
+            WINDOW_TOKENS_EACH,
+        )
+        .await;
+
+        assert!(
+            on.contains("REPLY-7"),
+            "the most recent turn travels whole however much it costs"
+        );
+        assert!(
+            !on.contains("REPLY-0"),
+            "and the bound still narrowed the window: this is pressure, not a \
+             refusal to narrow"
+        );
+    }
+
+    /// Recovery halves `target_window`, and the prompt is governed by
+    /// `min(target_window, token bound)`. Where the token bound is the
+    /// narrower - which is the point of turning it on - halving 40 -> 20 -> 10
+    /// leaves the prompt identical while the ladder still reports progress, so
+    /// the retries are spent re-sending the same request.
+    #[tokio::test]
+    async fn overflow_recovery_narrows_the_prompt_when_the_token_bound_governs_it() {
+        use crate::ports::llm::with_context_budget;
+        use std::sync::atomic::AtomicU32;
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let llm = OverflowThenSucceedLlm::new(u32::MAX, Arc::clone(&calls), "never reached");
+        let prompts = llm.prompts();
+
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            llm,
+            MockToolExecutor::new(vec![], HashMap::new()),
+            id_gen(),
+        )
+        // A ceiling far below the message window, so the token bound is what
+        // governs and `target_window` is not.
+        .with_verbatim_window(tokens_policy(3_000));
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        let mut stored = handler.get_conversation(&conv.id).await.unwrap();
+        let body = "x".repeat(2_000 * 4);
+        for i in 0..20 {
+            stored
+                .messages
+                .push(Message::new(Role::User, format!("PROMPT-{i}")));
+            stored
+                .messages
+                .push(Message::new(Role::Assistant, format!("REPLY-{i} {body}")));
+        }
+        handler.store.update(stored).await.unwrap();
+
+        with_context_budget(budget(ROOMY_BUDGET), async {
+            let _ = handler
+                .send_prompt(&conv.id, "next".into(), noop_callback(), noop_status())
+                .await;
+        })
+        .await;
+
+        // Every turn prompt the ladder sent, by how much history it carried.
+        let sizes: Vec<usize> = prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.len() > 2)
+            .map(std::vec::Vec::len)
+            .collect();
+        // A retry is only worth sending if it carries less than the one that
+        // overflowed. Recovery may also decide it has nothing left to free and
+        // stop after one - that is the right answer, not a missing retry.
+        // What must never happen is spending a retry on an identical request.
+        assert!(
+            !sizes.is_empty(),
+            "precondition: the turn must have reached the provider"
+        );
+        assert!(
+            sizes.windows(2).all(|w| w[1] < w[0]),
+            "recovery re-sent a prompt that carried as much as the one that \
+             overflowed, so it reported progress it did not make: {sizes:?}"
+        );
+    }
+
+    /// The floor is one complete turn, and a turn grows two messages a round.
+    /// A bound stored on round 1 would hold the window at round 1's size while
+    /// the turn outgrew it, and by round 5 the turn's own opening prompt would
+    /// sit outside its own window - unrecoverable, because `[Earlier turns]`
+    /// never indexes the turn being run.
+    #[tokio::test]
+    async fn the_bound_follows_a_turn_as_it_grows_rather_than_ratcheting() {
+        use crate::ports::llm::with_context_budget;
+
+        // Six tool rounds, then an answer: the turn reaches 13 messages.
+        let mut script: Vec<LlmResponse> = (0..6)
+            .map(|i| {
+                LlmResponse::with_tool_calls(
+                    "",
+                    vec![ToolCall::new(format!("c{i}"), "notes_search", "{}")],
+                )
+            })
+            .collect();
+        script.push(LlmResponse::text("done"));
+
+        let tools = vec![ToolDefinition::new(
+            "notes_search",
+            "search",
+            serde_json::json!({}),
+        )];
+        let mut results = HashMap::new();
+        results.insert("notes_search".to_string(), "a small result".to_string());
+
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            ToolCallingLlm::new(script),
+            MockToolExecutor::new(tools, results),
+            id_gen(),
+        )
+        // A ceiling so small that round 1 can hold only the current turn.
+        .with_verbatim_window(tokens_policy(10));
+        let prompts = handler.llm.prompts();
+
+        let id = stored_conversation(&handler, WINDOW_TURNS, WINDOW_TOKENS_EACH).await;
+        with_context_budget(budget(ROOMY_BUDGET), async {
+            handler
+                .send_prompt(
+                    &id,
+                    "THE-PROMPT-BEING-ANSWERED".into(),
+                    noop_callback(),
+                    noop_status(),
+                )
+                .await
+                .unwrap();
+        })
+        .await;
+
+        // The last round's prompt must still carry the turn's own opening as a
+        // real User message, not merely as the re-injected `[Current task]`
+        // anchor - the anchor carries the text, and the messages it asked
+        // about are what the model needs.
+        let recorded = prompts.lock().unwrap().clone();
+        let last = recorded.last().expect("the turn made a call");
+        assert!(
+            last.iter()
+                .any(|m| m.role == Role::User && m.content == "THE-PROMPT-BEING-ANSWERED"),
+            "the turn's own prompt left its own window by the last round; it \
+             carried {:?}",
+            last.iter()
+                .map(|m| (&m.role, m.content.chars().take(40).collect::<String>()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// AC: the percentage is applied to the EFFECTIVE per-turn budget - the
+    /// resolved figure the assembler plans against - and not to a model's
+    /// nominal window or to any configured ceiling.
+    ///
+    /// The ceiling is set out of reach, so the resolved budget is the only
+    /// number left that can decide the target, and two runs differing only in
+    /// it must carry different amounts of history.
+    #[tokio::test]
+    async fn the_share_is_taken_from_the_resolved_budget_and_nothing_else() {
+        let out_of_reach = tokens_policy(u64::MAX / 2);
+
+        // 0.33 x 30,000 = 9,900 tokens: about four turns.
+        let narrow = window_run(
+            out_of_reach.clone(),
+            30_000,
+            WINDOW_TURNS,
+            WINDOW_TOKENS_EACH,
+        )
+        .await;
+        // 0.33 x 200,000 = 66,000 tokens: all of them.
+        let wide = window_run(out_of_reach, 200_000, WINDOW_TURNS, WINDOW_TOKENS_EACH).await;
+
+        assert!(
+            wide.len() > narrow.len(),
+            "a larger resolved budget must buy more history: {} vs {}",
+            wide.len(),
+            narrow.len()
+        );
+        assert!(
+            !narrow.contains("REPLY-0"),
+            "the narrow budget must have dropped the oldest turn"
+        );
+        assert!(
+            wide.contains("REPLY-0"),
+            "the wide one must not have: it is the same conversation"
+        );
+    }
+
+    /// A range the bound dropped is in neither the prompt nor the rolling
+    /// summary until something folds it. The pre-flight fold already exists for
+    /// exactly that case, and it must see the window the loop ASKED for rather
+    /// than the one the bound narrowed it to - otherwise it reads the window as
+    /// exactly what was requested and folds nothing.
+    #[tokio::test]
+    async fn what_the_bound_dropped_reaches_the_rolling_summary() {
+        use crate::ports::llm::with_context_budget;
+
+        let handler = window_handler(tokens_policy(5_000));
+        let id = stored_conversation(&handler, WINDOW_TURNS, WINDOW_TOKENS_EACH).await;
+        let before = handler.get_conversation(&id).await.unwrap();
+        assert_eq!(
+            before.compacted_through, 0,
+            "precondition: nothing has been folded yet"
+        );
+
+        with_context_budget(budget(ROOMY_BUDGET), async {
+            handler
+                .send_prompt(&id, "next".into(), noop_callback(), noop_status())
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let after = handler.get_conversation(&id).await.unwrap();
+        assert!(
+            after.compacted_through > 0,
+            "the marker must cover what the bound dropped, got {}",
+            after.compacted_through
+        );
+    }
+
+    /// AC: every turn outside the verbatim window is present in the index tier
+    /// (#1206), so a turn the bound dropped is still distinguishable from one
+    /// that never happened.
+    #[tokio::test]
+    async fn a_turn_the_bound_dropped_is_still_named_by_the_index() {
+        let on = window_run(
+            tokens_policy(5_000),
+            ROOMY_BUDGET,
+            WINDOW_TURNS,
+            WINDOW_TOKENS_EACH,
+        )
+        .await;
+
+        assert!(has_turn_index(&on), "the index must have rendered");
+        // EVERY turn the bound dropped, not just the oldest: the criterion is
+        // that nothing falls into a gap, and checking one of several would pass
+        // for a block that named only that one.
+        let dropped: Vec<usize> = (0..WINDOW_TURNS)
+            .filter(|i| !on.contains(&format!("REPLY-{i}")))
+            .collect();
+        assert!(
+            dropped.len() > 1,
+            "precondition: the bound must drop more than one turn, or this test \
+             cannot tell a complete index from a partial one"
+        );
+        for i in &dropped {
+            assert!(
+                on.contains(&format!("PROMPT-{i}")),
+                "turn {i} left the window and the index does not name it"
+            );
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Turn-end capture (#1207).
