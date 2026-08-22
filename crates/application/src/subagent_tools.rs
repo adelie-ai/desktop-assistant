@@ -320,10 +320,17 @@ impl<C: ?Sized + ConversationService + Send + Sync + 'static> SubagentTools<C> {
         // private working conversation is filtered out of the user's
         // conversation list and message search -- the parent collects the
         // subagent's result off the pad (#607/#608), not from this transcript.
+        // The daemon composes this title from a name the MODEL supplies, so
+        // it is bounded rather than refused (#1303): refusing would fail a
+        // spawn over a label the user never saw. The `Subagent: ` prefix
+        // leads, so a cut removes the supplied name and the title still says
+        // what the conversation is.
+        let child_title =
+            desktop_assistant_core::domain::bound_generated_title(&format!("Subagent: {name}"));
         let child_conv = self
             .conversations
             .create_conversation(
-                format!("Subagent: {name}"),
+                child_title.clone(),
                 vec![desktop_assistant_core::domain::RESERVED_SUBAGENT_TAG.to_string()],
             )
             .await?;
@@ -364,7 +371,7 @@ impl<C: ?Sized + ConversationService + Send + Sync + 'static> SubagentTools<C> {
         let spec = AgentConversationSpec {
             user_id: user_id.clone(),
             name: name.clone(),
-            title: format!("Subagent: {name}"),
+            title: child_title,
             initial_prompt,
             override_selection,
             tools: if tools_allowlist.is_empty() {

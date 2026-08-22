@@ -447,6 +447,42 @@ fn ping_request_with_total_len(target: usize) -> String {
     json
 }
 
+/// Build a `WsRequest::RenameConversation` of exactly `target` bytes, padded
+/// in the `title`, and return it with the request id it carries.
+///
+/// The bulk goes in a field the reply does NOT echo. `RenameConversation`
+/// answers `Ack`, so a request at the inbound cap produces a tiny reply. A
+/// `Ping` cannot serve here: its reply echoes the request id, so a request one
+/// byte under the cap yields a reply a few bytes OVER it, and since #1303 the
+/// server refuses to put that on the wire. That refusal is correct - such a
+/// reply is unreadable by any peer holding the same cap - but it makes `Ping`
+/// unable to observe the inbound boundary this test is about.
+fn rename_request_with_total_len(target: usize) -> (String, String) {
+    let id = "req-1".to_string();
+    let base = WsRequest {
+        id: id.clone(),
+        command: desktop_assistant_api_model::Command::RenameConversation {
+            id: "c1".into(),
+            title: String::new(),
+        },
+    };
+    let base_len = serde_json::to_string(&base).unwrap().len();
+    assert!(
+        target >= base_len,
+        "target len {target} is smaller than envelope overhead {base_len}"
+    );
+    let req = WsRequest {
+        id: id.clone(),
+        command: desktop_assistant_api_model::Command::RenameConversation {
+            id: "c1".into(),
+            title: "x".repeat(target - base_len),
+        },
+    };
+    let json = serde_json::to_string(&req).unwrap();
+    assert_eq!(json.len(), target, "padded WsRequest length mismatch");
+    (json, id)
+}
+
 #[tokio::test]
 async fn ws_message_at_4_mb_minus_one_byte_is_accepted() {
     let (addr, server) = spawn_server().await;
@@ -455,13 +491,7 @@ async fn ws_message_at_4_mb_minus_one_byte_is_accepted() {
         .await
         .unwrap();
 
-    let payload = ping_request_with_total_len(MAX_WS_BYTES - 1);
-    let id_echo: String = serde_json::from_str::<serde_json::Value>(&payload)
-        .unwrap()
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap()
-        .to_string();
+    let (payload, id_echo) = rename_request_with_total_len(MAX_WS_BYTES - 1);
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         payload.into(),
@@ -480,14 +510,9 @@ async fn ws_message_at_4_mb_minus_one_byte_is_accepted() {
     match parsed {
         WsFrame::Result { id, result } => {
             assert_eq!(id, id_echo, "result id should echo the request id");
-            assert_eq!(
-                result,
-                desktop_assistant_api_model::CommandResult::Pong {
-                    value: "pong".into()
-                }
-            );
+            assert_eq!(result, desktop_assistant_api_model::CommandResult::Ack);
         }
-        other => panic!("expected Pong result, got {other:?}"),
+        other => panic!("expected an Ack result, got {other:?}"),
     }
 
     server.abort();

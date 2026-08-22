@@ -13,11 +13,39 @@ Interface: `org.desktopAssistant.Settings`
 ## Methods
 
 - `CreateConversation(title: s) -> id: s`
+  - A `title` past the daemon's title cap (4 KiB of serialized bytes) is
+    refused with a D-Bus error naming the size. Nothing is created. The same
+    refusal applies to `RenameConversation`.
 - `ListConversations(max_age_days: i) -> a(ssus)`
   - `max_age_days = 0` disables filtering
   - tuple: `(id, title, message_count, updated_at)` where `updated_at` is `YYYY-MM-DD HH:MM:SS`
+  - The daemon bounds each `title` in bytes. Only a title stored before the
+    write bound can arrive cut; a title written from now on is refused past the
+    cap rather than stored. A cut title states the loss in words at the end of
+    what is kept. This signature has no field for the stored size, so a D-Bus
+    caller cannot tell a cut title from a whole one. Never write a title from
+    this list back with a rename - it would be refused: on the WebSocket and
+    UDS shape the answer carries `title_total_bytes` for exactly that check.
+  - The daemon bounds the whole answer in bytes as well, so a very long list
+    arrives holding the most recently updated part of it. This signature has no
+    field to report how many conversations were left out.
 - `GetConversation(id: s) -> (id: s, title: s, messages: a(ss))`
   - message tuple: `(role, content)`
+  - The daemon bounds this answer in bytes, so a conversation larger than the
+    response budget returns its NEWEST messages only. This signature has no
+    field to report that in - the WebSocket and UDS shape carries
+    `omitted_leading_messages`, and a D-Bus caller sees a shorter list instead.
+    A caller that needs the whole history must page it with `GetMessages`. A
+    single message past the budget arrives headed, and its content opens with
+    a line saying so. The `title` is bounded in bytes the same way a
+    `ListConversations` row's is, and cannot be told from a whole one here
+    either. See `docs/API_TRANSPORT.md`.
+  - `GetMessages` on this interface has the same limit. The daemon runs one
+    windowing path for every transport, so a D-Bus window IS cut to the response
+    byte budget, and the `(total, truncated, messages)` signature has no field
+    to say so. A caller reads `truncated`, which the bridge does return, and
+    uses UDS or WebSocket where it needs `size_capped`, `next_after_count` or
+    `content_total_bytes`.
 - `DeleteConversation(id: s) -> ()`
 - `ClearAllHistory() -> deleted_count: u`
 - `SendPrompt(conversation_id: s, prompt: s) -> request_id: s`

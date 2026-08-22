@@ -5,8 +5,12 @@
 //! close marker by some peers). The header is read with `read_exact`, the
 //! body is then allocated and read with `read_exact`.
 //!
-//! The [`MAX_FRAME_LEN`] cap keeps a buggy or hostile peer from claiming a
-//! multi-GB length and forcing an allocation blow-up.
+//! The [`MAX_FRAME_LEN`] cap applies to both directions. On read it keeps a
+//! buggy or hostile peer from claiming a multi-GB length and forcing an
+//! allocation blow-up. On write it stops this side putting a frame on the wire
+//! that the peer's reader is bound to reject - which used to cost the whole
+//! connection, because a peer that rejects a frame breaks its read loop and
+//! fails every outstanding request, not only the one that was too large.
 //!
 //! This crate is intentionally tiny and dependency-light (only `tokio` for
 //! the async read/write traits) so both the server transports
@@ -48,11 +52,37 @@ where
     Ok(body)
 }
 
+/// `true` when a body is too large for one frame, so a caller can answer the
+/// waiting request with a failure instead of putting an unreadable frame on
+/// the wire.
+///
+/// [`write_frame`] applies the same check itself and refuses. This predicate
+/// exists so a transport can tell the two failures apart *before* it writes:
+/// an oversize body means one request cannot be answered, while a write error
+/// means the connection is gone. Confusing the two is what made a single large
+/// response tear down every outstanding request on the connection.
+pub fn exceeds_frame_cap(body: &[u8]) -> bool {
+    body.len() > MAX_FRAME_LEN as usize
+}
+
 /// Write one length-prefixed frame and flush.
+///
+/// Refuses a body larger than [`read_frame`] would accept, with
+/// [`std::io::ErrorKind::InvalidData`] and **before writing any bytes**. The
+/// reader has always rejected an oversize frame; the writer used to send one
+/// happily, so the daemon could put a frame on the wire that no peer was able
+/// to read. A partial write would be worse still: it would desynchronize the
+/// stream and break every later request on that connection.
 pub async fn write_frame<W>(writer: &mut W, body: &[u8]) -> std::io::Result<()>
 where
     W: AsyncWriteExt + Unpin,
 {
+    if exceeds_frame_cap(body) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("frame body {} exceeds cap {MAX_FRAME_LEN}", body.len()),
+        ));
+    }
     let len = body.len() as u32;
     writer.write_all(&len.to_le_bytes()).await?;
     writer.write_all(body).await?;
@@ -118,6 +148,49 @@ mod tests {
         let mut cursor = std::io::Cursor::new(buf);
         let err = read_frame(&mut cursor).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    /// Acceptance (#1303): `write_frame` refuses a body larger than
+    /// `read_frame` would accept. The two used to disagree - the reader
+    /// rejected an oversize frame and the writer wrote one happily - so the
+    /// daemon could put a frame on the wire that no peer was able to read.
+    #[tokio::test]
+    async fn write_frame_refuses_a_body_larger_than_read_frame_would_accept() {
+        let body = vec![b'x'; MAX_FRAME_LEN as usize + 1];
+        let mut buf = Vec::new();
+        let err = write_frame(&mut buf, &body)
+            .await
+            .expect_err("an oversize body must be refused, not written");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// #1303: the refusal writes NOTHING. A partial frame would desynchronize
+    /// the stream and break every later request on the same connection, which
+    /// is the failure the refusal exists to prevent.
+    #[tokio::test]
+    async fn a_refused_frame_puts_no_bytes_on_the_wire() {
+        let body = vec![b'x'; MAX_FRAME_LEN as usize + 1];
+        let mut buf = Vec::new();
+        let _ = write_frame(&mut buf, &body).await;
+        assert!(
+            buf.is_empty(),
+            "a refused frame must leave the stream untouched, got {} bytes",
+            buf.len()
+        );
+    }
+
+    /// #1303: the boundary is the same on both sides. A body of exactly
+    /// `MAX_FRAME_LEN` is accepted by the reader, so the writer accepts it too.
+    #[tokio::test]
+    async fn write_frame_accepts_a_body_of_exactly_max_len() {
+        let body = vec![b'x'; MAX_FRAME_LEN as usize];
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &body)
+            .await
+            .expect("a body at the cap is within it, not over it");
+
+        let mut cursor = std::io::Cursor::new(buf);
+        assert_eq!(read_frame(&mut cursor).await.unwrap().len(), body.len());
     }
 
     #[tokio::test]

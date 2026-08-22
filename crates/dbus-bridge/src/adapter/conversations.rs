@@ -937,12 +937,15 @@ mod tests {
                     role: role.to_string(),
                     content: content.to_string(),
                     idempotency_key: None,
+                    content_total_bytes: None,
                 })
                 .collect(),
             warnings: Vec::new(),
             model_selection: None,
             conversation_personality: None,
             tool_gate_disabled: false,
+            omitted_leading_messages: 0,
+            title_total_bytes: None,
         })
     }
 
@@ -1025,6 +1028,9 @@ mod tests {
                 updated_at: "2026-06-14".into(),
                 archived: false,
                 tags: vec![],
+                title_total_bytes: None,
+                omitted_trailing_conversations: 0,
+                omitted_tags: 0,
             }],
         )));
         let rows = DbusConversationsAdapter::new(Arc::clone(&t))
@@ -1138,8 +1144,11 @@ mod tests {
                     role: role.to_string(),
                     content: content.to_string(),
                     idempotency_key: None,
+                    content_total_bytes: None,
                 })
                 .collect(),
+            size_capped: false,
+            next_after_count: 0,
         })
     }
 
@@ -1360,6 +1369,8 @@ mod tests {
             total_raw_count: 0,
             truncated: false,
             messages: Vec::new(),
+            size_capped: false,
+            next_after_count: 0,
         });
         let bridge = Arc::new(CannedTransport::new(reply.clone()));
         DbusConversationsAdapter::new(Arc::clone(&bridge))

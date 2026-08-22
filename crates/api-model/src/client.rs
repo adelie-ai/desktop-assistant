@@ -171,6 +171,7 @@ mod tests {
             role: "assistant".into(),
             content: "hi".into(),
             idempotency_key: None,
+            content_total_bytes: None,
         });
         assert_eq!(m.kind, MessageKind::Normal);
         assert_eq!(m.content, "hi");
@@ -191,6 +192,7 @@ mod tests {
             role: "user".into(),
             content: "hi".into(),
             idempotency_key: Some("k1".into()),
+            content_total_bytes: None,
         });
         assert_eq!(
             m.idempotency_key.as_deref(),
@@ -246,6 +248,7 @@ mod created_at_tests {
             role: "user".to_string(),
             content: "hi".to_string(),
             idempotency_key: None,
+            content_total_bytes: None,
         };
         let first = ChatMessage::from(view.clone()).created_at_ms;
         let second = ChatMessage::from(view).created_at_ms;

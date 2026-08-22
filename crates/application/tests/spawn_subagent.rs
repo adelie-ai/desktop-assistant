@@ -21,7 +21,8 @@ use desktop_assistant_application::subagent_tools::{
 };
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{
-    Conversation, ConversationId, ConversationSummary, Message, ToolDefinition, ToolNamespace,
+    Conversation, ConversationId, ConversationSummary, MAX_TITLE_BYTES, Message, ToolDefinition,
+    ToolNamespace, title_serialized_len,
 };
 use desktop_assistant_core::ports::auth::with_user_id;
 use desktop_assistant_core::ports::inbound::{
@@ -426,6 +427,65 @@ async fn wait_for_completion(
             Err(_) => panic!("timed out waiting for TaskCompleted({want})"),
         }
     }
+}
+
+// --------------------------------------------------------------------
+// The child conversation's title is bounded where it is composed (#1303)
+// --------------------------------------------------------------------
+
+/// #1303: `spawn_subagent` composes the child conversation's title from a
+/// `name` the MODEL supplies. The daemon composes that title, so it is bounded
+/// where it is composed rather than refused - a refusal would fail a spawn the
+/// user did not ask for. The `Subagent: ` label leads, so a cut removes the
+/// supplied name and the title still says what the conversation is.
+#[tokio::test]
+async fn a_subagent_title_is_bounded_where_it_is_composed() {
+    let registry = Arc::new(BackgroundTaskRegistry::new());
+    let conversations = Arc::new(FakeConversations::new("hello"));
+    let tools = SubagentTools::new(Arc::clone(&registry), Arc::clone(&conversations));
+    let user = unique_user("alice");
+
+    let user_for_body = user.clone();
+    let tools_for_body = tools.clone();
+    let (_parent_id, result) =
+        under_parent_task(&registry, user.clone(), "parent-conv", move |_pid| {
+            let tools = tools_for_body;
+            let user = user_for_body;
+            async move {
+                with_user_id(user, async move {
+                    tools
+                        .execute_tool(
+                            TOOL_SPAWN_SUBAGENT,
+                            serde_json::json!({
+                                "name": "n".repeat(4 * 1024 * 1024),
+                                "prompt": "say hello",
+                                "wait": true,
+                            }),
+                        )
+                        .await
+                })
+                .await
+            }
+        })
+        .await;
+
+    result.expect("a spawn must not fail because the model chose a long name");
+
+    let title = conversations
+        .state
+        .lock()
+        .unwrap()
+        .conversations
+        .values()
+        .map(|conv| conv.title.clone())
+        .find(|title| title.starts_with("Subagent: "))
+        .expect("the spawn must create a child conversation labelled as a subagent");
+
+    let bytes = title_serialized_len(&title);
+    assert!(
+        bytes <= MAX_TITLE_BYTES,
+        "a generated title must be bounded at generation: {bytes} > {MAX_TITLE_BYTES}"
+    );
 }
 
 // --------------------------------------------------------------------

@@ -12,7 +12,8 @@ pub mod skill;
 pub mod tool;
 
 pub use conversation::{
-    Conversation, ConversationId, ConversationSummary, MessageSummary, RESERVED_SUBAGENT_TAG,
+    Conversation, ConversationId, ConversationSummary, MAX_TITLE_BYTES, MessageSummary,
+    RESERVED_SUBAGENT_TAG, bound_generated_title, check_title_bound, title_serialized_len,
 };
 pub use knowledge::{KnowledgeEntry, SUMMARY_MAX_CHARS};
 pub use knowledge_use::{

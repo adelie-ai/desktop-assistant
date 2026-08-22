@@ -1883,6 +1883,52 @@ pub struct ConversationSummary {
     pub archived: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// Byte length of the whole stored title, when `title` holds only the
+    /// beginning of it (#1303). `None` (the default, and omitted from the
+    /// wire) means `title` is the whole stored title.
+    ///
+    /// A client that pre-fills a rename field from a served title MUST check
+    /// this first. The value it was given is a head with a notice on the end,
+    /// so writing it back with `RenameConversation` replaces the stored title
+    /// with the cut one and the rest is gone. A response bound is a read-path
+    /// bound: nothing is deleted while the client does not write it back.
+    ///
+    /// Only a title stored BEFORE the write bound can carry this. A title
+    /// written from now on is refused past [`MAX_TITLE_BYTES`] rather than
+    /// stored, so a response never has to cut one. The warning above still
+    /// holds for those older rows, because a cut title is itself inside the
+    /// cap and so is accepted when it is written back.
+    ///
+    /// Mirrors [`MessageView::content_total_bytes`], and carries the same
+    /// limit: it reports the size and offers no reader, because no
+    /// client-facing byte-range read exists yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_total_bytes: Option<u64>,
+    /// How many conversations the response left out, from the END of the list,
+    /// to stay inside [`MAX_RESPONSE_BYTES`] (#1303). `0` (the default, and
+    /// omitted from the wire) means the list holds every conversation the
+    /// request asked for.
+    ///
+    /// Carried on every returned row, and the same value on each.
+    /// `CommandResult::Conversations` is a bare list with no envelope to put it
+    /// in, and giving the variant an envelope would change the wire shape of a
+    /// result an older client already parses - the compatibility break this
+    /// work exists to avoid. So a client reads the count off any row it has.
+    /// The cut takes the END of the list, which is the least recently updated
+    /// part, so what a sidebar shows first is what survives.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub omitted_trailing_conversations: u32,
+    /// How many of THIS row's tags were left out to keep the row inside the
+    /// response budget (#1303). `0` (the default, and omitted from the wire)
+    /// means the row carries every tag it has.
+    ///
+    /// A tag is written by the client and validated nowhere, so one row's tags
+    /// could take the whole response on their own. Cutting them keeps the row
+    /// in the list: a conversation the caller cannot see is worse than a
+    /// conversation shown with fewer tags. `tags` keeps the first ones, so
+    /// what is dropped is the end of the list.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub omitted_tags: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1914,7 +1960,109 @@ pub struct ConversationView {
     /// old-shaped or new-shaped payload identically.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tool_gate_disabled: bool,
+    /// How many of the OLDEST messages this response left out to stay inside
+    /// [`MAX_RESPONSE_BYTES`] (#1303). `0` (the default, and omitted from the
+    /// wire) means no message was left out.
+    ///
+    /// Zero does NOT mean the response is whole. A response is partial in
+    /// three independent ways, and this field reports only the first: a
+    /// message can be left out, a message that is larger than the whole budget
+    /// comes back headed instead of dropped, and the title can be cut. A
+    /// conversation of one over-budget message therefore carries this field at
+    /// zero and one headed row. A reader that wants to know whether it has
+    /// everything must check [`MessageView::content_total_bytes`] on the
+    /// returned messages and [`ConversationView::title_total_bytes`] as well.
+    ///
+    /// This is the business status of a partial read, in the payload rather
+    /// than in a transport failure. It is also the caller's cursor: the
+    /// omitted messages are raw indexes `0 .. omitted_leading_messages`, so a
+    /// caller reads them with `GetMessages { after_count: 0 }` and then walks
+    /// forward with `MessagesView::next_after_count`.
+    ///
+    /// A **field**, never a new [`ConversationWarning`] variant. Serde refuses
+    /// an unknown enum variant, so a new variant would make an old client fail
+    /// the whole `ConversationView` parse - which is the very failure #1303
+    /// removes. An unknown field is ignored instead. `WsFrame::Error::detail`
+    /// records the same reasoning.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub omitted_leading_messages: u32,
+    /// Byte length of the whole stored title, when `title` holds only the
+    /// beginning of it (#1303). `None` (the default, and omitted from the
+    /// wire) means `title` is the whole stored title.
+    ///
+    /// The same marker, with the same meaning and the same warning, as
+    /// [`ConversationSummary::title_total_bytes`]: a client that pre-fills a
+    /// rename field from this title must refuse to write it back while this
+    /// field is set, or the cut value replaces the stored one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_total_bytes: Option<u64>,
 }
+
+/// `true` when a `u32` counter is at its default, so serde omits it and the
+/// wire bytes stay identical to the shape an older peer sends.
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+/// Serialized-byte budget for one command response body (#1303).
+///
+/// `GetConversation` and `GetMessages` bound what they return against this
+/// before the response is handed to a transport. Every transport into and out
+/// of the daemon caps one message at 4 MiB - `MAX_FRAME_LEN` in
+/// `desktop-assistant-frame-codec` for UDS and the D-Bus bridge,
+/// `MAX_WS_MESSAGE_BYTES` in `desktop-assistant-ws` for WebSocket - and an
+/// answer past that cap could not be read at all. Bounding it here turns a
+/// torn-down connection into a partial answer the caller can page.
+///
+/// A megabyte below the transport cap, deliberately. The layer that builds a
+/// response cannot see the frame the transport wraps it in, and the D-Bus
+/// bridge re-wraps it again. Slack costs nothing here and removes every
+/// rounding argument. `uds-interface` and `ws-interface` each hold the tie to
+/// their own cap with a compile-time assertion, so the two cannot drift.
+pub const MAX_RESPONSE_BYTES: usize = 3 * 1024 * 1024;
+
+/// Serialized-byte budget for a conversation title in a response (#1303).
+///
+/// This is a BACKSTOP for a title that is already stored, not the working
+/// bound. A title is bounded where it is WRITTEN: a title a client supplies
+/// past this size is refused with the business code
+/// `conversation_title_too_long`, and a title the daemon composes for itself
+/// is cut at generation. The rule and the number both live in
+/// `desktop_assistant_core::domain::MAX_TITLE_BYTES`, and a compile-time
+/// assertion in `desktop-assistant-application` holds the two constants equal.
+/// A backstop under the write bound would cut a title the write path had just
+/// accepted, which is the loss this work removes.
+///
+/// The backstop stays because a write rule cannot repair a title that is
+/// already stored, and a row written before that rule existed can be any size.
+/// A response cuts such a title, states the loss in words at the end of what
+/// is kept, and reports the stored size in `title_total_bytes`. Nothing this
+/// daemon stores from now on can reach that cut.
+///
+/// Why one legacy title matters: a title rides in every conversation view,
+/// every conversation summary and the title-changed event. One of them alone
+/// could push a `GetConversation` answer past the transport cap and make that
+/// conversation unopenable, and push a `ListConversations` answer past it and
+/// make the whole conversation list unreadable.
+pub const MAX_TITLE_BYTES: usize = 4096;
+
+/// Inbound WebSocket message / frame size cap, in bytes.
+///
+/// Mirrors the length-prefixed frame caps in `desktop-assistant-frame-codec`
+/// (UDS) and `crates/dbus-bridge/src/transport.rs`, so every transport into
+/// the daemon has the same `4 * 1024 * 1024 == 4_194_304`-byte ceiling. The
+/// server caps *both* `max_message_size` and `max_frame_size`: the former
+/// keeps an attacker from assembling a giant message out of many in-cap
+/// fragments, and the latter rejects an oversize single frame before its body
+/// is even allocated (closes SECURITY_AUDIT.md #7).
+///
+/// It lives beside the wire types, not in the server crate, because both sides
+/// need it and neither may depend on the other: the server enforces it, and a
+/// client must not enqueue a request past it. A client that writes an oversize
+/// message loses the socket, and with it every request in flight - not only
+/// the one that was too large. `desktop-assistant-ws` re-exports this constant,
+/// so one number holds both ends.
+pub const MAX_WS_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Advisory conditions attached to a conversation view. Modeled as an enum
 /// so additional variants can be added without breaking existing clients.
@@ -1948,13 +2096,91 @@ pub struct MessageView {
     /// it (`serde(default)`).
     #[serde(default)]
     pub idempotency_key: Option<String>,
+    /// Byte length of the whole stored content, when `content` holds only the
+    /// beginning of it (#1303). `None` (the default, and omitted from the
+    /// wire) means `content` is the whole message.
+    ///
+    /// Set only when one message alone is larger than the response budget.
+    /// The response then carries the head of the row rather than dropping the
+    /// row, so a conversation is never unreadable because of a single large
+    /// message. `content` states the same loss in words at its front, so a
+    /// client that predates this field still shows the reader what happened.
+    ///
+    /// Nothing was deleted: the message is stored whole. No client-facing
+    /// byte-range read exists yet, so this field reports the size and offers
+    /// no reader.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_total_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MessagesView {
     pub total_raw_count: u32,
+    /// `true` when older messages were dropped from the front of the window.
+    ///
+    /// Set by a tail request that asked for fewer messages than the
+    /// conversation holds, and by the response byte budget when it cut a tail
+    /// window (#1303) - both drop the OLDEST. This is the only signal a tail
+    /// caller has that rows are missing, because `next_after_count` names the
+    /// end of the conversation in tail mode. Read [`MessagesView::size_capped`]
+    /// as well to tell which of the two did it.
     pub truncated: bool,
     pub messages: Vec<MessageView>,
+    /// `true` when the response budget ([`MAX_RESPONSE_BYTES`]) removed
+    /// messages from this window (#1303). `false` (the default, and omitted
+    /// from the wire) means the budget removed no message from the window.
+    ///
+    /// Distinct from `truncated`, which says the *tail* request dropped older
+    /// messages. Both are set when a tail window is cut by bytes. Only this
+    /// one is set when a cursor window (`after_count >= 0`) is cut, because a
+    /// cursor window drops the NEWEST end: the caller continues from
+    /// `next_after_count`.
+    ///
+    /// `false` does NOT mean the window is whole. A window is partial in two
+    /// independent ways, and this field reports only the first: a message can
+    /// be removed from the window, and a message that is larger than the whole
+    /// budget comes back HEADED instead of removed. A window whose only
+    /// message is over-budget therefore carries this field at `false` and one
+    /// headed row, because nothing was removed. A reader that wants to know it
+    /// has everything must check [`MessageView::content_total_bytes`] on the
+    /// returned messages as well.
+    ///
+    /// It is the stop condition of a walk in cursor mode: while it is `true`,
+    /// there is another page.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub size_capped: bool,
+    /// The raw message index this window ended at - one past the last message
+    /// it carries - so a caller reads the next page with
+    /// `GetMessages { after_count: next_after_count }` (#1303).
+    ///
+    /// The caller must not derive the cursor itself. `after_count` indexes RAW
+    /// messages, while `messages` counts the messages left AFTER the
+    /// `include_roles` filter, so `after_count + messages.len()` names an
+    /// earlier row than the window really reached and re-reads rows whenever a
+    /// role filter is active. This field is the raw index, so the two can
+    /// never disagree.
+    ///
+    /// `total_raw_count` when the window is empty, which says there is nothing
+    /// further to read.
+    ///
+    /// The walk belongs to CURSOR mode (`after_count >= 0`): while
+    /// `size_capped` is `true`, request again from `next_after_count`. Each cut
+    /// page carries at least one message, so the cursor always moves forward
+    /// and the walk ends.
+    ///
+    /// In TAIL mode this field names the END of the conversation, because a
+    /// tail window keeps the NEWEST messages. Requesting again from it returns
+    /// an empty window, so a walk that follows it in tail mode reads nothing
+    /// and stops - having never read the older messages the tail window
+    /// dropped. A tail caller reads `truncated` instead, which says older
+    /// messages were dropped, and reads them by switching to cursor mode from
+    /// `after_count: 0` and walking forward.
+    ///
+    /// `serde(default)` keeps an older payload parsing. An older peer never
+    /// sets `size_capped` either, so a walk over an old payload stops on the
+    /// first page and never reads this field.
+    #[serde(default)]
+    pub next_after_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2916,6 +3142,19 @@ pub enum WsFrame {
 }
 
 impl WsFrame {
+    /// The request this frame answers, or `None` for an `Event`.
+    ///
+    /// A transport uses it to turn a per-frame failure into a failure of the
+    /// one request rather than of the connection (#1303): with an id it can
+    /// send an `Error` the waiting caller matches, and without one it has no
+    /// caller to tell.
+    pub fn request_id(&self) -> Option<&str> {
+        match self {
+            Self::Result { id, .. } | Self::Error { id, .. } => Some(id),
+            Self::Event { .. } => None,
+        }
+    }
+
     /// An unclassified failure: the historical shape, message only.
     pub fn error(id: impl Into<String>, message: impl Into<String>) -> Self {
         Self::Error {
@@ -5196,6 +5435,107 @@ mod tests {
         assert_eq!(res, back);
     }
 
+    /// Acceptance (#1303): partial-ness travels as a FIELD, so a payload from
+    /// an older daemon - which has no such field - still parses whole. A new
+    /// `ConversationWarning` variant would have failed the entire parse and
+    /// left the conversation just as unopenable.
+    #[test]
+    fn an_old_shaped_conversation_view_still_parses() {
+        let old = r#"{"id":"c1","title":"t","messages":[{"role":"user","content":"hi"}]}"#;
+        let view: ConversationView = serde_json::from_str(old).expect("old shape must parse");
+        assert_eq!(view.messages.len(), 1);
+        assert_eq!(
+            view.omitted_leading_messages, 0,
+            "an older daemon reports nothing omitted"
+        );
+        assert_eq!(
+            view.messages[0].content_total_bytes, None,
+            "an older daemon reports whole content"
+        );
+    }
+
+    /// #1303: the same for `MessagesView` - an old payload has neither
+    /// `size_capped` nor `next_after_count`, and must read as "not capped"
+    /// rather than fail. A walk over an old payload stops on the first page,
+    /// because `size_capped` is the stop condition and it reads as `false`.
+    #[test]
+    fn an_old_shaped_messages_view_still_parses() {
+        let old = r#"{"total_raw_count":2,"truncated":true,"messages":[]}"#;
+        let view: MessagesView = serde_json::from_str(old).expect("old shape must parse");
+        assert_eq!(view.total_raw_count, 2);
+        assert!(view.truncated);
+        assert!(!view.size_capped);
+        assert_eq!(
+            view.next_after_count, 0,
+            "an older daemon sends no cursor, and a walk never reads it"
+        );
+    }
+
+    /// #1303: a whole response keeps the wire bytes it always had. The new
+    /// fields are omitted at their defaults, so an older client sees exactly
+    /// the payload it saw before.
+    #[test]
+    fn a_whole_response_omits_the_partial_fields_from_the_wire() {
+        let view = ConversationView {
+            id: "c1".into(),
+            title: "t".into(),
+            messages: vec![MessageView {
+                id: "m1".into(),
+                role: "user".into(),
+                content: "hi".into(),
+                idempotency_key: None,
+                content_total_bytes: None,
+            }],
+            warnings: vec![],
+            model_selection: None,
+            conversation_personality: None,
+            tool_gate_disabled: false,
+            omitted_leading_messages: 0,
+            title_total_bytes: None,
+        };
+        let json = serde_json::to_string(&view).expect("serialize");
+        assert!(
+            !json.contains("omitted_leading_messages"),
+            "a whole conversation must not carry the partial marker: {json}"
+        );
+        assert!(
+            !json.contains("content_total_bytes"),
+            "a whole message must not carry the headed marker: {json}"
+        );
+    }
+
+    /// #1303: a partial response DOES carry the markers, so a caller can act
+    /// on them without parsing prose.
+    #[test]
+    fn a_partial_response_carries_the_partial_markers_on_the_wire() {
+        let view = ConversationView {
+            id: "c1".into(),
+            title: "t".into(),
+            messages: vec![MessageView {
+                id: "m1".into(),
+                role: "user".into(),
+                content: "<head>".into(),
+                idempotency_key: None,
+                content_total_bytes: Some(9_000_000),
+            }],
+            warnings: vec![],
+            model_selection: None,
+            conversation_personality: None,
+            tool_gate_disabled: false,
+            omitted_leading_messages: 7,
+            title_total_bytes: Some(5_000_000),
+        };
+        let json = serde_json::to_string(&view).expect("serialize");
+        let back: ConversationView = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(back.omitted_leading_messages, 7);
+        assert_eq!(back.messages[0].content_total_bytes, Some(9_000_000));
+        assert_eq!(
+            back.title_total_bytes,
+            Some(5_000_000),
+            "a cut title must be machine-readable, not prose inside the value"
+        );
+    }
+
     #[test]
     fn conversation_view_carries_optional_personality_override() {
         // `conversation_personality` is omitted from the wire when `None`
@@ -5209,6 +5549,8 @@ mod tests {
             model_selection: None,
             conversation_personality: None,
             tool_gate_disabled: false,
+            omitted_leading_messages: 0,
+            title_total_bytes: None,
         };
         let json = serde_json::to_string(&view).unwrap();
         assert!(
@@ -5266,6 +5608,8 @@ mod tests {
             model_selection: None,
             conversation_personality: None,
             tool_gate_disabled: false,
+            omitted_leading_messages: 0,
+            title_total_bytes: None,
         };
         let json = serde_json::to_string(&view).unwrap();
         assert!(

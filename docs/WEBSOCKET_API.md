@@ -263,8 +263,73 @@ Current command variants:
     overwrite a file it could not read. It clears once the file loads again.
 - `set_config { changes }`
 - `create_conversation { title }`
+  - A `title` past `desktop_assistant_core::domain::MAX_TITLE_BYTES` (4 KiB of
+    serialized bytes) is refused. The error frame carries the business code
+    `conversation_title_too_long`, a message fit to show the person, and
+    `retryable: false`. Nothing is created.
 - `list_conversations { max_age_days }`
+  - The whole answer is bounded in **bytes**, not one field of it. A list past
+    the budget comes back holding the FRONT of the list - the most recently
+    updated part - and every returned row carries
+    `omitted_trailing_conversations`, the number of conversations the answer
+    left out. The count is repeated on each row because the result is a bare
+    list with no envelope to carry it, so read it off any row.
+  - Each row's `title` is bounded in bytes. Only a title stored before the
+    write bound can be cut: a title written from now on is refused past the cap
+    rather than stored. A cut title states the loss in words at the end of what
+    is kept, and carries `title_total_bytes` with the stored size. A title
+    inside the bound is unchanged and unmarked. **Do not write a cut title
+    back**: a rename dialog pre-filled from a title whose `title_total_bytes`
+    is set offers a value `rename_conversation` now refuses, so read the field
+    and disable the field rather than letting the person meet the refusal.
+  - A row's `tags` are bounded too. `tags` is client-written and validated
+    nowhere, so one row's tags could take the whole answer. A row that does not
+    fit loses tags from the end of its list before it loses its place in the
+    list, and says how many with `omitted_tags`.
 - `get_conversation { id }`
+  - The answer is bounded in **bytes**, not only in message count. A
+    conversation larger than the response budget comes back as a normal,
+    successful result holding the NEWEST messages that fit, with
+    `omitted_leading_messages` naming how many of the oldest were left out.
+    That count is also the cursor to read the rest: the omitted messages are
+    raw indexes `0 .. omitted_leading_messages`, so page them with
+    `get_messages { after_count }` and walk forward with the answer's
+    `next_after_count`. A single message larger than the whole budget comes
+    back headed rather than dropped - its `content` opens with a line saying
+    so, and `content_total_bytes` gives its true stored size. Nothing is
+    deleted; the message is stored whole.
+  - `omitted_leading_messages` at `0` means no message was left out. It does
+    **not** mean the answer is whole: a conversation of one over-budget
+    message comes back with the count at `0` and that one row headed, so check
+    `content_total_bytes` as well.
+  - The `title` is bounded in bytes the same way a list row's is, and carries
+    `title_total_bytes` when it was cut. Do not write a cut title back:
+    `rename_conversation` refuses it.
+  - See `docs/API_TRANSPORT.md` for the budget and the transport caps behind
+    it.
+- `get_messages { conversation_id, tail, after_count, include_roles }`
+  - Read the next page from the answer's `next_after_count`, which is the raw
+    message index the window ended at. Do **not** compute
+    `after_count + messages.len()`: `after_count` counts raw messages while
+    `messages` counts what `include_roles` let through, so a computed cursor
+    names an earlier row than the window reached and returns rows twice under
+    a role filter.
+  - The walk above is for **cursor mode** (`after_count >= 0`), and
+    `size_capped` is its stop condition: while it is `true` the byte budget cut
+    the window, so request again from `next_after_count`. Each cut page carries
+    at least one message, so the walk always ends.
+  - In **tail mode** (`after_count < 0`, `tail > 0`) `next_after_count` names
+    the END of the conversation, because a tail window keeps the newest
+    messages. Requesting again from it returns an empty window, so a walk that
+    follows it reads nothing further and stops without ever reading the older
+    messages the tail dropped. A tail caller reads `truncated`, which says
+    older messages were dropped, and reads them by switching to cursor mode
+    from `after_count: 0` and walking forward.
+  - `size_capped` at `false` means the byte budget removed no message from the
+    window. It does **not** mean the window is whole: a window whose only
+    message is larger than the whole budget comes back with that row headed and
+    the flag still `false`, so check `content_total_bytes` on the returned
+    messages as well.
 - `delete_conversation { id }`
 - `clear_all_history`
 - `send_message { conversation_id, content, turn_id?, traceparent? }`
@@ -782,6 +847,10 @@ No field was added or removed, and the wire bytes are unchanged.
 
 7. Refresh conversation state
 - Send `get_conversation` if you need the full canonical message list.
+- Check `omitted_leading_messages` on the answer. When it is above zero the
+  list is the newest part of the conversation, and the rest is read with
+  `get_messages { after_count }` from index 0 forward, each page continuing
+  from the previous answer's `next_after_count` while `size_capped` is `true`.
 
 8. Optional live configuration
 - Send `set_config`.

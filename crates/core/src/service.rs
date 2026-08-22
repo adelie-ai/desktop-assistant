@@ -14,7 +14,7 @@ use crate::domain::negative_memory::{
 use crate::domain::skill::{detect_kind, skill_content_hash};
 use crate::domain::{
     Conversation, ConversationId, ConversationSummary, IndexedSkill, Locality, Message, Role,
-    ToolCall, ToolDefinition, ToolNamespace, TrustTier,
+    ToolCall, ToolDefinition, ToolNamespace, TrustTier, bound_generated_title, check_title_bound,
 };
 use crate::planning::{self, StepStack};
 use crate::ports::auth::current_user_id;
@@ -535,7 +535,11 @@ async fn generate_conversation_title<L: LlmClient>(initial_prompt: &str, llm: &L
     )
     .await
     {
-        Ok(response) => sanitize_generated_title(&response.text),
+        // The daemon generates this one, so it is bounded rather than
+        // refused: a refusal would fail a turn the user did not ask for
+        // (#1303). `sanitize_generated_title` keeps eight WORDS, and a word
+        // has no length, so one long token is an unbounded title without this.
+        Ok(response) => bound_generated_title(&sanitize_generated_title(&response.text)),
         Err(e) => {
             tracing::warn!("conversation title generation failed: {e}");
             String::new()
@@ -2641,6 +2645,14 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         title: String,
         tags: Vec<String>,
     ) -> Result<Conversation, CoreError> {
+        // A title the client supplies is refused past the cap, before anything
+        // is written (#1303). A response cuts an over-cap title to stay
+        // readable, and a client that pre-fills a rename field from a served
+        // title writes the cut value back - so an over-cap title in storage
+        // turns a read-path bound into permanent loss. Keeping it out of
+        // storage is the cure; the cut stays only for rows written before this
+        // rule existed.
+        check_title_bound(&title)?;
         let id = (self.id_generator)();
         let mut conv = Conversation::new(id, title);
         let timestamp = now_timestamp();
@@ -2695,6 +2707,10 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationService
         id: &ConversationId,
         title: String,
     ) -> Result<(), CoreError> {
+        // Refused before the lock and before the read, so a refused rename
+        // touches nothing at all (#1303). See `create_conversation` for why an
+        // over-cap title is refused rather than cut.
+        check_title_bound(&title)?;
         // Rename is itself a whole-conversation read-modify-write (get → set
         // title → full `store.update`), so a rename racing an active turn would
         // load a stale snapshot and clobber the turn's messages. Take the same
@@ -5631,7 +5647,9 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
 mod tests {
     use super::*;
     use crate::context::MIN_TRUNCATION_TOKENS;
-    use crate::domain::{ToolCall, ToolDefinition, TransportKind};
+    use crate::domain::{
+        MAX_TITLE_BYTES, ToolCall, ToolDefinition, TransportKind, title_serialized_len,
+    };
     use crate::ports::llm::with_tool_policy;
     use crate::ports::llm::{
         BudgetSource, ContextBudget, HostedToolSearch, LlmResponse, TokenUsage,
@@ -16367,6 +16385,155 @@ mod tests {
         assert!(
             instruction.contains(skill_search_discovery),
             "missing: {skill_search_discovery}"
+        );
+    }
+
+    // --- The title is bounded where it is WRITTEN (#1303) -----------------
+    //
+    // A response cuts an over-cap title to keep the answer readable. That cut
+    // is a read-path bound, and a client that pre-fills a rename field from a
+    // served title writes the cut value back, which turns the bound into
+    // permanent loss. The cure is to keep an over-cap title out of storage in
+    // the first place: a client-supplied title past the cap is refused as a
+    // business outcome, and a title the daemon composes for itself is bounded
+    // where it is composed, because refusing there would fail an operation the
+    // user did not ask for.
+
+    /// #1303: a rename whose title is past the cap is refused, and the stored
+    /// title is left exactly as it was. A rename that half-applied would be
+    /// the loss this bound exists to remove.
+    #[tokio::test]
+    async fn a_rename_past_the_title_cap_is_refused_and_changes_nothing_stored() {
+        let handler = make_handler(vec!["ok"]);
+        let conv = handler
+            .create_conversation("Trip Planning".into(), vec![])
+            .await
+            .expect("an ordinary title must be accepted");
+
+        // One byte past the cap once the two JSON quote bytes are counted.
+        let over_cap = "t".repeat(MAX_TITLE_BYTES - 1);
+        assert_eq!(
+            title_serialized_len(&over_cap),
+            MAX_TITLE_BYTES + 1,
+            "the test input must be one byte past the cap"
+        );
+
+        let err = handler
+            .rename_conversation(&conv.id, over_cap)
+            .await
+            .expect_err("a title past the cap must be refused");
+        match err {
+            CoreError::InvalidInput { code, message, .. } => {
+                assert_eq!(
+                    code, "conversation_title_too_long",
+                    "the refusal must carry a stable business code a client can branch on"
+                );
+                assert!(
+                    !message.is_empty(),
+                    "the refusal must carry text fit to show the person who typed the title"
+                );
+            }
+            other => panic!("expected a rules-based refusal, got {other:?}"),
+        }
+
+        let stored = handler
+            .store
+            .data
+            .lock()
+            .unwrap()
+            .get(conv.id.as_str())
+            .cloned()
+            .expect("the conversation must still exist");
+        assert_eq!(
+            stored.title, "Trip Planning",
+            "a refused rename must change nothing that is stored"
+        );
+    }
+
+    /// #1303: a title of exactly the cap is accepted and stored whole, so the
+    /// bound refuses only what is past it.
+    ///
+    /// The permit side of the pair. It passes before the guard exists as well
+    /// as after, which is the point: it holds the guard to refusing nothing
+    /// else.
+    #[tokio::test]
+    async fn a_rename_at_the_title_cap_is_accepted_and_stored_whole() {
+        let handler = make_handler(vec!["ok"]);
+        let conv = handler
+            .create_conversation("Trip Planning".into(), vec![])
+            .await
+            .expect("an ordinary title must be accepted");
+
+        let at_cap = "t".repeat(MAX_TITLE_BYTES - 2);
+        assert_eq!(
+            title_serialized_len(&at_cap),
+            MAX_TITLE_BYTES,
+            "the test input must sit exactly on the cap"
+        );
+
+        handler
+            .rename_conversation(&conv.id, at_cap.clone())
+            .await
+            .expect("a title on the cap must be accepted");
+
+        let stored = handler
+            .store
+            .data
+            .lock()
+            .unwrap()
+            .get(conv.id.as_str())
+            .cloned()
+            .expect("the conversation must still exist");
+        assert_eq!(
+            stored.title, at_cap,
+            "a title on the cap must be stored whole and unmarked"
+        );
+    }
+
+    /// #1303: `CreateConversation` writes the same client-supplied field, so
+    /// it is refused the same way. Nothing is created.
+    #[tokio::test]
+    async fn a_create_conversation_past_the_title_cap_is_refused() {
+        let handler = make_handler(vec!["ok"]);
+
+        let err = handler
+            .create_conversation("t".repeat(MAX_TITLE_BYTES - 1), vec![])
+            .await
+            .expect_err("a title past the cap must be refused");
+        match err {
+            CoreError::InvalidInput { code, .. } => assert_eq!(
+                code, "conversation_title_too_long",
+                "the refusal must carry the same stable code as a rename"
+            ),
+            other => panic!("expected a rules-based refusal, got {other:?}"),
+        }
+
+        assert!(
+            handler.store.data.lock().unwrap().is_empty(),
+            "a refused create must leave no conversation behind"
+        );
+    }
+
+    /// #1303: a title the daemon generates for itself is bounded where it is
+    /// generated. An LLM writes this one, and `sanitize_generated_title` keeps
+    /// eight WORDS - a word has no length, so one long token is an unbounded
+    /// title. It is bounded rather than refused, because the user did not ask
+    /// for it and a refusal would fail their turn.
+    #[tokio::test]
+    async fn a_generated_title_is_bounded_where_it_is_generated() {
+        let one_huge_word = "w".repeat(5 * 1024 * 1024);
+        let llm = MockLlm::new(vec![&one_huge_word]);
+
+        let generated = generate_conversation_title("plan a trip", &llm).await;
+
+        assert!(
+            title_serialized_len(&generated) <= MAX_TITLE_BYTES,
+            "a generated title must be bounded at generation: {} > {MAX_TITLE_BYTES}",
+            title_serialized_len(&generated)
+        );
+        assert!(
+            !generated.is_empty(),
+            "a bounded title must still name the conversation, not become empty"
         );
     }
 
