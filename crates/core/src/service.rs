@@ -2280,7 +2280,91 @@ impl<S: ConversationStore, L, T> ConversationHandler<S, L, T> {
     /// Best-effort by design — a storage failure is logged, never returned.
     /// Cancellation is the outcome the caller asked for and must not be
     /// replaced by a persistence error.
-    async fn persist_abandoned_turn(&self, conv: &Conversation, turn_start: usize) {
+    /// Persist the turn's transcript, then keep what the harness must not lose
+    /// from it (#1207).
+    ///
+    /// One door for every ordinary exit - an answer, a user-visible error, an
+    /// exhausted round budget - so no exit has to remember to capture. The
+    /// abandoned-turn path has its own persist and calls the capture itself,
+    /// for the same reason.
+    ///
+    /// The transcript is written first and the capture second: the transcript
+    /// is the record, the capture is a convenience laid beside it, and an
+    /// order that risked the first for the second would be the wrong trade.
+    async fn persist_turn(
+        &self,
+        conv: Conversation,
+        turn_start: usize,
+        provenance: TurnProvenance,
+    ) -> Result<(), CoreError> {
+        let captured = conv.clone();
+        self.store.update(conv).await?;
+        self.capture_turn_record(&captured, turn_start, provenance)
+            .await;
+        Ok(())
+    }
+
+    /// Keep the user's own words, the tool calls with their arguments and
+    /// outcomes, and the assistant's closing text, on this conversation's pad
+    /// (#1207).
+    ///
+    /// **Nothing here asks the model to have noticed.** Volunteering asks it
+    /// to decide, mid-task, that something was worth keeping, and gives it no
+    /// feedback when it fails - so a turn that forgot to record its decision
+    /// looks exactly like a turn in which none was taken.
+    ///
+    /// **A failure is visible and costs the turn nothing.** The transcript
+    /// already holds every byte this restates, so the worst a failed capture
+    /// does is leave the turn findable by position and not by relevance.
+    /// Failing the turn over it would trade the answer the user is waiting for
+    /// against a convenience.
+    ///
+    /// Runs after the reply: the answer streams to the user chunk by chunk
+    /// while the turn is running, so nothing here is between the user and what
+    /// they asked for.
+    ///
+    /// Every turn is captured, including a short one that ran no tool. The
+    /// obvious saving - skip a turn that looks trivial - would drop exactly
+    /// the case this exists for, because "use the kustomization from now on"
+    /// is short and calls nothing.
+    async fn capture_turn_record(
+        &self,
+        conv: &Conversation,
+        turn_start: usize,
+        provenance: TurnProvenance,
+    ) {
+        let Some(write) = self.scratchpad_write.clone() else {
+            return;
+        };
+        // The writing turn's provenance decides the stamp, and the operator's
+        // `hard_withhold` decides whether the turn's own derived text is kept
+        // at all. Both are read here rather than inside the capture, so the
+        // one place that knows the turn is the one place that says.
+        let Some(note) = crate::turn_capture::capture_turn(
+            &conv.messages,
+            turn_start,
+            provenance,
+            self.hard_withhold,
+        ) else {
+            return;
+        };
+        let key = note.key.clone();
+        if let Err(e) = write(conv.id.0.clone(), vec![note]).await {
+            tracing::warn!(
+                conversation_id = %conv.id.0,
+                note_key = %key,
+                error = %e,
+                "could not keep this turn's record; the transcript still holds every byte of it"
+            );
+        }
+    }
+
+    async fn persist_abandoned_turn(
+        &self,
+        conv: &Conversation,
+        turn_start: usize,
+        provenance: TurnProvenance,
+    ) {
         let mut snapshot = conv.clone();
         let executed = snapshot
             .messages
@@ -2294,6 +2378,7 @@ impl<S: ConversationStore, L, T> ConversationHandler<S, L, T> {
             cancelled_turn_notice(executed, unanswered),
         ));
         snapshot.updated_at = now_timestamp();
+        let captured = snapshot.clone();
         if let Err(e) = self.store.update(snapshot).await {
             tracing::warn!(
                 conversation_id = %conv.id.0,
@@ -2301,6 +2386,10 @@ impl<S: ConversationStore, L, T> ConversationHandler<S, L, T> {
                 "failed to persist the abandoned turn's transcript"
             );
         }
+        // A cancelled turn is still a turn that happened, and what the user
+        // said in it is still what they said (#1207).
+        self.capture_turn_record(&captured, turn_start, provenance)
+            .await;
     }
 }
 
@@ -3027,7 +3116,8 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             // and `cancellation_during_tool_dispatch_aborts_before_next_llm_call`.
             // The round that just finished is saved first (#731).
             if is_cancelled() {
-                self.persist_abandoned_turn(&conv, turn_start).await;
+                self.persist_abandoned_turn(&conv, turn_start, turn_provenance)
+                    .await;
                 return Err(CoreError::Cancelled);
             }
 
@@ -3684,7 +3774,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                         ));
                         conv.messages.push(Message::new(Role::Assistant, &friendly));
                         conv.updated_at = now_timestamp();
-                        self.store.update(conv).await?;
+                        self.persist_turn(conv, turn_start, turn_provenance).await?;
                         return Ok(friendly);
                     }
                     continue;
@@ -3701,7 +3791,8 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                         conversation_id = %conversation_id.0,
                         "send_prompt cancelled mid-stream"
                     );
-                    self.persist_abandoned_turn(&conv, turn_start).await;
+                    self.persist_abandoned_turn(&conv, turn_start, turn_provenance)
+                        .await;
                     return Err(CoreError::Cancelled);
                 }
                 Err(e) => {
@@ -3714,7 +3805,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     let friendly = user_visible_llm_error_message(&e);
                     conv.messages.push(Message::new(Role::Assistant, &friendly));
                     conv.updated_at = now_timestamp();
-                    self.store.update(conv).await?;
+                    self.persist_turn(conv, turn_start, turn_provenance).await?;
                     return Ok(friendly);
                 }
             };
@@ -3738,7 +3829,8 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             // are saved (#731).
             if is_cancelled() {
                 round_report.set_outcome(crate::telemetry::RoundOutcome::Cancelled);
-                self.persist_abandoned_turn(&conv, turn_start).await;
+                self.persist_abandoned_turn(&conv, turn_start, turn_provenance)
+                    .await;
                 return Err(CoreError::Cancelled);
             }
 
@@ -3869,7 +3961,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // outcome is corrected from the error by the caller.
                 round_report.set_outcome(crate::telemetry::RoundOutcome::Answered);
                 report.outcome = crate::telemetry::TurnOutcome::Answered;
-                self.store.update(conv).await?;
+                self.persist_turn(conv, turn_start, turn_provenance).await?;
                 return Ok(visible_text);
             }
 
@@ -3897,7 +3989,8 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 // recorded before we go (#731).
                 if is_cancelled() {
                     round_report.set_outcome(crate::telemetry::RoundOutcome::Cancelled);
-                    self.persist_abandoned_turn(&conv, turn_start).await;
+                    self.persist_abandoned_turn(&conv, turn_start, turn_provenance)
+                        .await;
                     return Err(CoreError::Cancelled);
                 }
 
@@ -4434,7 +4527,8 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                                 output: "cancelled".to_string(),
                             });
                             round_report.set_outcome(crate::telemetry::RoundOutcome::Cancelled);
-                            self.persist_abandoned_turn(&conv, turn_start).await;
+                            self.persist_abandoned_turn(&conv, turn_start, turn_provenance)
+                                .await;
                             return Err(CoreError::Cancelled);
                         }
                         Err(e) => {
@@ -4928,7 +5022,8 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
         // Cancelled while the budget ran out: skip the wind-down call, but the
         // 200 rounds of tool work still belong in the transcript (#731).
         if is_cancelled() {
-            self.persist_abandoned_turn(&conv, turn_start).await;
+            self.persist_abandoned_turn(&conv, turn_start, turn_provenance)
+                .await;
             return Err(CoreError::Cancelled);
         }
 
@@ -5054,7 +5149,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
         }
         conv.updated_at = now_timestamp();
         report.outcome = crate::telemetry::TurnOutcome::RoundsExhausted;
-        self.store.update(conv).await?;
+        self.persist_turn(conv, turn_start, turn_provenance).await?;
         Ok(closing)
     }
 }
@@ -8382,6 +8477,300 @@ mod tests {
     }
 
     // --- Planning + compaction (#240) ---
+
+    // -----------------------------------------------------------------------
+    // Turn-end capture (#1207).
+    // -----------------------------------------------------------------------
+
+    /// The turn captures written by a run, keyed as they were stored.
+    fn captures(
+        pad: &Arc<Mutex<HashMap<String, crate::domain::ScratchpadNote>>>,
+    ) -> Vec<crate::domain::ScratchpadNote> {
+        pad.lock()
+            .unwrap()
+            .values()
+            .filter(|n| n.note_type == crate::turn_capture::TURN_NOTE_TYPE)
+            .cloned()
+            .collect()
+    }
+
+    /// AC: a decision the user stated is durable after the turn, without the
+    /// model having chosen to record it. Nothing in this script writes a note,
+    /// opens a step, or calls a memory tool.
+    #[tokio::test]
+    async fn a_decision_the_user_stated_survives_a_turn_that_recorded_nothing() {
+        let (write, list, pad) = in_memory_scratchpad();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            ToolCallingLlm::new(vec![LlmResponse::text("understood")]),
+            MockToolExecutor::new(vec![], HashMap::new()),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "from now on deploy with the kustomization".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .expect("turn completes");
+
+        let kept = captures(&pad);
+        assert_eq!(kept.len(), 1, "one turn, one capture: {kept:?}");
+        assert!(
+            kept[0]
+                .content
+                .contains("from now on deploy with the kustomization"),
+            "{}",
+            kept[0].content
+        );
+    }
+
+    /// AC: tool calls and their outcomes are captured whether or not any step
+    /// claimed them. This turn opens no step at all.
+    #[tokio::test]
+    async fn a_turn_that_opened_no_step_still_captures_what_ran() {
+        let tools = vec![ToolDefinition::new(
+            "notes_search",
+            "search",
+            serde_json::json!({}),
+        )];
+        let mut results = HashMap::new();
+        results.insert(
+            "notes_search".to_string(),
+            "PAYLOAD-THAT-MUST-NOT-REACH-THE-PAD".to_string(),
+        );
+
+        let (write, list, pad) = in_memory_scratchpad();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            ToolCallingLlm::new(vec![
+                LlmResponse::with_tool_calls("", vec![ToolCall::new("t1", "notes_search", "{}")]),
+                LlmResponse::text("here you go"),
+            ]),
+            MockToolExecutor::new(tools, results),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(
+                &conv.id,
+                "find the notes".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .expect("turn completes");
+
+        let kept = captures(&pad);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert!(
+            kept[0].content.contains("notes_search"),
+            "{}",
+            kept[0].content
+        );
+        assert!(kept[0].content.contains("answered"), "{}", kept[0].content);
+        assert!(
+            !kept[0]
+                .content
+                .contains("PAYLOAD-THAT-MUST-NOT-REACH-THE-PAD"),
+            "a tool's bytes stay in the transcript: {}",
+            kept[0].content
+        );
+    }
+
+    /// AC: the pass runs on a turn that ended in an error, not only on a clean
+    /// one. The user's words are exactly what a failed turn most needs kept.
+    #[tokio::test]
+    async fn a_turn_that_ended_in_an_error_is_still_captured() {
+        let (write, list, pad) = in_memory_scratchpad();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            FailingLlm::new(Vec::new(), 1),
+            MockToolExecutor::new(vec![], HashMap::new()),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        let answer = handler
+            .send_prompt(
+                &conv.id,
+                "always use the sealed secret".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .expect("a provider failure surfaces as a user-visible message");
+        assert!(!answer.is_empty());
+
+        let kept = captures(&pad);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert!(
+            kept[0].content.contains("always use the sealed secret"),
+            "{}",
+            kept[0].content
+        );
+    }
+
+    /// AC: the pass runs on a turn that ended in an error - and a cancelled
+    /// turn is the exit most likely to carry an interrupted decision, so it
+    /// gets its own test rather than riding on the error path's.
+    #[tokio::test]
+    async fn a_cancelled_turn_is_still_captured() {
+        struct CancellingLlm;
+
+        #[async_trait::async_trait]
+        impl LlmClient for CancellingLlm {
+            async fn stream_completion(
+                &self,
+                _messages: Vec<Message>,
+                _tools: &[ToolDefinition],
+                _reasoning: ReasoningConfig,
+                _on_chunk: ChunkCallback,
+            ) -> Result<LlmResponse, CoreError> {
+                Err(CoreError::Cancelled)
+            }
+        }
+
+        let (write, list, pad) = in_memory_scratchpad();
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            CancellingLlm,
+            MockToolExecutor::new(vec![], HashMap::new()),
+            id_gen(),
+        )
+        .with_scratchpad_write(write)
+        .with_scratchpad_list(list);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        let token = CancellationToken::new();
+        let result = crate::ports::llm::with_cancellation_token(
+            token,
+            handler.send_prompt(
+                &conv.id,
+                "always deploy with the kustomization".into(),
+                noop_callback(),
+                noop_status(),
+            ),
+        )
+        .await;
+        assert!(matches!(result, Err(CoreError::Cancelled)), "{result:?}");
+
+        let kept = captures(&pad);
+        assert_eq!(kept.len(), 1, "a cancelled turn still happened: {kept:?}");
+        assert!(
+            kept[0]
+                .content
+                .contains("always deploy with the kustomization"),
+            "{}",
+            kept[0].content
+        );
+    }
+
+    /// AC: extraction failure is visible and does not fail the turn. The
+    /// transcript already holds every byte the capture restates, so failing
+    /// the turn over it would trade the answer against a convenience.
+    #[tokio::test]
+    async fn a_capture_that_cannot_be_written_does_not_fail_the_turn() {
+        let failing: ScratchpadWriteFn = Arc::new(|_conv, _notes| {
+            Box::pin(async { Err(CoreError::Storage("the pad is unreachable".into())) })
+        });
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            ToolCallingLlm::new(vec![LlmResponse::text("the answer")]),
+            MockToolExecutor::new(vec![], HashMap::new()),
+            id_gen(),
+        )
+        .with_scratchpad_write(failing);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        let answer = handler
+            .send_prompt(
+                &conv.id,
+                "a question".into(),
+                noop_callback(),
+                noop_status(),
+            )
+            .await
+            .expect("a failed capture must not fail the turn");
+        assert_eq!(answer, "the answer");
+    }
+
+    /// AC: the pass never blocks the reply reaching the user. The answer
+    /// streams chunk by chunk while the turn runs; the capture happens after
+    /// the last byte has left.
+    #[tokio::test]
+    async fn the_reply_reaches_the_user_before_anything_is_captured() {
+        let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let o = Arc::clone(&order);
+        let chunk: ChunkCallback = Box::new(move |_chunk| {
+            o.lock().unwrap().push("chunk");
+            true
+        });
+
+        let o = Arc::clone(&order);
+        let write: ScratchpadWriteFn = Arc::new(move |_conv, _notes| {
+            o.lock().unwrap().push("capture");
+            Box::pin(async { Ok(Vec::new()) })
+        });
+
+        let handler = ConversationHandler::with_tools(
+            MockStore::new(),
+            ToolCallingLlm::new(vec![LlmResponse::text("the answer")]),
+            MockToolExecutor::new(vec![], HashMap::new()),
+            id_gen(),
+        )
+        .with_scratchpad_write(write);
+
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        handler
+            .send_prompt(&conv.id, "a question".into(), chunk, noop_status())
+            .await
+            .expect("turn completes");
+
+        let seen = order.lock().unwrap().clone();
+        let first_capture = seen
+            .iter()
+            .position(|e| *e == "capture")
+            .expect("a capture");
+        let last_chunk = seen
+            .iter()
+            .rposition(|e| *e == "chunk")
+            .expect("the answer streamed");
+        assert!(
+            last_chunk < first_capture,
+            "the whole answer must have left before the capture runs: {seen:?}"
+        );
+    }
 
     /// An in-memory scratchpad backing the write/list closures, plus a handle
     /// to inspect what was written.
