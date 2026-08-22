@@ -4,6 +4,10 @@
 //! history load to draw one chart, and the numbers are derived from rows that
 //! already exist (`messages.tool_calls` joined to their `Role::Tool` results),
 //! so there is nothing to keep in sync and it works retroactively.
+//!
+//! Each tool's `namespace` is resolved the same way, by a `LEFT JOIN` against
+//! `tool_definitions.provider` (#1312): a tool with no definition row (its
+//! server was removed) is still counted, with a null namespace.
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::planning::COMPACTION_POINTER_PREFIX;
@@ -32,16 +36,19 @@ struct ToolUsageRow {
     last_ordinal: i32,
     first_used_at: Option<chrono::DateTime<chrono::Utc>>,
     last_used_at: Option<chrono::DateTime<chrono::Utc>>,
+    namespace: Option<String>,
 }
 
 impl ToolUsageRow {
     fn into_usage(self) -> ToolUsage {
         ToolUsage {
-            // Namespace is resolved by the caller from the live tool registry,
-            // not stored per call — a name's namespace is a property of the
-            // registry today, and baking a stale one into history would make the
-            // grouping lie after a server is renamed.
-            namespace: None,
+            // Resolved by a LEFT JOIN against tool_definitions.provider
+            // (#1312), not stored per call - a name's namespace is a property
+            // of the registry today, and baking a stale one into history
+            // would make the grouping lie after a server is renamed. A tool
+            // whose definition row is gone (its server was removed) still
+            // reports here, with namespace null - the honest answer.
+            namespace: self.namespace,
             tool_name: self.tool_name,
             call_count: self.call_count.max(0) as u32,
             result_bytes: self.result_bytes.max(0) as u64,
@@ -124,9 +131,11 @@ impl ToolUsageStore for PgToolUsageStore {
                     ca.first_ordinal::int                    AS first_ordinal, \
                     ca.last_ordinal::int                     AS last_ordinal, \
                     ca.first_used_at                         AS first_used_at, \
-                    ca.last_used_at                          AS last_used_at \
+                    ca.last_used_at                          AS last_used_at, \
+                    td.provider                              AS namespace \
              FROM call_agg ca \
              LEFT JOIN result_agg ra ON ra.tool_name = ca.tool_name \
+             LEFT JOIN tool_definitions td ON td.name = ca.tool_name \
              ORDER BY ca.call_count DESC, ca.tool_name ASC",
         )
         .bind(user_id.as_str())
