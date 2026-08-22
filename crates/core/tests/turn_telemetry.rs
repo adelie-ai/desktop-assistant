@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex, MutexGuard, Once};
 use adelie_telemetry::metrics::{Label, Summary};
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{
-    Conversation, ConversationId, ConversationSummary, Message, ToolCall, ToolDefinition,
+    Conversation, ConversationId, ConversationSummary, Message, Role, ToolCall, ToolDefinition,
     ToolNamespace,
 };
 use desktop_assistant_core::ports::auth::{UserId, with_user_id};
@@ -2591,6 +2591,193 @@ fn handler_with_pinned_note(
         Box::pin(async move { Ok(vec![note]) })
     });
     handler(responses, tools).with_scratchpad_list(list)
+}
+
+// ---------------------------------------------------------------------------
+// What the sweep did not reach (#1205).
+//
+// Names are spelled out rather than imported, for the reason the block above
+// gives: a rename at the recording site must fail these tests instead of
+// travelling with them.
+// ---------------------------------------------------------------------------
+
+/// The turn-span fields the tool-byte census reports under.
+const CONTEXT_TOOL_BYTE_FIELDS: [&str; 6] = [
+    "context.tool_bytes",
+    "context.tool_bytes_evicted",
+    "context.tool_bytes_reduced",
+    "context.tool_bytes_shrunk_elsewhere",
+    "context.tool_bytes_carried",
+    "context.tool_carried_pct",
+];
+
+/// The fraction the epic is measured against. Deliberately without `_bytes` in
+/// its name: a unit check by substring passes anything carrying that word,
+/// whatever the value actually is, and this is the one field here that is not
+/// a byte count.
+const CONTEXT_CARRIED_PCT_FIELD: &str = "context.tool_carried_pct";
+
+#[test]
+fn turn_span_reports_what_eviction_did_not_reach() {
+    let _serialised = serialised();
+    let captured = run(Level::INFO, two_round_script(), ScriptedTools::ok());
+    let turn = captured.span("turn");
+
+    for field in CONTEXT_TOOL_BYTE_FIELDS {
+        assert!(
+            turn.field(field).is_some(),
+            "the turn span must carry `{field}`; it recorded {:?}",
+            turn.fields
+        );
+    }
+    assert!(
+        prompt_field(turn, "context.tool_bytes") > 0,
+        "a turn that ran a tool held tool bytes; it recorded {:?}",
+        turn.fields
+    );
+    assert!(
+        !CONTEXT_CARRIED_PCT_FIELD.contains("_bytes"),
+        "the one field here that is not a byte count must not be named as if \
+         it were, or the unit check below passes it on the substring alone"
+    );
+    // Per model needs no label: the turn span already carries the route.
+    assert!(
+        turn.field("model").is_some(),
+        "the census is read per model off the turn span; it recorded {:?}",
+        turn.fields
+    );
+}
+
+/// The census must cover the WINDOW, not the conversation. A conversation
+/// carries every tool result it ever held and the store loads all of them;
+/// counting those would make the figure track how old a conversation is rather
+/// than what the turn is carrying.
+///
+/// The fixture makes the two answers differ by an order of magnitude: one
+/// ancient result far outside the window, one small one inside it.
+#[test]
+fn the_census_covers_the_window_and_not_the_whole_conversation() {
+    let _serialised = serialised();
+
+    /// Bytes of the ancient result. Far larger than anything the turn itself
+    /// produces, so a census over the conversation cannot be mistaken for one
+    /// over the window.
+    const ANCIENT_BYTES: usize = 400_000;
+
+    let captured = capture(Level::INFO, async move {
+        // Seed a conversation whose OLDEST turn holds a huge tool result, then
+        // bury it under enough turns that the window cannot reach it.
+        let mut seeded = Conversation::new(CONVERSATION_ID, "c");
+        seeded
+            .messages
+            .push(Message::new(Role::User, "the oldest ask"));
+        seeded
+            .messages
+            .push(Message::assistant_with_tool_calls(vec![ToolCall::new(
+                "ancient",
+                "read_file",
+                "{}",
+            )]));
+        seeded
+            .messages
+            .push(Message::tool_result("ancient", "x".repeat(ANCIENT_BYTES)));
+        for i in 0..60 {
+            seeded
+                .messages
+                .push(Message::new(Role::User, format!("u-{i}")));
+            seeded
+                .messages
+                .push(Message::new(Role::Assistant, format!("a-{i}")));
+        }
+        let store = MemStore::default();
+        store.create(seeded).await.expect("seed the conversation");
+
+        // A windowing conversation compacts on entry, and the summariser is
+        // the same scripted client - so the script carries several tool rounds
+        // to be sure one survives being eaten and the loop reaches the census
+        // at the bottom of a round.
+        let mut script: Vec<Reply> = (0..4)
+            .map(|_| {
+                LlmResponse::with_tool_calls("", vec![tool_call("c1")])
+                    .with_usage(usage(100, 10))
+                    .into()
+            })
+            .collect();
+        script.push(
+            LlmResponse::text(REPLY_SENTINEL)
+                .with_usage(usage(200, 20))
+                .into(),
+        );
+
+        let handler = ConversationHandler::with_tools(
+            store,
+            ScriptedLlm::new(script),
+            ScriptedTools::ok(),
+            Box::new(|| CONVERSATION_ID.to_string()),
+        );
+        let conv = ConversationId::from(CONVERSATION_ID);
+
+        with_user_id(
+            UserId::new(USER_ID),
+            with_request_id(
+                REQUEST_ID.to_string(),
+                with_turn_route(route(), async {
+                    let _ = handler
+                        .send_prompt_with_override(
+                            &conv,
+                            PROMPT_SENTINEL.to_string(),
+                            None,
+                            String::new(),
+                            Box::new(|_| true),
+                            Box::new(|_| {}),
+                            CancellationToken::new(),
+                        )
+                        .await;
+                }),
+            ),
+        )
+        .await;
+    });
+
+    let turn = captured.span("turn");
+    let total = prompt_field(turn, "context.tool_bytes");
+    assert!(
+        total > 0,
+        "precondition: the turn ran a tool, so it held some tool bytes"
+    );
+    assert!(
+        total < ANCIENT_BYTES as u64 / 10,
+        "the census counted a result the window dropped: {total} bytes against \
+         an ancient result of {ANCIENT_BYTES}"
+    );
+}
+
+#[test]
+fn every_context_figure_on_the_turn_span_names_its_unit() {
+    let _serialised = serialised();
+    let captured = run(Level::INFO, two_round_script(), ScriptedTools::ok());
+    let turn = captured.span("turn");
+
+    let mut checked = 0;
+    for key in turn.fields.keys() {
+        if !key.starts_with("context.") {
+            continue;
+        }
+        checked += 1;
+        assert!(
+            key.contains("_bytes") || key == CONTEXT_CARRIED_PCT_FIELD,
+            "`{key}` states no unit. A byte count and a percentage look \
+             equally plausible side by side, so every figure here says which \
+             it is"
+        );
+    }
+    assert_eq!(
+        checked,
+        CONTEXT_TOOL_BYTE_FIELDS.len(),
+        "the turn span carried {checked} `context.` fields, so this test did \
+         not see the set it names; it recorded {:?}",
+        turn.fields
+    );
 }
 
 #[test]

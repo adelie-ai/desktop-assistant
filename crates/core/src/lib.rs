@@ -6,6 +6,7 @@ pub mod context;
 pub mod context_window;
 pub mod domain;
 pub mod error_classify;
+pub(crate) mod eviction_class;
 pub(crate) mod otel_bridge;
 pub mod planning;
 pub mod ports;

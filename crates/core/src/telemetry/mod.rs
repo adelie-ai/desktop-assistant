@@ -278,6 +278,15 @@ pub(crate) fn turn_span(
         // within a turn, so on its own it cannot show the growth.
         prompt.tool_schema_tokens_max = tracing::field::Empty,
         prompt.tool_count_max = tracing::field::Empty,
+        // What the sweep did not reach (#1205). Declared here for the same
+        // reason the breakdown is: a `record` against an undeclared field is
+        // dropped without a word.
+        context.tool_bytes = tracing::field::Empty,
+        context.tool_bytes_evicted = tracing::field::Empty,
+        context.tool_bytes_reduced = tracing::field::Empty,
+        context.tool_bytes_shrunk_elsewhere = tracing::field::Empty,
+        context.tool_bytes_carried = tracing::field::Empty,
+        context.tool_carried_pct = tracing::field::Empty,
     );
     // The turn is the root of its trace, so this is where the trace id the
     // client already knows becomes the one a backend indexes by. Everything
@@ -571,6 +580,11 @@ pub(crate) struct TurnGuard {
     /// above keeps the turn's opening figure, which is the floor of a set that
     /// only grows within a turn; this is its ceiling.
     tool_peak: prompt::ToolBlockPeak,
+    /// What the turn's tool traffic weighed and how much of it eviction
+    /// reached (#1205). `None` until a round takes the census, which a turn
+    /// that answered without calling a tool never does - and having held no
+    /// tool bytes is exactly what that is.
+    tool_bytes: Option<crate::planning::ToolByteCensus>,
 }
 
 impl TurnGuard {
@@ -584,6 +598,7 @@ impl TurnGuard {
             tokens: TokenTotals::default(),
             prompt: None,
             tool_peak: prompt::ToolBlockPeak::default(),
+            tool_bytes: None,
         }
     }
 
@@ -604,6 +619,18 @@ impl TurnGuard {
         );
         self.prompt.get_or_insert(breakdown);
     }
+
+    /// Note what the turn's tool traffic weighs, as of the round that just
+    /// finished (#1205).
+    ///
+    /// Last writer wins, which is the opposite of
+    /// [`Self::set_prompt_breakdown`] and for the opposite reason: that one
+    /// answers what the turn cost before it did anything, and this one answers
+    /// what it is carrying now. A turn that ends between censuses reports the
+    /// last completed round, which is the state its exit was decided from.
+    pub(crate) fn set_tool_byte_census(&mut self, census: crate::planning::ToolByteCensus) {
+        self.tool_bytes = Some(census);
+    }
 }
 
 impl Drop for TurnGuard {
@@ -614,6 +641,9 @@ impl Drop for TurnGuard {
             prompt::record_on_span(&self.span, breakdown);
             prompt::record_metrics(breakdown);
             prompt::record_peak_on_span(&self.span, self.tool_peak);
+        }
+        if let Some(census) = &self.tool_bytes {
+            prompt::record_tool_bytes(&self.span, census);
         }
         self.span.record("rounds", self.rounds);
         self.span.record("outcome", self.outcome.as_label());
