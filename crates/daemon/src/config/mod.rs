@@ -186,6 +186,11 @@ pub struct DaemonConfig {
     /// (#1208). Absent section => defaults (the token bound off).
     #[serde(default, skip_serializing_if = "ContextConfig::is_default")]
     pub context: ContextConfig,
+    /// `[inspector]` — whether the full text of every turn is kept, and for
+    /// how long (#1252). Absent section => the deployment decides; see
+    /// [`resolve_inspector`].
+    #[serde(default, skip_serializing_if = "InspectorConfig::is_default")]
+    pub inspector: InspectorConfig,
 }
 
 /// `[context]` configuration: what bounds the verbatim window.
@@ -286,6 +291,140 @@ impl ContextConfig {
                 })
                 .collect(),
         }
+    }
+}
+
+/// `[inspector]` configuration: whether this daemon keeps the full text of
+/// every turn, and for how long.
+///
+/// The record holds the assembled system prompt, every injected block, the
+/// person's own words, the model's reply and every tool result. It is what
+/// makes the assistant debuggable at all, and it is also a second copy of
+/// somebody's whole conversation, so the switch is deliberate rather than
+/// incidental.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct InspectorConfig {
+    /// Whether to keep it. Absent means the deployment decides - see
+    /// [`resolve_inspector`] - and a stated value wins over that in both
+    /// directions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// How many days a turn's record is kept before the sweep removes it.
+    ///
+    /// Held to at least [`MIN_INSPECTOR_RETENTION_DAYS`]. There is no
+    /// keep-forever value: an unbounded store of conversation text is the
+    /// thing this setting exists to stop being the accident.
+    #[serde(default = "default_inspector_retention_days")]
+    pub retention_days: u32,
+}
+
+impl Default for InspectorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: None,
+            retention_days: default_inspector_retention_days(),
+        }
+    }
+}
+
+impl InspectorConfig {
+    /// Whether this equals the default section, so a default `[inspector]` is
+    /// not serialized back out.
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// The shipped retention window for turn records.
+pub const DEFAULT_INSPECTOR_RETENTION_DAYS: u32 = 7;
+
+/// The shortest retention window an operator can ask for. Zero is not a value:
+/// it would read as "keep nothing" to one person and "keep everything" to the
+/// next, and only one of those is safe to guess at.
+pub const MIN_INSPECTOR_RETENTION_DAYS: u32 = 1;
+
+fn default_inspector_retention_days() -> u32 {
+    DEFAULT_INSPECTOR_RETENTION_DAYS
+}
+
+/// What turn capture resolved to for this daemon, and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InspectorPosture {
+    /// Whether the full text of every turn is kept.
+    pub enabled: bool,
+    /// How long a kept record survives, in days.
+    ///
+    /// It governs the sweep whether or not `enabled` is set, because the
+    /// records a daemon wrote before capture was turned off are the ones that
+    /// most need removing.
+    pub retention_days: u32,
+    /// Where the answer came from, for the startup line.
+    pub source: InspectorSource,
+}
+
+/// Why turn capture is on or off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InspectorSource {
+    /// The operator stated `[inspector] enabled` in `daemon.toml`.
+    Configured,
+    /// Nobody stated anything, so the deployment decided.
+    Deployment,
+}
+
+/// Resolve whether this daemon keeps the full text of every turn.
+///
+/// A stated `[inspector] enabled` wins, in both directions. With nothing
+/// stated the deployment decides, because the two deployments differ in what
+/// the record actually is:
+///
+/// * A daemon reachable only over its Unix socket serves one local person, who
+///   already owns every byte of it. There the record is that person's own
+///   debugging aid and it is on.
+/// * A daemon with its remote door open can be reached by more than one
+///   principal. There the same record is one principal's conversations sitting
+///   in a store a second principal operates, so it is off until an operator
+///   says otherwise.
+///
+/// `remote_door_open` is the WebSocket listener, which is the daemon's only
+/// door that more than one principal can arrive at.
+pub fn resolve_inspector(config: &InspectorConfig, remote_door_open: bool) -> InspectorPosture {
+    let (enabled, source) = match config.enabled {
+        Some(stated) => (stated, InspectorSource::Configured),
+        None => (!remote_door_open, InspectorSource::Deployment),
+    };
+    InspectorPosture {
+        enabled,
+        retention_days: config.retention_days.max(MIN_INSPECTOR_RETENTION_DAYS),
+        source,
+    }
+}
+
+/// Say whether this daemon is keeping the full text of every turn, before it
+/// serves anything.
+///
+/// On every boot, whichever way it resolved. A store of conversation text that
+/// an operator can only discover by reading the schema is a store nobody
+/// checks, and the default follows the deployment rather than a constant - so
+/// silence would leave two daemons behaving differently with nothing said.
+///
+/// It lives here rather than inline in `main` so a test can install a
+/// subscriber and assert on what is actually emitted.
+pub fn report_inspector_posture(posture: &InspectorPosture) {
+    let because = match posture.source {
+        InspectorSource::Configured => "[inspector] enabled",
+        InspectorSource::Deployment => "the deployment",
+    };
+    if posture.enabled {
+        tracing::info!(
+            "turn capture: on ({because}) - the full text of every turn is kept \
+             for {} days, then deleted",
+            posture.retention_days
+        );
+    } else {
+        // "records none" rather than "keeps none": a daemon that captured
+        // yesterday still holds those rows until the sweep reaches them, and a
+        // line claiming otherwise would be read as an assurance.
+        tracing::info!("turn capture: off ({because}) - this daemon records no turn text");
     }
 }
 
@@ -4869,6 +5008,170 @@ max_context_tokens = 1000000
         let serialized = toml::to_string(&config).unwrap();
         let reparsed: DaemonConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(config.context, reparsed.context);
+    }
+
+    // --- [inspector] section (#1252) ----------------------------------------
+
+    /// Acceptance (#1252): a daemon whose remote door is open can be reached
+    /// by more than one principal, so the full text of one person's turns is
+    /// not kept there unless an operator asks for it.
+    #[test]
+    fn a_multi_user_daemon_defaults_to_disabled() {
+        let config: DaemonConfig = toml::from_str("").unwrap();
+        let posture = super::resolve_inspector(&config.inspector, true);
+        assert!(
+            !posture.enabled,
+            "an unconfigured daemon with its remote door open must not keep \
+             conversation text"
+        );
+        assert_eq!(posture.source, super::InspectorSource::Deployment);
+    }
+
+    /// Acceptance (#1252): a daemon reachable only over its Unix socket serves
+    /// one local person, who already owns every byte of it. There the record
+    /// is that person's own debugging aid, so it is on.
+    #[test]
+    fn a_local_single_user_daemon_defaults_to_enabled() {
+        let config: DaemonConfig = toml::from_str("").unwrap();
+        let posture = super::resolve_inspector(&config.inspector, false);
+        assert!(
+            posture.enabled,
+            "a single-user local daemon keeps its own turns by default"
+        );
+        assert_eq!(posture.source, super::InspectorSource::Deployment);
+        assert_eq!(
+            posture.retention_days,
+            super::DEFAULT_INSPECTOR_RETENTION_DAYS,
+            "and the window is bounded rather than open-ended"
+        );
+    }
+
+    #[test]
+    fn a_stated_setting_wins_over_the_deployment_in_both_directions() {
+        // The refusal above is only worth having if the permit works too: an
+        // operator who wants the record on a shared daemon must be able to say
+        // so, and one who wants it off on a desktop must be able to say that.
+        let on: DaemonConfig = toml::from_str("[inspector]\nenabled = true\n").unwrap();
+        let posture = super::resolve_inspector(&on.inspector, true);
+        assert!(posture.enabled, "a stated `true` reaches a shared daemon");
+        assert_eq!(posture.source, super::InspectorSource::Configured);
+
+        let off: DaemonConfig = toml::from_str("[inspector]\nenabled = false\n").unwrap();
+        let posture = super::resolve_inspector(&off.inspector, false);
+        assert!(!posture.enabled, "and a stated `false` reaches a desktop");
+        assert_eq!(posture.source, super::InspectorSource::Configured);
+    }
+
+    #[test]
+    fn the_retention_window_is_configurable_and_never_unbounded() {
+        let stated: DaemonConfig = toml::from_str("[inspector]\nretention_days = 30\n").unwrap();
+        assert_eq!(
+            super::resolve_inspector(&stated.inspector, false).retention_days,
+            30
+        );
+
+        // Zero would read as "keep nothing" to one operator and "keep
+        // everything" to the next. Only one of those is safe to guess at, so
+        // neither is guessed at: the floor applies.
+        let zero: DaemonConfig = toml::from_str("[inspector]\nretention_days = 0\n").unwrap();
+        assert_eq!(
+            super::resolve_inspector(&zero.inspector, false).retention_days,
+            super::MIN_INSPECTOR_RETENTION_DAYS,
+            "there is no keep-forever value"
+        );
+    }
+
+    /// Acceptance (#1252): the boot log says whether the daemon is keeping the
+    /// full text of every turn. A store of conversation text an operator can
+    /// only find by reading the schema is a store nobody checks - and because
+    /// the default follows the deployment rather than a constant, silence
+    /// would leave two daemons behaving differently with nothing said.
+    #[test]
+    fn the_startup_log_states_whether_turn_capture_is_on() {
+        let config: DaemonConfig = toml::from_str("").unwrap();
+
+        let said = captured_inspector_log(&super::resolve_inspector(&config.inspector, false));
+        assert!(
+            said.contains("turn capture: on"),
+            "a daemon that keeps turn text must say so, got: {said}"
+        );
+        assert!(
+            said.contains(&super::DEFAULT_INSPECTOR_RETENTION_DAYS.to_string()),
+            "and state the window it keeps it for, got: {said}"
+        );
+
+        let said = captured_inspector_log(&super::resolve_inspector(&config.inspector, true));
+        assert!(
+            said.contains("turn capture: off"),
+            "and a daemon that keeps none must say that, got: {said}"
+        );
+    }
+
+    /// What `report_inspector_posture` actually writes, for `posture`.
+    ///
+    /// A capturing subscriber rather than an assertion on a returned string,
+    /// for the same reason `captured_startup_log` uses one: the property is
+    /// that the daemon SAYS it, and a test that reads a formatter stays green
+    /// with the emission deleted.
+    fn captured_inspector_log(posture: &super::InspectorPosture) -> String {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let sink = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            super::report_inspector_posture(posture);
+        });
+
+        let bytes = sink.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        String::from_utf8(bytes).expect("captured log output is UTF-8")
+    }
+
+    #[test]
+    fn the_inspector_section_round_trips() {
+        let config: DaemonConfig =
+            toml::from_str("[inspector]\nenabled = true\nretention_days = 14\n").unwrap();
+        assert_eq!(config.inspector.enabled, Some(true));
+        assert_eq!(config.inspector.retention_days, 14);
+        let serialized = toml::to_string(&config).unwrap();
+        let back: DaemonConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(back.inspector, config.inspector);
+    }
+
+    #[test]
+    fn a_default_inspector_section_is_not_written_back_out() {
+        let config: DaemonConfig = toml::from_str("").unwrap();
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(
+            !serialized.contains("[inspector]"),
+            "a default section must not be serialized: {serialized}"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────

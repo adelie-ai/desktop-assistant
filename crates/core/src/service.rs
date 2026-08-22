@@ -55,6 +55,9 @@ use crate::ports::turn_capability::{
     Delivery, TurnCapabilityChange, TurnCapabilityReason, notify_turn_capability_change,
 };
 use crate::ports::turn_interactivity::{TurnInteractivity, current_turn_interactivity};
+use crate::ports::turn_record::{
+    RoundRecord, RoundToolResults, SharedTurnRecorder, TurnRecord, turn_correlation_id,
+};
 use crate::ports::turn_telemetry::{
     TurnTrace, UNSET as TURN_TELEMETRY_UNSET, current_request_id, current_turn_route,
     current_turn_trace, with_turn_trace,
@@ -182,6 +185,14 @@ fn cancellation_token_or_default() -> CancellationToken {
 /// for any value whatever, including one that puts the next run past this
 /// number - which is the freeze it exists to prevent.
 pub(crate) const MAX_TOOL_ROUNDS: usize = 200;
+
+/// Which round the wind-down's turn record is filed under (#1252).
+///
+/// One past the loop's last round, which is where it happens: the tool budget
+/// is spent, and the wind-down is the extra provider call that turns an
+/// exhausted turn into a closing the person can read. Numbering it inside the
+/// loop's range would collide with a real round.
+const WIND_DOWN_ROUND: u32 = MAX_TOOL_ROUNDS as u32 + 1;
 
 /// Whether the repeat ledger may answer this tool's call from the transcript
 /// rather than running it (#1301).
@@ -699,6 +710,11 @@ pub struct ConversationHandler<S, L, T = NoopToolExecutor> {
     /// nothing. `false` is the shipped state and the default here, so a test
     /// or a background job gets the behaviour a desktop install gets.
     hard_withhold: bool,
+    /// Where this turn's full text is written, when a deployment captures it
+    /// (#1252). `None` - the default, and the shape a daemon with capture off
+    /// runs - means the loop assembles, sends and answers exactly as it did
+    /// before the feature existed: no clone of the request, no write, no cost.
+    turn_recorder: Option<SharedTurnRecorder>,
     /// Per-conversation turn serialization (#282). Maps a conversation id to a
     /// `Weak`-referenced async mutex; a turn upgrades-or-inserts the entry, holds
     /// the `Arc<Mutex<()>>` guard across its whole body, then drops it. Entries
@@ -759,6 +775,7 @@ impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
             host: DEFAULT_HOST_LABEL.to_string(),
             on_workstation: true,
             hard_withhold: false,
+            turn_recorder: None,
             turn_locks: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -984,6 +1001,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             host: DEFAULT_HOST_LABEL.to_string(),
             on_workstation: true,
             hard_withhold: false,
+            turn_recorder: None,
             turn_locks: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -997,6 +1015,119 @@ impl<S, L, T> ConversationHandler<S, L, T> {
     pub fn with_context_breakdown_recorder(mut self, record: ContextBreakdownRecordFn) -> Self {
         self.record_context_breakdown = Some(record);
         self
+    }
+
+    /// Write this handler's turns to `recorder` - the request as sent, the
+    /// reply, the tool calls and their results (#1252).
+    ///
+    /// Wired by the daemon only when turn capture resolves on for the
+    /// deployment. Left unwired the turn costs exactly what it did before the
+    /// feature existed: the loop clones no request and issues no write.
+    ///
+    /// A failing write never fails the turn. See
+    /// [`crate::ports::turn_record`] for what each record holds and why the
+    /// writes are separate.
+    pub fn with_turn_recorder(mut self, recorder: SharedTurnRecorder) -> Self {
+        self.turn_recorder = Some(recorder);
+        self
+    }
+
+    /// Write the turn's own record, absorbing a failure.
+    ///
+    /// A store that cannot be written is a fault worth an operator's
+    /// attention - an unmigrated database, an exhausted pool, a missing grant
+    /// makes every write fail and the tables stay empty while the daemon says
+    /// nothing. It is not worth the answer a person asked for, so it is a WARN
+    /// and the turn goes on.
+    async fn write_turn_record(&self, recorder: &SharedTurnRecorder, record: TurnRecord) {
+        if let Err(error) = recorder.record_turn(record).await {
+            tracing::warn!(
+                target: "turn_records",
+                %error,
+                "could not record the turn; the turn itself is unaffected"
+            );
+        }
+    }
+
+    /// Write one round's request and reply, absorbing a failure. See
+    /// [`Self::write_turn_record`] for why it is absorbed.
+    async fn write_round_record(&self, recorder: &SharedTurnRecorder, record: RoundRecord) {
+        let round = record.round;
+        if let Err(error) = recorder.record_round(record).await {
+            tracing::warn!(
+                target: "turn_records",
+                round,
+                %error,
+                "could not record the round; the turn itself is unaffected"
+            );
+        }
+    }
+
+    /// Write what one round's tool calls returned, absorbing a failure. See
+    /// [`Self::write_turn_record`] for why it is absorbed.
+    async fn write_round_results(&self, recorder: &SharedTurnRecorder, record: RoundToolResults) {
+        let round = record.round;
+        if let Err(error) = recorder.record_round_results(record).await {
+            tracing::warn!(
+                target: "turn_records",
+                round,
+                %error,
+                "could not record the round's tool results; the turn itself is unaffected"
+            );
+        }
+    }
+
+    /// Record what this round's tool calls have returned so far (#1252).
+    ///
+    /// `results_from` is where the round's own appends begin - taken after its
+    /// assistant row, because everything below that point only appends and the
+    /// compaction above it can move rows.
+    ///
+    /// Read back off the conversation rather than collected as the calls were
+    /// answered: every path that answers one - a dispatch, a refusal, a gate's
+    /// rejection, a repeat pointed at an earlier row - lands there, and a
+    /// hand-kept list would miss whichever of them nobody thought about.
+    ///
+    /// Called when the round finishes AND on the cancellation exits inside it.
+    /// A cancelled round has usually run some of its calls and committed their
+    /// side effects, so recording nothing would say no tool ran when one did -
+    /// a wrong answer, where an absent one would only have been a gap.
+    async fn record_round_results_so_far(
+        &self,
+        recorded_turn: Option<&String>,
+        conversation_id: &ConversationId,
+        round: usize,
+        conversation: &Conversation,
+        results_from: usize,
+    ) {
+        let (Some(recorder), Some(correlation_id)) = (&self.turn_recorder, recorded_turn) else {
+            return;
+        };
+        let results: Vec<Message> = conversation
+            .messages
+            .get(results_from..)
+            .unwrap_or_default()
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .cloned()
+            .collect();
+        if results.is_empty() {
+            // Nothing to say, and saying it would destroy. The column already
+            // defaults to the empty list, and a retry of the same turn that is
+            // cancelled before its first call would otherwise overwrite what
+            // the attempt before it recorded.
+            return;
+        }
+        self.write_round_results(
+            recorder,
+            RoundToolResults {
+                correlation_id: correlation_id.clone(),
+                conversation_id: conversation_id.0.clone(),
+                round: round as u32 + 1,
+                results,
+            },
+        )
+        .await;
     }
 
     /// Set the daemon's self-identity `host` label used for server-side tool
@@ -3219,6 +3350,28 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
         let burns_written_this_turn: Arc<Mutex<HashMap<String, String>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
+        // The turn's own record (#1252), written before the first round rather
+        // than after the last: a turn that then fails, is cancelled, or ends
+        // the process still has a record saying it happened and where it
+        // dispatched. `None` here is a daemon with turn capture off, which
+        // pays for none of what follows.
+        let recorded_turn = self.turn_recorder.as_ref().map(|_| turn_correlation_id());
+        if let (Some(recorder), Some(correlation_id)) = (&self.turn_recorder, &recorded_turn) {
+            let route = current_turn_route();
+            self.write_turn_record(
+                recorder,
+                TurnRecord {
+                    correlation_id: correlation_id.clone(),
+                    conversation_id: conversation_id.0.clone(),
+                    connection_id: route.connection_id.clone(),
+                    provider: route.provider.clone(),
+                    model: route.model.clone(),
+                    tool_policy: current_tool_policy().as_str().to_string(),
+                },
+            )
+            .await;
+        }
+
         for round in 0..MAX_TOOL_ROUNDS {
             // Between-rounds cancellation checkpoint (issue #109): if the
             // caller cancelled while the previous tool round was
@@ -3770,6 +3923,14 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 });
             }
             let llm_messages = assembled.messages;
+            // The request, kept only when something is going to record it. A
+            // daemon with capture off must clone nothing: this is the whole
+            // assembled prompt, and it is the largest allocation in the round.
+            let recorded_request = if recorded_turn.is_some() {
+                llm_messages.clone()
+            } else {
+                Vec::new()
+            };
             // Incremental sanitizer: carries think-block parser state across
             // chunks so each byte is scanned once, instead of re-sanitizing
             // the full accumulated stream on every chunk (O(n²) per turn).
@@ -3854,6 +4015,37 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             // the turn and one retries: a measurement written inside an arm
             // would be missing from whichever arm nobody thought about.
             crate::telemetry::record_llm_call(llm_started.elapsed(), &route, llm_result.is_ok());
+            // The round's record (#1252). Written here, before the match
+            // below branches, for the same reason the measurement above is:
+            // two of those arms leave the turn and one retries, so a write
+            // inside an arm would be missing from whichever arm nobody thought
+            // about. What the round's tool calls then returned is a second
+            // write, at the end of the round body.
+            if let (Some(recorder), Some(correlation_id)) = (&self.turn_recorder, &recorded_turn) {
+                let (response_text, response_tool_calls, usage, error) = match &llm_result {
+                    Ok(response) => (
+                        response.text.clone(),
+                        response.tool_calls.clone(),
+                        response.usage.clone(),
+                        None,
+                    ),
+                    Err(e) => (String::new(), Vec::new(), None, Some(e.to_string())),
+                };
+                self.write_round_record(
+                    recorder,
+                    RoundRecord {
+                        correlation_id: correlation_id.clone(),
+                        conversation_id: conversation_id.0.clone(),
+                        round: round as u32 + 1,
+                        request: recorded_request,
+                        response_text,
+                        response_tool_calls,
+                        usage,
+                        error,
+                    },
+                )
+                .await;
+            }
             llm_span.record("outcome", if llm_result.is_ok() { "ok" } else { "error" });
             // The counts the provider reported, onto the span that made the
             // call - recorded before the handles below drop, because a closed
@@ -4187,6 +4379,11 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             conv.messages.push(Message::assistant_with_tool_calls(
                 response.tool_calls.clone(),
             ));
+            // Where this round's own tool results begin (#1252). Taken after
+            // the assistant row rather than at the top of the round, because
+            // the compaction above this point can move rows and everything
+            // below it only appends.
+            let round_results_from = conv.messages.len();
 
             // Execute each tool call and append results
             for tool_call in &response.tool_calls {
@@ -4201,6 +4398,18 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     round_report.set_outcome(crate::telemetry::RoundOutcome::Cancelled);
                     self.persist_abandoned_turn(&conv, turn_start, turn_provenance)
                         .await;
+                    // The calls that already ran committed their side effects,
+                    // so the record says which they were (#1252). After the
+                    // transcript, not before: the person's own data does not
+                    // wait behind a debugging record on a stalled pool.
+                    self.record_round_results_so_far(
+                        recorded_turn.as_ref(),
+                        conversation_id,
+                        round,
+                        &conv,
+                        round_results_from,
+                    )
+                    .await;
                     return Err(CoreError::Cancelled);
                 }
 
@@ -4739,6 +4948,16 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                             round_report.set_outcome(crate::telemetry::RoundOutcome::Cancelled);
                             self.persist_abandoned_turn(&conv, turn_start, turn_provenance)
                                 .await;
+                            // As above: the transcript first, then the record
+                            // of the calls that ran.
+                            self.record_round_results_so_far(
+                                recorded_turn.as_ref(),
+                                conversation_id,
+                                round,
+                                &conv,
+                                round_results_from,
+                            )
+                            .await;
                             return Err(CoreError::Cancelled);
                         }
                         Err(e) => {
@@ -5215,6 +5434,18 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 &conv.messages[window_from.min(conv.messages.len())..],
                 &projection,
             ));
+            // What this round's calls returned (#1252). Bounded to the rows
+            // this round appended: a call id comes off the model's reply, so
+            // one model reusing `call_1` every round would otherwise make each
+            // round's record swallow every earlier round's results.
+            self.record_round_results_so_far(
+                recorded_turn.as_ref(),
+                conversation_id,
+                round,
+                &conv,
+                round_results_from,
+            )
+            .await;
         }
 
         // #453: the tool-round budget is spent. Rather than returning an error
@@ -5328,13 +5559,45 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             }
         });
         let reasoning = crate::ports::llm::current_reasoning_config();
-        let closing = match crate::telemetry::measured_aux_call(
+        // The wind-down is a round of this turn on this turn's own connector,
+        // and it produces the closing the person actually reads - so it is
+        // recorded like any other (#1252). Its request exists nowhere else:
+        // the transient instruction above was popped before this point, so
+        // without the record the one message the person read has no prompt
+        // anybody can recover. Numbered past the loop's last round, which is
+        // where it happens.
+        let recorded_wind_down_request = if recorded_turn.is_some() {
+            wind_down_messages.clone()
+        } else {
+            Vec::new()
+        };
+        let wind_down_result = crate::telemetry::measured_aux_call(
             crate::telemetry::LlmPurpose::WindDown,
             self.llm
                 .stream_completion(wind_down_messages, &[], reasoning, wind_down_stream),
         )
-        .await
-        {
+        .await;
+        if let (Some(recorder), Some(correlation_id)) = (&self.turn_recorder, &recorded_turn) {
+            let (response_text, usage, error) = match &wind_down_result {
+                Ok(response) => (response.text.clone(), response.usage.clone(), None),
+                Err(e) => (String::new(), None, Some(e.to_string())),
+            };
+            self.write_round_record(
+                recorder,
+                RoundRecord {
+                    correlation_id: correlation_id.clone(),
+                    conversation_id: conversation_id.0.clone(),
+                    round: WIND_DOWN_ROUND,
+                    request: recorded_wind_down_request,
+                    response_text,
+                    response_tool_calls: Vec::new(),
+                    usage,
+                    error,
+                },
+            )
+            .await;
+        }
+        let closing = match wind_down_result {
             Ok(response) => {
                 let visible = sanitize_assistant_text(&response.text);
                 if visible.trim().is_empty() {

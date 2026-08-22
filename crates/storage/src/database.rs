@@ -143,6 +143,12 @@ const PERSONAL_DATA_TABLES: &[&str] = &[
     // turn happened, which is a record of the person's work before any of the
     // work itself is read.
     "context_breakdowns",
+    // 055 - the turn records. The widest personal-data surface in the schema:
+    // a round row holds the assembled system prompt, every injected block, the
+    // person's own words and whatever a tool read on their behalf. Unscoped,
+    // one tenant would read another's conversations whole through this tool.
+    "turn_records",
+    "turn_round_records",
 ];
 
 /// The canonical set of personal-data tables (see `PERSONAL_DATA_TABLES`).

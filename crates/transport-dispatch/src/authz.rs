@@ -421,9 +421,52 @@ pub(crate) fn with_caller_capability(mut config: api::Config, held: Capability) 
     config
 }
 
+/// The capability a caller must hold to read a turn record belonging to
+/// somebody else (#1252).
+///
+/// Named here, beside the command policy table, rather than as a parallel
+/// authorization model: a turn record holds one person's whole prompt and
+/// reply, so reading across users is the read-everything switch and it belongs
+/// on the same axis as every other privileged read.
+///
+/// The daemon ships no command that reads across users, and the store's own
+/// statements bind the caller's id, so nothing today can widen a read. This
+/// names the level a reader must require when one is added, so that ticket
+/// wires a door rather than inventing a model.
+pub const READ_ANY_USER_TURN_RECORDS: Capability = Capability::Admin;
+
+/// Whether `held` may read turn records belonging to somebody other than the
+/// caller.
+///
+/// Answered through [`Capability::permits`] rather than by matching on the
+/// variant, so a level added above administrator has to be classified there
+/// once instead of here as well.
+pub fn may_read_any_user_turn_records(held: &Capability) -> bool {
+    held.permits(&READ_ANY_USER_TURN_RECORDS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1252. A turn record holds one person's assembled prompt, their own
+    /// words and the model's reply. Reading one that is not yours is the
+    /// read-everything switch, so a tenant must not hold it.
+    #[test]
+    fn reading_another_users_turn_records_needs_the_named_capability() {
+        assert!(
+            !may_read_any_user_turn_records(&Capability::Tenant),
+            "a tenant reads its own turns and nobody else's"
+        );
+        assert!(
+            may_read_any_user_turn_records(&READ_ANY_USER_TURN_RECORDS),
+            "and the named level is what permits it"
+        );
+        assert!(
+            !may_read_any_user_turn_records(&Capability::Other("owner".to_string())),
+            "a level this build does not recognize grants nothing"
+        );
+    }
 
     #[test]
     fn tenant_is_the_default_capability() {

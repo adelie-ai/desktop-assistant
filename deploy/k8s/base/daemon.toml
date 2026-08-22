@@ -39,6 +39,16 @@ knowledge_rewrite_fraction = 0.25
 # reap and the model's delete tool free nothing and log what they spared.
 knowledge_hard_delete_requires_person = false
 
+# Whether this daemon keeps the full text of every turn - the request as sent,
+# the reply, the tool calls and their results. Absent, the deployment decides:
+# on for a daemon reachable only over its Unix socket, off once the remote
+# WebSocket door is open, because there the record is one person's whole
+# conversation sitting where a second principal operates the store. State
+# `enabled` to override either way; the boot log says which it resolved to.
+# [inspector]
+# enabled = false
+# retention_days = 7
+
 [purposes.interactive]
 connection = "default"
 model = "llama3.2:1b"

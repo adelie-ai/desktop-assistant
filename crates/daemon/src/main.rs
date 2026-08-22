@@ -63,6 +63,14 @@ use transports::{
 /// on both paths.
 const TAG_REGISTRY_EMBED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How often the turn-record retention sweep runs (#1252).
+///
+/// Hourly, and not configurable. The window an operator chooses is measured in
+/// days, so the interval only decides how long a record outlives it - and a
+/// knob that could be set to a week would let a record outlive a one-day
+/// window by six days while the startup line still said one.
+const TURN_RECORD_SWEEP_INTERVAL_SECS: u64 = 3600;
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         if let Err(e) = tokio::signal::ctrl_c().await {
@@ -1022,6 +1030,21 @@ async fn main() -> Result<()> {
     // keeps the two decisions from reading different values.
     let ws_enabled = env_bool("DESKTOP_ASSISTANT_WS_ENABLED", transports_config.ws_enabled);
 
+    // Whether this daemon keeps the full text of every turn (#1252), and for
+    // how long. Resolved here because the answer follows the deployment: the
+    // remote door is the daemon's only door that more than one principal can
+    // arrive at, and a record of one person's whole conversation sitting where
+    // a second principal can operate the store is a different object from the
+    // same record on a desktop. Said on every boot, whichever way it went.
+    let inspector_posture = config::resolve_inspector(
+        &daemon_config
+            .as_ref()
+            .map(|c| c.inspector.clone())
+            .unwrap_or_default(),
+        ws_enabled,
+    );
+    config::report_inspector_posture(&inspector_posture);
+
     // Build the per-connection client registry from the [connections] map
     // (#9). Purpose-based dispatch (#10 + #11) picks the right client per
     // request via `registry.get(&purpose_resolved.connection_id)`;
@@ -1412,6 +1435,24 @@ async fn main() -> Result<()> {
             pool.clone(),
         ))
     });
+
+    // The turn-record store (#1252). Two conditions, and each absence is said
+    // rather than inferred: the operator's resolved posture, and a database to
+    // write to. An operator who turned capture on and has no database must not
+    // have to work out from an empty table why nothing is recorded.
+    let turn_record_store = match (inspector_posture.enabled, pg_pool.as_ref()) {
+        (true, Some(pool)) => Some(Arc::new(desktop_assistant_storage::PgTurnRecordStore::new(
+            pool.clone(),
+        ))),
+        (true, None) => {
+            tracing::warn!(
+                "turn capture is on but no database is configured, so no turn text is \
+                 kept; configure [database] or set [inspector] enabled = false"
+            );
+            None
+        }
+        (false, _) => None,
+    };
 
     let tool_registry_store = pg_pool.as_ref().map(|pool| {
         Arc::new(desktop_assistant_storage::PgToolRegistryStore::new(
@@ -2417,6 +2458,69 @@ async fn main() -> Result<()> {
         }
     };
 
+    // #1252: age out turn records. Retention is what makes the store a
+    // debugging aid rather than an archive of somebody's conversations, so
+    // there is no configuration that keeps records and never removes them.
+    let inspector_retention_days = inspector_posture.retention_days;
+    let (turn_record_sweep_shutdown_tx, turn_record_sweep_shutdown_rx) =
+        tokio::sync::oneshot::channel::<()>();
+    // Gated on the database alone, and deliberately not on whether capture is
+    // on now. An operator who ran with capture on and has just turned it off is
+    // the one person whose records most need removing, and a sweep that only
+    // ran while capture was on would strand every one of them - while the boot
+    // line said no turn text is kept.
+    let turn_record_sweep_task = match &pg_pool {
+        Some(pool) => {
+            let pool = pool.clone();
+            tracing::info!(
+                "turn-record sweep enabled: retention {inspector_retention_days}d, every \
+                 {TURN_RECORD_SWEEP_INTERVAL_SECS}s (runs whether or not capture is on, so \
+                 records already written still age out)"
+            );
+            Some(tokio::spawn(async move {
+                let mut shutdown_rx = turn_record_sweep_shutdown_rx;
+                // Let startup settle before the first sweep.
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                    _ = &mut shutdown_rx => {
+                        tracing::info!("turn-record sweep cancelled before first pass");
+                        return;
+                    }
+                }
+
+                loop {
+                    match desktop_assistant_storage::sweep_expired_turn_records(
+                        &pool,
+                        inspector_retention_days,
+                    )
+                    .await
+                    {
+                        Ok(n) if n > 0 => tracing::info!(
+                            "turn-record sweep removed {n} turn{} past the window",
+                            if n == 1 { "" } else { "s" }
+                        ),
+                        Ok(_) => tracing::debug!("turn-record sweep: nothing expired"),
+                        Err(e) => tracing::warn!("turn-record sweep failed: {e}"),
+                    }
+
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(
+                            TURN_RECORD_SWEEP_INTERVAL_SECS,
+                        )) => {}
+                        _ = &mut shutdown_rx => {
+                            tracing::info!("turn-record sweep: shutdown signal received");
+                            break;
+                        }
+                    }
+                }
+            }))
+        }
+        None => {
+            drop(turn_record_sweep_shutdown_rx);
+            None
+        }
+    };
+
     // Spawn background dreaming (periodic fact extraction) task
     let dreaming_enabled = daemon_config
         .as_ref()
@@ -3110,6 +3214,12 @@ async fn main() -> Result<()> {
         }
     }
 
+    // #1252: the turn's full text goes to the store when capture resolved on.
+    // Unwired, the loop clones no request and issues no write.
+    if let Some(store) = turn_record_store.clone() {
+        handler = handler.with_turn_recorder(store);
+    }
+
     // Wrap the core `ConversationHandler` in the routing wrapper so adapters
     // can call `send_prompt_with_override` and have the override/stored-
     // selection priority path applied.
@@ -3715,6 +3825,13 @@ async fn main() -> Result<()> {
         && let Err(e) = task.await
     {
         tracing::warn!("knowledge-trash sweep join error during shutdown: {e}");
+    }
+
+    let _ = turn_record_sweep_shutdown_tx.send(());
+    if let Some(task) = turn_record_sweep_task
+        && let Err(e) = task.await
+    {
+        tracing::warn!("turn-record sweep join error during shutdown: {e}");
     }
 
     let _ = dreaming_shutdown_tx.send(());

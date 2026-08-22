@@ -26,6 +26,7 @@ pub mod skill_use;
 pub mod tag_registry;
 pub mod tool_registry;
 pub mod tool_usage;
+pub mod turn_records;
 pub mod turn_state;
 
 pub use desktop_assistant_auth_jwt::{DEFAULT_USER_ID, UserId};
@@ -67,4 +68,5 @@ pub use skill_use::PgSkillUseLog;
 /// knowledge-maintenance service) without taking a direct `sqlx` dependency.
 pub use sqlx::PgPool;
 pub use tool_registry::{PROVIDER_BOOST_WEIGHT, PgToolRegistryStore, ToolRegisterBatch};
+pub use turn_records::{PgTurnRecordStore, sweep_expired_turn_records};
 pub use turn_state::PgTurnStateStore;

@@ -36,6 +36,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   answers both commands with an error rather than an empty list, so "this
   conversation has no entries" and "this daemon keeps none" stay different
   answers.
+- The daemon can keep the full text of every turn: the request exactly as sent
+  to the connector (system prompt and every injected block included), the
+  reply, the tool calls with their arguments, and each tool result. One record
+  per turn and one per round within it, keyed by the turn's correlation id -
+  the same value the client's event stream and a trace backend already carry.
+
+  **For operators.** The new `[inspector]` section holds `enabled` and
+  `retention_days`. An absent `enabled` follows the deployment: on for a daemon
+  reachable only over its Unix socket, off once `[transports] ws_enabled` opens
+  the remote door, because there the same record is one principal's
+  conversations in a store a second principal operates. A stated value wins in
+  both directions, and the boot log states which it resolved to and why. The
+  window defaults to 7 days and is held to at least 1; there is no
+  keep-forever value, and an hourly sweep removes what is past it. Capture also
+  needs a database - configured without one, the daemon warns rather than
+  writing nothing quietly. Records live in the new `turn_records` and
+  `turn_round_records` tables, both `user_id`-scoped with their own row-level
+  security.
+
+  Two operational notes. The sweep runs wherever there is a database, whether
+  or not capture is on now, so turning capture off still ages out what was
+  already written. And each round records the whole prompt it sent, which
+  contains the rounds before it, so a long tool-using turn writes several
+  megabytes; the retention window is the only bound, so size it against the
+  disk. `docs/features/turn-records.md` has the whole contract.
 
 ### Changed
 
