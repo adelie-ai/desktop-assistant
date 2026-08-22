@@ -77,6 +77,10 @@ pub enum RestartArea {
     /// `[context]`: what bounds the verbatim window is read once when the
     /// conversation handler is built (#1208).
     Context,
+    /// `[inspector]`: whether turn capture is wired, and the window its sweep
+    /// enforces, are both read once at startup - the recorder onto the
+    /// conversation handler, the window into the sweep task.
+    Inspector,
 }
 
 impl RestartArea {
@@ -92,6 +96,7 @@ impl RestartArea {
             Self::Authz => "authz",
             Self::Recall => "recall",
             Self::Context => "context",
+            Self::Inspector => "inspector",
         }
     }
 }
@@ -172,6 +177,9 @@ pub fn plan_reload(old: &DaemonConfig, new: &DaemonConfig) -> ReloadPlan {
     }
     if old.context != new.context {
         plan.restart_required.push(RestartArea::Context);
+    }
+    if old.inspector != new.inspector {
+        plan.restart_required.push(RestartArea::Inspector);
     }
 
     plan
@@ -521,6 +529,31 @@ mod tests {
         assert_eq!(RestartArea::Authz.as_key(), "authz");
         assert_eq!(RestartArea::Recall.as_key(), "recall");
         assert_eq!(RestartArea::Context.as_key(), "context");
+        assert_eq!(RestartArea::Inspector.as_key(), "inspector");
+    }
+
+    /// Turn capture is wired once, at startup, so an edit must read as pending
+    /// a restart. Both halves count: switching capture on or off changes what
+    /// the handler holds, and moving the window changes what the sweep
+    /// enforces, and neither reaches a running daemon.
+    #[test]
+    fn changing_the_inspector_section_requires_a_restart() {
+        let old = DaemonConfig::default();
+
+        let mut switched = DaemonConfig::default();
+        switched.inspector.enabled = Some(false);
+        let plan = plan_reload(&old, &switched);
+        assert!(plan.restart_required.contains(&RestartArea::Inspector));
+        assert!(!plan.rebuild_registry);
+
+        let mut narrower = DaemonConfig::default();
+        narrower.inspector.retention_days = 1;
+        assert!(
+            plan_reload(&old, &narrower)
+                .restart_required
+                .contains(&RestartArea::Inspector),
+            "the window is read once as well"
+        );
     }
 
     /// The admin allowlist is read into the transport validators once, so an

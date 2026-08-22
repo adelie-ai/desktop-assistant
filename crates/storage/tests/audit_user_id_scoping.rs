@@ -154,7 +154,54 @@ const ALLOWED_CROSS_USER_QUERIES: &[AllowedCrossUserQuery] = &[
                     install a per-user scope; every other statement \
                     in the file binds user_id.",
     },
+    // #1252 retention. The turn-record sweep deletes by age on behalf of the
+    // daemon, not of a caller, so it names no user. It lives in a file of its
+    // own for exactly this reason: the store beside it reads and writes one
+    // person's prompts and replies, and a whole-file exemption there would
+    // stop this audit checking the statements that matter.
+    AllowedCrossUserQuery {
+        file: "src/turn_records/retention.rs",
+        line_hint: 0,
+        rationale: "sweep_expired_turn_records: daemon-wide retention pass \
+                    that deletes every user's expired turn records by \
+                    started_at. The only statement in the file, and it \
+                    removes rows rather than returning any.",
+    },
 ];
+
+/// The retention sweep's exemption is whole-file (`line_hint: 0`), and its
+/// rationale says "the only statement in the file". Nothing held it to that,
+/// so a second statement added beside it would have been unaudited from the
+/// moment it was written. This is what holds it.
+///
+/// Two checks, because one is not enough. `extract_query_sites` only sees a
+/// SQL **literal**, so counting sites alone would pass a second statement
+/// composed with `format!` - which is also the one shape the main scan cannot
+/// read, so it would be doubly invisible. The second assertion refuses that
+/// shape in this file outright.
+#[test]
+fn the_retention_sweeps_exemption_covers_exactly_one_query() {
+    let path = storage_src_root().join("turn_records").join("retention.rs");
+    let content =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let sites = extract_query_sites(&content);
+    assert_eq!(
+        sites.len(),
+        1,
+        "src/turn_records/retention.rs is exempt from the user_id scan as a \
+         whole file, on the stated ground that it holds one deliberately \
+         cross-user DELETE. It now holds {} literal query sites, so either \
+         move the new one to the store beside it - where the scan reaches it - \
+         or narrow the exemption.",
+        sites.len()
+    );
+    assert!(
+        !content.contains("format!") && !content.contains("AssertSqlSafe"),
+        "a composed query in src/turn_records/retention.rs is invisible to \
+         both this check and the main scan, so the file may only hold literal \
+         SQL"
+    );
+}
 
 /// Result of scanning a single SQL fragment.
 #[derive(Debug)]
@@ -259,6 +306,24 @@ fn assert_personal_tables_match_audit() {
         !canonical.contains(&"turn_state"),
         "`turn_state` is a migration filename, not a table — the real table is `turns`"
     );
+}
+
+/// #1252. The turn-record tables hold the full text of every turn: the system
+/// prompt, every injected block, the model's reply, and every tool result. That
+/// is the largest personal-data surface in the schema, so the db_query tool's
+/// grafting set has to cover both of them or LLM-supplied SQL reads another
+/// tenant's conversations whole.
+#[test]
+fn turn_records_are_user_scoped() {
+    let canonical = personal_data_tables();
+    for required in ["turn_records", "turn_round_records"] {
+        assert!(
+            canonical.contains(&required),
+            "canonical personal-data list must include `{required}`; without it \
+             the db_query tool grafts no `user_id` predicate onto SQL naming it, \
+             and one tenant reads another's prompts and replies in full"
+        );
+    }
 }
 
 // ---------- helpers ---------------------------------------------------------

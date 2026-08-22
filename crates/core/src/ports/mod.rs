@@ -62,6 +62,7 @@ pub mod transcript;
 pub mod transport;
 pub mod turn_capability;
 pub mod turn_interactivity;
+pub mod turn_record;
 pub mod turn_telemetry;
 
 #[cfg(test)]
@@ -82,5 +83,6 @@ mod tests {
         fn _assert_tool_registry_exists<T: super::tool_registry::ToolRegistryStore>() {}
         fn _assert_skill_index_exists<T: super::skill_index::SkillIndexStore>() {}
         fn _assert_context_breakdown_exists<T: super::context_breakdown::ContextBreakdownStore>() {}
+        fn _assert_turn_recorder_exists<T: super::turn_record::TurnRecorder>() {}
     }
 }

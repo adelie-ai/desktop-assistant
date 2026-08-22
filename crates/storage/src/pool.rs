@@ -245,6 +245,9 @@ const MIGRATIONS: &[Migration] = &[
     // resolved the budget it ran under. Both were measured on every turn and
     // then discarded.
     migration!("054_context_breakdown.sql"),
+    // #1252: the full text of every turn - the request as sent, the reply, the
+    // tool calls and their results. One row per turn, one per round inside it.
+    migration!("055_turn_records.sql"),
 ];
 
 /// Second half of the advisory-lock key: the schema the migrations write to.
