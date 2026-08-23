@@ -36,6 +36,7 @@ warnings = "deny"
 
 [workspace.lints.clippy]
 all = "deny"
+undocumented_unsafe_blocks = "deny"
 
 [workspace.dependencies]
 notify = "8"

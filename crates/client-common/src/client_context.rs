@@ -169,6 +169,9 @@ fn gecos_full_name(uid: libc::uid_t) -> Option<String> {
     let mut buf_size = sysconf_or(libc::_SC_GETPW_R_SIZE_MAX, 1024).max(1024);
     loop {
         let mut buf: Vec<libc::c_char> = vec![0; buf_size];
+        // SAFETY: An all-zero bit pattern is valid for `libc::passwd` because its
+        // fields are raw pointers and integers; every field is written by
+        // `getpwuid_r` on success before any read.
         let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
         let mut result: *mut libc::passwd = std::ptr::null_mut();
         // SAFETY: `&mut pwd` is a valid `passwd*` for the call; `buf` is a

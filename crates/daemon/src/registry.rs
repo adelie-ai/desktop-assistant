@@ -1083,7 +1083,8 @@ mod tests {
 
         // The fixture relies on one env var being unset so the openai
         // connection resolves with no key. Clear it defensively.
-        // SAFETY: single-threaded test; name is specific to this fixture.
+        // SAFETY: The env var name is unique to this test, so no other test in
+        // the binary reads or writes it.
         unsafe {
             std::env::remove_var("DA_ISSUE9_FIXTURE_UNSET_OPENAI_KEY");
         }
