@@ -67,6 +67,21 @@ struct ConvData {
     password: *const c_char,
 }
 
+/// Owns the heap `ConvData` that PAM receives as `appdata_ptr` and
+/// reclaims it on every exit path. PAM reads it only while
+/// `pam_authenticate` and `pam_acct_mgmt` run, so reclaiming it after
+/// `pam_end`, or after a failed `pam_start`, is correct.
+struct ConvDataOwner(*mut ConvData);
+
+impl Drop for ConvDataOwner {
+    fn drop(&mut self) {
+        // SAFETY: the pointer came from Box::into_raw in `authenticate`,
+        // is reclaimed exactly once here, and PAM does not retain it
+        // past pam_end.
+        unsafe { drop(Box::from_raw(self.0)) };
+    }
+}
+
 /// Free a PAM response array allocated by `libc::calloc` inside the
 /// `conversation` callback below.
 ///
@@ -197,14 +212,15 @@ pub(super) fn authenticate(username: &str, password: &str) -> anyhow::Result<boo
 
     let mut handle: *mut PamHandle = ptr::null_mut();
     // Box the ConvData so its address is heap-stable and cannot be
-    // invalidated by stack moves.  The box is kept alive until after
-    // pam_end, guaranteeing the pointer remains valid for all callbacks.
+    // invalidated by stack moves. Wrap it in ConvDataOwner so it is
+    // reclaimed on every exit path, including early returns.
     let conv_data = Box::new(ConvData {
         password: password_bytes.as_ptr() as *const c_char,
     });
+    let _conv_data_owner = ConvDataOwner(Box::into_raw(conv_data));
     let conversation = PamConv {
         conv: Some(conversation),
-        appdata_ptr: Box::into_raw(conv_data).cast(),
+        appdata_ptr: _conv_data_owner.0 as *mut c_void,
     };
 
     // SAFETY: all pointers passed are valid for this call.
@@ -229,12 +245,6 @@ pub(super) fn authenticate(username: &str, password: &str) -> anyhow::Result<boo
     // SAFETY: handle came from pam_start and must be terminated once.
     unsafe {
         pam_end(handle, status);
-    }
-    // SAFETY: reclaim the boxed ConvData that was leaked via Box::into_raw.
-    // This must happen after pam_end so the pointer remains valid for all
-    // PAM callbacks.
-    unsafe {
-        drop(Box::from_raw(conversation.appdata_ptr as *mut ConvData));
     }
 
     Ok(status == PAM_SUCCESS)
