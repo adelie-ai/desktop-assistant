@@ -238,9 +238,10 @@ mod tests {
         assert!(saved >= 0, "duplicate the real stderr");
         let _restore = RestoreStderr(saved);
 
-        // SAFETY: `dup2` of an open descriptor over the process's own stderr.
-        // The guard above restores it, on the panicking path as well.
         assert!(
+            // SAFETY: `dup2` of an open descriptor over the process's own stderr.
+            // The guard above (`RestoreStderr`) restores it, even on the
+            // panicking path. `file` is guaranteed to be a valid open file.
             unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) } >= 0,
             "point stderr at the temporary file"
         );

@@ -4652,6 +4652,8 @@ mod tests {
             uuid::Uuid::new_v4().simple()
         ));
         let cstr = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `cstr` outlives the call; the pointer is read only during the
+        // call; the return code is checked immediately after to ensure success.
         let rc = unsafe { libc::mkfifo(cstr.as_ptr(), 0o600) };
         assert_eq!(rc, 0, "mkfifo failed");
 
@@ -4873,7 +4875,8 @@ base_url = "http://localhost:11435"
             // connection with no api key — every connection fails to build.
             // The reload must be refused so new turns don't all break.
             let unused = format!("DA_TEST_RELOAD_KEY_{}", uuid::Uuid::new_v4().simple());
-            // SAFETY: unique name, single-threaded test.
+            // SAFETY: The env var name is unique to this test (generated with a
+            // UUID), so no other test in the binary reads or writes it.
             unsafe {
                 std::env::remove_var(&unused);
             }

@@ -632,10 +632,19 @@ done
 
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
-            // SAFETY: see `set`.
             match &self.previous {
-                Some(v) => unsafe { std::env::set_var(self.key, v) },
-                None => unsafe { std::env::remove_var(self.key) },
+                Some(v) => {
+                    // SAFETY: `key` is exclusively owned by the calling test within
+                    // this binary; no other test thread reads or writes it while this
+                    // guard is alive.
+                    unsafe { std::env::set_var(self.key, v) }
+                }
+                None => {
+                    // SAFETY: `key` is exclusively owned by the calling test within
+                    // this binary; no other test thread reads or writes it while this
+                    // guard is alive.
+                    unsafe { std::env::remove_var(self.key) }
+                }
             }
         }
     }

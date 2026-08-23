@@ -104,12 +104,20 @@ unsafe fn free_responses(responses: *mut PamResponse, count: c_int) {
         return;
     }
     for i in 0..count {
+        // SAFETY: `responses` is a calloc'd array of `count` PamResponses; the
+        // loop bounds (0..count) ensure pointer arithmetic stays within bounds.
         let entry = unsafe { responses.add(i as usize) };
+        // SAFETY: `entry` is a valid pointer to a PamResponse within the bounds
+        // of the calloc'd array; dereferencing it is sound.
         if unsafe { !(*entry).resp.is_null() } {
             // Zero the password bytes before handing the buffer
             // back to libc (#38). The buffer was allocated via
             // `libc::strdup` from a NUL-terminated C string, so
             // `strlen` gives the byte count we need to wipe.
+            // SAFETY: `entry` is a valid pointer to a PamResponse; `(*entry).resp`
+            // was allocated via `libc::strdup`, so it is safe to read with strlen,
+            // zero with memset, and deallocate with free. `strlen` is safe because
+            // the field was allocated from a NUL-terminated C string.
             unsafe {
                 let len = libc::strlen((*entry).resp);
                 if len > 0 {
@@ -119,6 +127,8 @@ unsafe fn free_responses(responses: *mut PamResponse, count: c_int) {
             }
         }
     }
+    // SAFETY: `responses` was allocated via `libc::calloc` in the `conversation`
+    // callback; freeing it with `libc::free` is the matching deallocator.
     unsafe {
         libc::free(responses.cast());
     }

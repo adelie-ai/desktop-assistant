@@ -89,10 +89,19 @@ impl EnvVarGuard {
 
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
-        // SAFETY: see `set`.
         match &self.previous {
-            Some(v) => unsafe { std::env::set_var(self.key, v) },
-            None => unsafe { std::env::remove_var(self.key) },
+            Some(v) => {
+                // SAFETY: `key` is exclusively owned by the calling test within
+                // this binary; no other test thread reads or writes it while this
+                // guard is alive.
+                unsafe { std::env::set_var(self.key, v) }
+            }
+            None => {
+                // SAFETY: `key` is exclusively owned by the calling test within
+                // this binary; no other test thread reads or writes it while this
+                // guard is alive.
+                unsafe { std::env::remove_var(self.key) }
+            }
         }
     }
 }
@@ -569,10 +578,23 @@ async fn assert_non_utf8_value_passes_through(var: &'static str) {
     )
     .await;
 
-    // SAFETY: see above.
     match &previous {
-        Some(v) => unsafe { std::env::set_var(var, v) },
-        None => unsafe { std::env::remove_var(var) },
+        Some(v) => {
+            // SAFETY: The caller (a per-variable allowlist test) owns `var`
+            // exclusively within this binary. This restoration runs strictly after
+            // the test's `EnvVarGuard` for the same key has already been set and
+            // dropped (sequential, single-threaded within one `#[tokio::test]`
+            // function), so there is no overlap.
+            unsafe { std::env::set_var(var, v) }
+        }
+        None => {
+            // SAFETY: The caller (a per-variable allowlist test) owns `var`
+            // exclusively within this binary. This restoration runs strictly after
+            // the test's `EnvVarGuard` for the same key has already been set and
+            // dropped (sequential, single-threaded within one `#[tokio::test]`
+            // function), so there is no overlap.
+            unsafe { std::env::remove_var(var) }
+        }
     }
 
     let mut client = result.expect("handshake should succeed");
