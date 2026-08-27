@@ -1898,6 +1898,13 @@ async fn main() -> Result<()> {
         desktop_assistant_core::ports::context_breakdown::ContextBreakdownGetFn,
     );
     let mut context_breakdown_fns: Option<CbFns> = None;
+    // #1327: the per-turn context plan - every candidate the [Recall] lookup
+    // considered, scored by term. The turn loop takes the write and the
+    // opened-append; the read surface is a later unit. Needs a Postgres pool;
+    // without one the plan is built in memory and then dropped, and nothing
+    // about the turn changes.
+    let mut context_plan_store: Option<Arc<desktop_assistant_storage::context_plans::PgContextPlanStore>> =
+        None;
 
     if let Some(pool) = &pg_pool {
         tracing::info!("wiring database query into builtin tools");
@@ -1956,6 +1963,13 @@ async fn main() -> Result<()> {
                 let store = Arc::clone(&cb_store);
                 Box::pin(async move { store.get(&request_id).await })
             }),
+        ));
+
+        // Issue #1327: wire the per-turn context plan store. The turn loop
+        // takes the write (the plan itself, and the opened-append); the read
+        // surface (list/get for `adele inspect turn`) is a later unit.
+        context_plan_store = Some(Arc::new(
+            desktop_assistant_storage::context_plans::PgContextPlanStore::new(pool.clone()),
         ));
 
         // Issue #184: wire the per-conversation scratchpad store.
@@ -2564,6 +2578,65 @@ async fn main() -> Result<()> {
         }
     };
 
+    // #1327: age out context plans on the same window as the turn records
+    // above - the plan and the turn text answer the same forensic question,
+    // so they expire together on one knob rather than two. Gated on the
+    // database alone, for the same reason the turn-record sweep is: an
+    // operator who has just turned capture off is the one person whose
+    // plans most need removing.
+    let (context_plan_sweep_shutdown_tx, context_plan_sweep_shutdown_rx) =
+        tokio::sync::oneshot::channel::<()>();
+    let context_plan_sweep_task = match &pg_pool {
+        Some(pool) => {
+            let pool = pool.clone();
+            tracing::info!(
+                "context-plan sweep enabled: retention {inspector_retention_days}d, every \
+                 {TURN_RECORD_SWEEP_INTERVAL_SECS}s"
+            );
+            Some(tokio::spawn(async move {
+                let mut shutdown_rx = context_plan_sweep_shutdown_rx;
+                // Let startup settle before the first sweep.
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                    _ = &mut shutdown_rx => {
+                        tracing::info!("context-plan sweep cancelled before first pass");
+                        return;
+                    }
+                }
+
+                loop {
+                    match desktop_assistant_storage::sweep_expired_context_plans(
+                        &pool,
+                        inspector_retention_days,
+                    )
+                    .await
+                    {
+                        Ok(n) if n > 0 => tracing::info!(
+                            "context-plan sweep removed {n} plan{} past the window",
+                            if n == 1 { "" } else { "s" }
+                        ),
+                        Ok(_) => tracing::debug!("context-plan sweep: nothing expired"),
+                        Err(e) => tracing::warn!("context-plan sweep failed: {e}"),
+                    }
+
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(
+                            TURN_RECORD_SWEEP_INTERVAL_SECS,
+                        )) => {}
+                        _ = &mut shutdown_rx => {
+                            tracing::info!("context-plan sweep: shutdown signal received");
+                            break;
+                        }
+                    }
+                }
+            }))
+        }
+        None => {
+            drop(context_plan_sweep_shutdown_rx);
+            None
+        }
+    };
+
     // Spawn background dreaming (periodic fact extraction) task
     let dreaming_enabled = daemon_config
         .as_ref()
@@ -3087,6 +3160,26 @@ async fn main() -> Result<()> {
     // about the turn changes.
     if let Some((record, _, _)) = &context_breakdown_fns {
         handler = handler.with_context_breakdown_recorder(Arc::clone(record));
+    }
+    // #1327: persist the plan the [Recall] lookup built for this turn - every
+    // candidate considered, scored by term - and append ids the model opens
+    // during the turn. Additive - without a database the plan is built and
+    // then dropped, and nothing about the turn changes.
+    if let Some(store) = &context_plan_store {
+        let record_store = Arc::clone(store);
+        handler = handler.with_context_plan_recorder(Arc::new(
+            move |plan: desktop_assistant_core::ports::context_plan::ContextPlan| {
+                let store = Arc::clone(&record_store);
+                Box::pin(async move { store.record(&plan).await })
+            },
+        ));
+        let opened_store = Arc::clone(store);
+        handler = handler.with_context_plan_opened_recorder(Arc::new(
+            move |request_id: String, opened_id: String| {
+                let store = Arc::clone(&opened_store);
+                Box::pin(async move { store.append_opened(&request_id, &opened_id).await })
+            },
+        ));
     }
     // #1104: resolve the knowledge entries pinned notes attach, one batched read
     // per round, and repair a note whose entry has gone. Both need a database;
@@ -3875,6 +3968,13 @@ async fn main() -> Result<()> {
         && let Err(e) = task.await
     {
         tracing::warn!("turn-record sweep join error during shutdown: {e}");
+    }
+
+    let _ = context_plan_sweep_shutdown_tx.send(());
+    if let Some(task) = context_plan_sweep_task
+        && let Err(e) = task.await
+    {
+        tracing::warn!("context-plan sweep join error during shutdown: {e}");
     }
 
     let _ = dreaming_shutdown_tx.send(());

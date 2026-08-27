@@ -92,16 +92,55 @@ impl PgContextPlanStore {
     /// record into the second. The `WHERE` on the `DO UPDATE` makes that
     /// write land nowhere instead, and a `rows_affected() == 0` logs why.
     pub async fn record(&self, plan: &ContextPlan) -> Result<(), CoreError> {
-        // TODO(#1327): issue the upsert. Stubbed so the acceptance tests in
-        // `tests/context_plans.rs` fail for the behaviour they name - no row
-        // is ever written, so every read and the sweep downstream of it see
-        // nothing - rather than for a missing symbol. The JSON encoders
-        // below are still exercised here so the read path they also feed
-        // stays real.
-        let _ = weights_to_json(&plan.weights);
-        let _ = arms_to_json(&plan.arms);
-        let _ = candidates_to_json(&plan.candidates);
-        let _ = opened_to_json(&plan.opened);
+        let user_id = current_user_id();
+        let written = sqlx::query(
+            "INSERT INTO context_plans \
+                 (user_id, request_id, conversation_id, recall_ran, query_text, \
+                  query_text_truncated, bar, weights, scorer_version, arms, \
+                  candidates, considered_count, truncated, opened) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+             ON CONFLICT (user_id, request_id) DO UPDATE SET \
+                 conversation_id = EXCLUDED.conversation_id, \
+                 recall_ran = EXCLUDED.recall_ran, \
+                 query_text = EXCLUDED.query_text, \
+                 query_text_truncated = EXCLUDED.query_text_truncated, \
+                 bar = EXCLUDED.bar, \
+                 weights = EXCLUDED.weights, \
+                 scorer_version = EXCLUDED.scorer_version, \
+                 arms = EXCLUDED.arms, \
+                 candidates = EXCLUDED.candidates, \
+                 considered_count = EXCLUDED.considered_count, \
+                 truncated = EXCLUDED.truncated, \
+                 opened = EXCLUDED.opened \
+             WHERE context_plans.conversation_id = EXCLUDED.conversation_id",
+        )
+        .bind(user_id.as_str())
+        .bind(&plan.request_id)
+        .bind(&plan.conversation_id)
+        .bind(plan.recall_ran)
+        .bind(&plan.query_text)
+        .bind(plan.query_text_truncated)
+        .bind(plan.bar)
+        .bind(weights_to_json(&plan.weights))
+        .bind(&plan.scorer_version)
+        .bind(arms_to_json(&plan.arms))
+        .bind(candidates_to_json(&plan.candidates))
+        .bind(i32::try_from(plan.considered_count).unwrap_or(i32::MAX))
+        .bind(plan.truncated)
+        .bind(opened_to_json(&plan.opened))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CoreError::Storage(e.to_string()))?;
+        if written.rows_affected() == 0 {
+            tracing::warn!(
+                request_id = %plan.request_id,
+                conversation_id = %plan.conversation_id,
+                "a context plan for this correlation id is already recorded \
+                 against another conversation, so this turn's plan was not \
+                 written; the id is the client's own turn id and has been \
+                 reused"
+            );
+        }
         Ok(())
     }
 
