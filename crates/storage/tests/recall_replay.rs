@@ -314,8 +314,18 @@ async fn replay_ranks_a_seeded_corpus_exactly_as_the_live_scan_ranks_it() {
     // entry's distance from it is distinct — a tie would let the two scans
     // agree on the *set* of nearest rows while disagreeing on tie order for
     // reasons that have nothing to do with distance parity.
-    let ids = ["kb-0", "kb-1", "kb-2", "kb-3", "kb-4"];
-    let angles = [0.0_f32, 0.15, 0.4, 0.9, 1.5];
+    //
+    // kb-0 carries the query's own direction but at five times its
+    // magnitude. Cosine distance ignores magnitude entirely, so kb-0 stays
+    // nearest; Euclidean distance does not, and ranks kb-0 last. Unit
+    // vectors alone cannot tell the two operators apart — cosine distance
+    // and squared Euclidean distance are a monotonic transform of each
+    // other on the unit sphere — so this row is what makes the assertion
+    // below actually pin the operator rather than merely the angle.
+    let query = at_angle(0.0);
+    seed_entry(&fx.pool, "kb-0", vec![5.0, 0.0, 0.0], MODEL_A).await;
+    let ids = ["kb-1", "kb-2", "kb-3", "kb-4"];
+    let angles = [0.15_f32, 0.4, 0.9, 1.5];
     for (id, angle) in ids.iter().zip(angles.iter()) {
         seed_entry(&fx.pool, id, at_angle(*angle), MODEL_A).await;
     }
@@ -323,8 +333,6 @@ async fn replay_ranks_a_seeded_corpus_exactly_as_the_live_scan_ranks_it() {
     let manifest = take_snapshot(&fx.pool, USER, "snap-parity")
         .await
         .expect("take_snapshot succeeds");
-
-    let query = at_angle(-0.2);
 
     let live_store = PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
     let live_order: Vec<String> = with_user_id(UserId::new(USER), async {
@@ -351,7 +359,17 @@ async fn replay_ranks_a_seeded_corpus_exactly_as_the_live_scan_ranks_it() {
         live_order, snapshot_order,
         "the frozen scan must order the same corpus exactly as the live scan does"
     );
-    assert_eq!(live_order.len(), ids.len());
+    assert_eq!(
+        live_order.len(),
+        ids.len() + 1,
+        "kb-0 plus the four angled entries"
+    );
+    assert_eq!(
+        live_order.first().map(String::as_str),
+        Some("kb-0"),
+        "cosine distance ignores magnitude, so kb-0 (same direction, larger magnitude) is \
+         nearest under the correct operator"
+    );
 
     fx.cleanup().await;
 }
