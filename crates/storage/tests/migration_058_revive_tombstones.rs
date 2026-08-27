@@ -243,6 +243,35 @@ async fn a_live_row_is_left_untouched() {
         return;
     };
     insert_row(&fx.pool, "kb-live", "active", None, None).await;
+    // A row that is already `superseded` and already live -- the shape a
+    // resolved link takes once the new consolidation engine writes one
+    // directly, rather than through a tombstone. This is the case that
+    // actually exercises the `deleted_at IS NOT NULL` guard: the plain
+    // active row above never reaches that guard at all, because it fails
+    // the disposition filter first.
+    insert_row(&fx.pool, "kb-canonical", "active", None, None).await;
+    insert_row(
+        &fx.pool,
+        "kb-already-live-superseded",
+        "superseded",
+        None,
+        Some("kb-canonical"),
+    )
+    .await;
+    // Same shape, but the successor it names does not exist. Arm 1 above
+    // only ever touches `deleted_at` (already NULL here, so a broken guard
+    // there would be silently unobservable); arm 2's actions -- flipping
+    // `disposition` to `active` and clearing `superseded_by` -- are the
+    // ones a missing `deleted_at IS NOT NULL` guard would wrongly apply to
+    // an already-live row, and this is the fixture that can catch it.
+    insert_row(
+        &fx.pool,
+        "kb-already-live-dangling",
+        "superseded",
+        None,
+        Some("kb-hard-reaped"),
+    )
+    .await;
     rewind_058(&fx.pool).await;
 
     run_migrations(&fx.pool)
@@ -255,6 +284,46 @@ async fn a_live_row_is_left_untouched() {
          migration"
     );
     assert_eq!(disposition(&fx.pool, "kb-live").await, "active");
+    assert!(
+        deleted_at(&fx.pool, "kb-already-live-superseded")
+            .await
+            .is_none(),
+        "a row that is already live must stay live"
+    );
+    assert_eq!(
+        disposition(&fx.pool, "kb-already-live-superseded").await,
+        "superseded",
+        "a live superseded row is not a tombstone -- the deleted_at guard \
+         must keep the migration from touching it"
+    );
+    assert_eq!(
+        superseded_by(&fx.pool, "kb-already-live-superseded")
+            .await
+            .as_deref(),
+        Some("kb-canonical"),
+        "its successor link must be left exactly as it was"
+    );
+    assert!(
+        deleted_at(&fx.pool, "kb-already-live-dangling")
+            .await
+            .is_none(),
+        "a row that is already live must stay live even when its successor \
+         id is dangling"
+    );
+    assert_eq!(
+        disposition(&fx.pool, "kb-already-live-dangling").await,
+        "superseded",
+        "the deleted_at guard, not the successor's existence, is what must \
+         keep a live row out of arm 2 -- a dangling successor on a live row \
+         must not be reinterpreted as a hard-reap"
+    );
+    assert_eq!(
+        superseded_by(&fx.pool, "kb-already-live-dangling")
+            .await
+            .as_deref(),
+        Some("kb-hard-reaped"),
+        "the dangling link must be left exactly as it was"
+    );
 
     fx.cleanup().await;
 }
