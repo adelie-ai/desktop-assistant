@@ -75,6 +75,24 @@ fn page_limit(requested: u32) -> u32 {
     requested.min(MAX_PLANS_PER_PAGE)
 }
 
+/// The most ids the `opened` array keeps, mirroring
+/// [`desktop_assistant_core::ports::context_plan::MAX_PLANNED_CANDIDATES`] in
+/// order of magnitude.
+///
+/// `ContextPlan::opened` (`crates/core/src/ports/context_plan.rs`) carries no
+/// cap of its own - nothing in `core` writes past a handful of entries today,
+/// because nothing yet calls the opened-recorder hook this store wires (see
+/// the PR that added this file). That is a dormant path, not a proven one,
+/// and a dormant field is exactly the one nobody is watching when a future
+/// writer starts growing it. `candidates` already defends itself with a cap
+/// and a `truncated` flag; `opened` cannot carry the same flag without a
+/// field `core` does not define, so this store enforces a ceiling on the
+/// array itself instead, at both write paths (`record` and `append_opened`).
+/// A model cannot open more distinct candidates than a turn ever offered, and
+/// `candidates` is itself bounded at 512, so 512 is the natural ceiling here
+/// too, not a number picked independently.
+const MAX_OPENED_ENTRIES: usize = 512;
+
 pub struct PgContextPlanStore {
     pool: PgPool,
 }
@@ -127,7 +145,7 @@ impl PgContextPlanStore {
         .bind(candidates_to_json(&plan.candidates))
         .bind(i32::try_from(plan.considered_count).unwrap_or(i32::MAX))
         .bind(plan.truncated)
-        .bind(opened_to_json(&plan.opened))
+        .bind(opened_to_json(bounded_opened(&plan.opened)))
         .execute(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
@@ -158,9 +176,14 @@ impl PgContextPlanStore {
         opened_id: &str,
     ) -> Result<(), CoreError> {
         let user_id = current_user_id();
+        // Three-way CASE: already present (idempotent no-op), at the cap
+        // (refuse to grow further - also a no-op), otherwise append. The cap
+        // check reads the array's own length rather than a stored counter, so
+        // it stays correct however the array got to that length.
         sqlx::query(
             "UPDATE context_plans SET opened = CASE \
                  WHEN opened @> to_jsonb($3::text) THEN opened \
+                 WHEN jsonb_array_length(opened) >= $4 THEN opened \
                  ELSE opened || to_jsonb($3::text) \
              END \
              WHERE user_id = $1 AND request_id = $2",
@@ -168,6 +191,7 @@ impl PgContextPlanStore {
         .bind(user_id.as_str())
         .bind(request_id)
         .bind(opened_id)
+        .bind(i32::try_from(MAX_OPENED_ENTRIES).unwrap_or(i32::MAX))
         .execute(&self.pool)
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
@@ -487,6 +511,26 @@ fn candidates_from_json(stored: &Value) -> Vec<PlannedCandidate> {
 }
 
 // ---------- JSON mapping: opened ----------
+
+/// Cut `opened` to [`MAX_OPENED_ENTRIES`] if it is somehow already past the
+/// cap by the time `record` writes it. Logged, not silent: unlike
+/// `candidates`, the stored row carries no flag that says this array was
+/// truncated, so a warning here is the only trace of it.
+fn bounded_opened(opened: &[String]) -> &[String] {
+    if opened.len() > MAX_OPENED_ENTRIES {
+        tracing::warn!(
+            len = opened.len(),
+            cap = MAX_OPENED_ENTRIES,
+            "a plan's opened array arrived past its cap and was cut on write; \
+             every writer today appends at most one id per call through \
+             append_opened, which enforces the same cap, so this path is not \
+             expected to fire"
+        );
+        &opened[..MAX_OPENED_ENTRIES]
+    } else {
+        opened
+    }
+}
 
 fn opened_to_json(opened: &[String]) -> Value {
     Value::Array(opened.iter().map(|id| Value::String(id.clone())).collect())
