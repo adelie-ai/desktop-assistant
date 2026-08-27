@@ -313,7 +313,7 @@ impl HardDeleteOutcome {
 /// row from the *reap*, never from the tool that could erase it outright the
 /// same turn. Now that a tombstone can be brought back
 /// ([`crate::dreaming::restore_entry`]), a non-person delete by id is routed
-/// to the trash instead, in [`soft_delete_ids`], before the policy is even
+/// to the trash instead, in `soft_delete_ids`, before the policy is even
 /// consulted. `ExpiredTombstones` and `AllTombstones` are unaffected: they
 /// are the retention reap and the "empty the trash" control, and both already
 /// mean the row's fate is decided — reaping only ever touches what a person
