@@ -195,7 +195,7 @@ impl KnowledgeMaintenanceService for DaemonKnowledgeMaintenanceService {
         .await?;
         // Collapse the per-op-kind stats into a single "changes" count for the
         // task log; the live panel refresh is driven by `on_change` per user.
-        Ok(stats.updated + stats.merged_clusters + stats.soft_deleted + stats.scope_added)
+        Ok(stats.updated + stats.merged_clusters + stats.dispositioned + stats.scope_added)
     }
 
     async fn recalculate_embeddings(

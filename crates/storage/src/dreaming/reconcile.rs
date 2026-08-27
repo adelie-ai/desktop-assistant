@@ -1,15 +1,42 @@
 //! End-of-cycle reconciliation: op buffer + union-find merge clustering
-//! + transactional apply (issue #108).
+//! + transactional apply (issue #108, widened by #893).
 //!
 //! Per-memory consolidation reviews emit proposed operations; this module
 //! aggregates them, computes merge clusters (`merge(A,B)` + `merge(B,C)` →
-//! cluster `{A,B,C}`), and applies everything in a single transaction with
-//! soft-delete semantics for retired entries.
+//! cluster `{A,B,C}`), and applies everything in a single transaction.
 //!
-//! A retired row records *why* it was retired: a merge member names the
-//! canonical row that absorbed it, a prune carries the model's stated reason.
-//! The two outcomes are very different - one relocates the content, the other
-//! destroys it - so they must be separable on disk, not just in the logs.
+//! Consolidation has one destructive verb short of none: it cannot delete a
+//! row at all. An entry it judges wrong, stale or redundant is
+//! [`Disposition`]ed - marked with what it is and why - and stays live.
+//! `merge_new` writes a **new** row for the unified content and dispositions
+//! every member [`Disposition::Redundant`] with a link back; no member is
+//! rewritten or removed, so a merge can never deadlock against the settled
+//! rule and never drops a member's own provenance.
+//!
+//! **The real invariant, stated once.** An explicit entry (`source =
+//! 'explicit'`) can never be dispositioned `trivial` or `redundant` by a
+//! *standalone* proposal - that guard is enforced twice, in
+//! `consolidation.rs`'s pre-filter and again by this module's own SQL
+//! predicate. It is NOT true that an explicit entry can never carry
+//! `redundant` at all: a merge dispositions every member `redundant`
+//! unconditionally, including an explicit one, because the design accepts
+//! explicit members into a cluster on purpose (design section 4.3). What
+//! carries the protection forward is the new row, not the member: a cluster
+//! with an explicit member stamps the new row `source = 'explicit'` (below),
+//! so the fact stays protected under its new id even though the member row
+//! that used to hold it now reads `redundant`. A reader of this table -
+//! restore, a browse filter, an audit - must not assume `redundant` implies
+//! `source <> 'explicit'`; it does not.
+//!
+//! Two layers back every disposition guard here. Consolidation's own
+//! pre-filter (`crates/storage/src/dreaming/consolidation.rs`) reads the
+//! entries it already loaded and refuses what it can see is wrong before an
+//! op ever reaches this module. This module's own SQL predicates back that
+//! guard as a second, independent check: normally they refuse nothing, because
+//! the layer above already agreed. When one of them refuses something that
+//! layer let through, that is a hole in the guard above, not a safety net
+//! working as designed, and it is counted and logged as such
+//! (`ConsolidationStats::backstop_firings`).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -36,19 +63,25 @@ pub enum ProposedOp {
         a: String,
         b: String,
     },
-    Delete {
+    Disposition {
         id: String,
+        disposition: Disposition,
         /// The model's stated reason, already bounded by the caller. `None`
-        /// when it gave none: a tombstone reads better as "unstated" than as
-        /// an empty string.
+        /// when it gave none.
         reason: Option<String>,
+        /// The entry this one is refuted, superseded, or duplicated by. Only
+        /// meaningful for those three dispositions; ignored otherwise.
+        superseded_by: Option<String>,
     },
 }
 
 /// Synthesized result of merging a cluster, produced by an LLM synthesis call.
+///
+/// Carries no id of its own: the row `merge_new` writes gets a deterministic
+/// id derived from the sorted member ids (see `merge_id`), computed at apply
+/// time rather than decided by the caller.
 #[derive(Debug, Clone)]
 pub struct SynthesizedMerge {
-    pub canonical_id: String,
     pub member_ids: Vec<String>,
     pub new_content: String,
     pub new_scope: Option<KbScope>,
@@ -61,7 +94,7 @@ pub struct OpBuffer {
     merge_pairs: BTreeSet<(String, String)>,
     updates: HashMap<String, String>,
     scope_adds: HashMap<String, KbScope>,
-    deletes: HashMap<String, Option<String>>,
+    dispositions: HashMap<String, (Disposition, Option<String>, Option<String>)>,
     /// All ids touched by any op (focal memories), used to mark reviewed.
     reviewed_ids: BTreeSet<String>,
 }
@@ -94,16 +127,24 @@ impl OpBuffer {
                 self.reviewed_ids.insert(hi.clone());
                 self.merge_pairs.insert((lo, hi));
             }
-            ProposedOp::Delete { id, reason } => {
+            ProposedOp::Disposition {
+                id,
+                disposition,
+                reason,
+                superseded_by,
+            } => {
                 self.reviewed_ids.insert(id.clone());
-                self.deletes.insert(id, reason);
+                self.dispositions
+                    .insert(id, (disposition, reason, superseded_by));
             }
         }
     }
 
     /// Compute connected components on merge pairs. Returns clusters of
-    /// size ≥ 2, each as a sorted set of ids. The canonical id (lowest
-    /// lexicographic id in the cluster) is the merge target.
+    /// size ≥ 2, each as a sorted set of ids. The lowest lexicographic id in
+    /// the cluster is a stable key for looking up the cluster's synthesized
+    /// content - not the row that survives, since `merge_new` writes a new
+    /// one.
     pub fn merge_clusters(&self) -> Vec<BTreeSet<String>> {
         let mut parent: BTreeMap<String, String> = BTreeMap::new();
 
@@ -176,12 +217,28 @@ impl OpBuffer {
             .collect()
     }
 
-    pub fn standalone_deletes(&self) -> Vec<(String, Option<String>)> {
+    /// Disposition ops on ids that aren't in any merge cluster. A merge
+    /// member is dispositioned [`Disposition::Redundant`] by the merge apply
+    /// itself, so a standalone disposition proposed for the same id would be
+    /// redundant work at best and a conflicting write at worst - excluding it
+    /// here is what makes the disposition budget blind to it too (#712 item
+    /// 3): the caller computes the budget from what this returns, after
+    /// subsumption, not from every disposition the model proposed.
+    pub fn standalone_dispositions(
+        &self,
+    ) -> Vec<(String, Disposition, Option<String>, Option<String>)> {
         let in_cluster = self.clustered_ids();
-        self.deletes
+        self.dispositions
             .iter()
             .filter(|(id, _)| !in_cluster.contains(*id))
-            .map(|(id, reason)| (id.clone(), reason.clone()))
+            .map(|(id, (disposition, reason, superseded_by))| {
+                (
+                    id.clone(),
+                    *disposition,
+                    reason.clone(),
+                    superseded_by.clone(),
+                )
+            })
             .collect()
     }
 
@@ -221,16 +278,14 @@ pub async fn apply_ops(
     // failure and must not roll the transaction back.
     super::trash::reap_expired_for_user(&mut *tx, user_id.as_str(), policy).await?;
 
-    // Apply merges: update canonical row, soft-delete cluster members. The
-    // canonical row's embedding is left stale (not regenerated here) — the
-    // bumped `updated_at` marks it for the background embedding-backfill task.
+    // Apply merges: insert a new row for the unified content, disposition
+    // every member `redundant` with a link back. No member is rewritten or
+    // removed - the new row's embedding starts NULL and the background
+    // embedding-backfill task picks it up, same as extraction's own inserts.
     for merge in synthesized {
-        // One read for the whole cluster: the canonical row's metadata (its
-        // source_conversation_id must survive the merge) and every member's
-        // provenance.
-        let member_rows: Vec<(String, Option<String>, serde_json::Value)> = sqlx::query_as(
-            "SELECT id, source, metadata FROM knowledge_base \
-             WHERE user_id = $1 AND id = ANY($2)",
+        let member_rows: Vec<(String, Option<String>, Vec<String>, i16)> = sqlx::query_as(
+            "SELECT id, source, tags, review_generation FROM knowledge_base \
+             WHERE user_id = $1 AND id = ANY($2) AND deleted_at IS NULL",
         )
         .bind(user_id.as_str())
         .bind(&merge.member_ids)
@@ -238,79 +293,145 @@ pub async fn apply_ops(
         .await
         .map_err(|e| CoreError::Storage(format!("dreaming: cluster fetch failed: {e}")))?;
 
-        let mut metadata = member_rows
-            .iter()
-            .find(|(id, _, _)| id == &merge.canonical_id)
-            .map(|(_, _, value)| KbMetadata::from_json(value))
-            .unwrap_or_default();
-        metadata.scope = merge.new_scope.clone();
+        // A member may have been reaped or retired by a concurrent change
+        // between the plan being formed and this transaction. Fewer than two
+        // live members left means there is nothing to unify.
+        if member_rows.len() < 2 {
+            tracing::warn!(
+                "dreaming: merge cluster for {:?} has fewer than two live members at apply \
+                 time; skipping",
+                merge.member_ids
+            );
+            continue;
+        }
 
-        // A deliberately-entered fact absorbed by a merge keeps its provenance
-        // on the surviving row. Stamping the canonical 'consolidation' would
-        // strip the never-prune protection, and the next night's pass would be
-        // free to delete a fact the user entered on purpose.
+        let new_id = merge_id(&merge.member_ids);
+
+        // A deliberately-entered fact absorbed by a merge passes its
+        // protection to the new row. Stamping it 'consolidation' would strip
+        // the never-prune protection, and the next pass would be free to
+        // disposition a fact the user entered on purpose.
         let cluster_is_explicit = member_rows
             .iter()
-            .any(|(_, source, _)| source.as_deref() == Some(SOURCE_EXPLICIT));
+            .any(|(_, source, ..)| source.as_deref() == Some(SOURCE_EXPLICIT));
+        let source = if cluster_is_explicit {
+            "explicit"
+        } else {
+            "consolidation"
+        };
 
-        sqlx::query(
-            "UPDATE knowledge_base \
-             SET content = $1, metadata = $2, \
-                 source = CASE WHEN $3 THEN 'explicit' ELSE 'consolidation' END, \
-                 updated_at = NOW(), \
-                 reviewed_at = NOW(), \
-                 review_generation = LEAST(review_generation + 1, $4) \
-             WHERE user_id = $5 AND id = $6",
+        let max_generation = member_rows
+            .iter()
+            .map(|(_, _, _, generation)| *generation)
+            .max()
+            .unwrap_or(0);
+        let new_generation = (max_generation + 1).min(MAX_REVIEW_GENERATION);
+
+        let mut tags: BTreeSet<String> = BTreeSet::new();
+        for (_, _, member_tags, _) in &member_rows {
+            tags.extend(member_tags.iter().cloned());
+        }
+        let tags: Vec<String> = tags.into_iter().collect();
+
+        // Deliberately empty except `scope`: a merge can absorb any number of
+        // members, each with its own `source_conversation_id`, so writing any
+        // one of them onto the new row would misrepresent an N-source
+        // synthesis as coming from a single conversation - the old in-place
+        // merge did exactly that (picked whichever member sorted lowest) and
+        // it was never anything but arbitrary. The true provenance is not
+        // lost: every member stays a live row, carries its own
+        // `source_conversation_id` untouched, and is reachable from the new
+        // row by `WHERE superseded_by = <new row's id>`. That link is the
+        // recovery path today, pinned by
+        // `a_merged_rows_conversation_provenance_is_recoverable_through_its_members`
+        // below; #696's derived-from table gives it a proper index later, at
+        // which point this row can be re-cast as one of several sources
+        // rather than staying silent about the count.
+        let mut metadata = KbMetadata::new();
+        metadata.scope = merge.new_scope.clone();
+
+        // Deterministic on the sorted member ids, so a replayed apply (a
+        // retried batch after a crash, or the same plan applied twice)
+        // upserts this exact row rather than writing a duplicate. `user_id`
+        // is repeated in the conflict guard defensively: the id is derived
+        // only from member ids that already belong to this user, so a
+        // cross-tenant collision is not expected, but the guard costs
+        // nothing and turns an impossible case into a silent no-op rather
+        // than a cross-tenant write.
+        let inserted = sqlx::query(
+            "INSERT INTO knowledge_base \
+                (id, user_id, content, tags, metadata, source, review_generation, reviewed_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) \
+             ON CONFLICT (id) DO UPDATE SET \
+                content = EXCLUDED.content, tags = EXCLUDED.tags, \
+                metadata = EXCLUDED.metadata, source = EXCLUDED.source, \
+                review_generation = EXCLUDED.review_generation, \
+                reviewed_at = NOW(), updated_at = NOW() \
+             WHERE knowledge_base.user_id = $2",
         )
-        .bind(&merge.new_content)
-        .bind(metadata.to_json())
-        .bind(cluster_is_explicit)
-        .bind(MAX_REVIEW_GENERATION)
+        .bind(&new_id)
         .bind(user_id.as_str())
-        .bind(&merge.canonical_id)
+        .bind(&merge.new_content)
+        .bind(&tags)
+        .bind(metadata.to_json())
+        .bind(source)
+        .bind(new_generation)
         .execute(&mut *tx)
         .await
-        .map_err(|e| CoreError::Storage(format!("dreaming: merge canonical update failed: {e}")))?;
+        .map_err(|e| CoreError::Storage(format!("dreaming: merge insert failed: {e}")))?;
 
-        // Soft-delete the rest of the cluster, each member pointing at the row
-        // that absorbed it. No reason is written: the model states none per
-        // member, and `superseded_by` already says where the content went.
-        let to_delete: Vec<String> = merge
-            .member_ids
-            .iter()
-            .filter(|id| *id != &merge.canonical_id)
-            .cloned()
-            .collect();
-        if !to_delete.is_empty() {
-            let result = sqlx::query(
-                "UPDATE knowledge_base \
-                 SET deleted_at = NOW(), reviewed_at = NOW(), \
-                     disposition = $3, superseded_by = $4 \
-                 WHERE user_id = $2 AND id = ANY($1) AND deleted_at IS NULL",
-            )
-            .bind(&to_delete)
-            .bind(user_id.as_str())
-            .bind(Disposition::Superseded.as_str())
-            .bind(&merge.canonical_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| {
-                CoreError::Storage(format!("dreaming: cluster soft-delete failed: {e}"))
-            })?;
-            // Count rows the statement actually retired, so a member already
-            // tombstoned by an earlier op is not counted twice.
-            stats.soft_deleted += result.rows_affected() as usize;
+        // Fail closed: the conflict guard above can affect zero rows (the id
+        // exists under a different owner - unreachable today, since the id is
+        // a UUIDv5 hash of member ids that already belong to this user, but
+        // the guard exists for exactly this case). Dispositioning the members
+        // against a row that was never actually written would strand them
+        // pointing at nothing. No member is touched this run; the cluster is
+        // simply not unified, the same outcome as the too-few-live-members
+        // case above.
+        if inserted.rows_affected() == 0 {
+            tracing::warn!(
+                "dreaming: merge_new insert for {new_id} (members {:?}) did not land; \
+                 skipping this cluster's member disposition rather than stranding them",
+                merge.member_ids
+            );
+            continue;
         }
+
+        // Every member stays a live row, dispositioned `redundant` and
+        // pointing at the row that absorbed it. No reason is written: the
+        // model states none per member, and `superseded_by` already says
+        // where the content went.
+        let result = sqlx::query(
+            "UPDATE knowledge_base \
+             SET disposition = $3, superseded_by = $4, \
+                 reviewed_at = NOW(), updated_at = NOW() \
+             WHERE user_id = $2 AND id = ANY($1) AND deleted_at IS NULL",
+        )
+        .bind(&merge.member_ids)
+        .bind(user_id.as_str())
+        .bind(Disposition::Redundant.as_str())
+        .bind(&new_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| CoreError::Storage(format!("dreaming: member disposition failed: {e}")))?;
+        // Count rows the statement actually touched, so a member already
+        // dispositioned by an earlier op in the same run is not counted
+        // twice.
+        stats.dispositioned += result.rows_affected() as usize;
 
         stats.merged_clusters += 1;
     }
 
     // Standalone updates (not in any merge cluster). Embedding left stale for
     // the background backfill task; only content + watermarks change here.
+    // The settled guard is backed by its own predicate here: consolidation's
+    // pre-filter already excludes a settled entry's edit, so this should
+    // refuse nothing in the ordinary run; when it does, that is a hole in the
+    // guard above, not this guard working as intended.
     for (id, new_content) in buffer.standalone_updates() {
-        // As with a merge canonical: tightening the prose of a deliberately-
-        // entered fact must not relabel it as the model's own output.
-        sqlx::query(
+        // As with a merge: tightening the prose of a deliberately-entered
+        // fact must not relabel it as the model's own output.
+        let result = sqlx::query(
             "UPDATE knowledge_base \
              SET content = $1, \
                  source = CASE WHEN source = 'explicit' THEN 'explicit' \
@@ -318,7 +439,7 @@ pub async fn apply_ops(
                  updated_at = NOW(), \
                  reviewed_at = NOW(), \
                  review_generation = LEAST(review_generation + 1, $2) \
-             WHERE user_id = $4 AND id = $3",
+             WHERE user_id = $4 AND id = $3 AND deleted_at IS NULL AND review_generation < $2",
         )
         .bind(&new_content)
         .bind(MAX_REVIEW_GENERATION)
@@ -327,7 +448,20 @@ pub async fn apply_ops(
         .execute(&mut *tx)
         .await
         .map_err(|e| CoreError::Storage(format!("dreaming: update failed: {e}")))?;
-        stats.updated += 1;
+
+        if result.rows_affected() > 0 {
+            stats.updated += 1;
+        } else if row_is_active(&mut *tx, user_id.as_str(), &id).await? {
+            tracing::warn!(
+                "dreaming: consolidation edit of {id} was refused by the settled-entry \
+                 backstop; the guard above should already have excluded it"
+            );
+            stats.backstop_firings += 1;
+        }
+        // Else: the row is simply gone (already deleted, or reaped by the
+        // trash sweep between the plan being formed and this transaction).
+        // That is the ordinary case #712 item 2 says must not be reported the
+        // same way as a guard hole.
     }
 
     // Standalone scope additions.
@@ -360,28 +494,102 @@ pub async fn apply_ops(
         }
     }
 
-    // Standalone prunes: nothing supersedes them, so the model's stated reason
-    // is the only record of why the entry is gone. The `source` predicate is a
-    // backstop: consolidation already filters protected ids out of the plan,
-    // but the row itself refuses too, so no future caller of `apply_ops` can
-    // prune a deliberately-entered fact by forgetting the filter.
-    for (id, reason) in buffer.standalone_deletes() {
+    // Standalone dispositions: nothing supersedes them but a superseded or
+    // redundant target, so the model's stated reason (and, for those two, the
+    // successor) is the record of why the entry now reads the way it does.
+    for (id, disposition, reason, superseded_by) in buffer.standalone_dispositions() {
+        // Scope guard: two facts about disjoint, non-empty scopes cannot
+        // contradict each other, so a refuted/superseded/redundant
+        // disposition naming a target is refused when the scopes share
+        // nothing. This is the one guard with no application-level layer
+        // above it - it needs a fresh read of both rows' metadata, which may
+        // span slices the caller never held together, so the apply path is
+        // its only enforcement point.
+        if let Some(target) = superseded_by.as_deref()
+            && matches!(
+                disposition,
+                Disposition::Refuted | Disposition::Superseded | Disposition::Redundant
+            )
+        {
+            let pair = vec![id.clone(), target.to_string()];
+            let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+                "SELECT id, metadata FROM knowledge_base \
+                 WHERE user_id = $1 AND id = ANY($2) AND deleted_at IS NULL",
+            )
+            .bind(user_id.as_str())
+            .bind(&pair)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| {
+                CoreError::Storage(format!("dreaming: scope-guard metadata fetch failed: {e}"))
+            })?;
+            let scope_of = |wanted: &str| -> Option<KbScope> {
+                rows.iter()
+                    .find(|(row_id, _)| row_id == wanted)
+                    .and_then(|(_, metadata)| KbMetadata::from_json(metadata).scope)
+                    .filter(|scope| !scope.is_empty())
+            };
+            if let (Some(a), Some(b)) = (scope_of(&id), scope_of(target))
+                && scopes_are_disjoint(&a, &b)
+            {
+                tracing::debug!(
+                    "dreaming: refusing to disposition {id} against {target}: their scopes \
+                     share nothing, so one cannot contradict the other"
+                );
+                stats.scope_guard_refusals += 1;
+                continue;
+            }
+        }
+
+        // The schema's own CHECK constraint requires `superseded_by` exactly
+        // when the disposition is `superseded` or `redundant`, and forbids it
+        // otherwise. A `refuted` op may still have named a target - read
+        // above for the scope guard - but it is not stored.
+        let stored_target = match disposition {
+            Disposition::Superseded | Disposition::Redundant => superseded_by.as_deref(),
+            _ => None,
+        };
+        // An explicit entry may be refuted, superseded, or made obsolete by
+        // the model, but never marked trivial or redundant - the never-prune
+        // rule translated into the wider vocabulary.
+        let explicit_may_not_receive =
+            matches!(disposition, Disposition::Trivial | Disposition::Redundant);
+
+        // `source IS DISTINCT FROM 'explicit'`, not `source <> 'explicit'`:
+        // most rows carry a NULL source, and SQL's three-valued logic makes
+        // `NULL = 'explicit'` NULL rather than false, which would make `NOT
+        // ($6 AND source = 'explicit')` NULL too - and a NULL predicate in a
+        // WHERE clause excludes the row exactly like a real refusal would,
+        // silently turning every ordinary disposition into a backstop firing.
+        // `IS DISTINCT FROM` reads NULL as "not explicit", which is what the
+        // guard means.
         let result = sqlx::query(
             "UPDATE knowledge_base \
-             SET deleted_at = NOW(), reviewed_at = NOW(), \
-                 disposition = $3, disposition_reason = $4 \
-             WHERE user_id = $2 AND id = $1 \
-               AND deleted_at IS NULL \
-               AND source IS DISTINCT FROM 'explicit'",
+             SET disposition = $3, disposition_reason = $4, superseded_by = $5, \
+                 reviewed_at = NOW(), updated_at = NOW() \
+             WHERE user_id = $2 AND id = $1 AND deleted_at IS NULL \
+               AND (NOT $6 OR source IS DISTINCT FROM 'explicit')",
         )
         .bind(&id)
         .bind(user_id.as_str())
-        .bind(Disposition::Trivial.as_str())
+        .bind(disposition.as_str())
         .bind(reason.as_deref())
+        .bind(stored_target)
+        .bind(explicit_may_not_receive)
         .execute(&mut *tx)
         .await
-        .map_err(|e| CoreError::Storage(format!("dreaming: soft-delete failed: {e}")))?;
-        stats.soft_deleted += result.rows_affected() as usize;
+        .map_err(|e| CoreError::Storage(format!("dreaming: disposition failed: {e}")))?;
+
+        if result.rows_affected() > 0 {
+            stats.dispositioned += 1;
+        } else if row_is_active(&mut *tx, user_id.as_str(), &id).await? {
+            tracing::warn!(
+                "dreaming: consolidation disposition of {id} to {} was refused by the \
+                 explicit-entry backstop; the guard above should already have excluded it",
+                disposition.as_str()
+            );
+            stats.backstop_firings += 1;
+        }
     }
 
     // Any reviewed id that didn't already get its reviewed_at touched
@@ -406,6 +614,66 @@ pub async fn apply_ops(
         .map_err(|e| CoreError::Storage(format!("dreaming: commit failed: {e}")))?;
 
     Ok(stats)
+}
+
+/// Fixed namespace for [`merge_id`]'s UUIDv5 hash. Any 16 bytes work here -
+/// what matters is that it never changes, so the same member set always
+/// hashes to the same id.
+const MERGE_ID_NAMESPACE: uuid::Uuid = uuid::Uuid::from_bytes(*b"adelie-kb-merge!");
+
+/// The id a `merge_new` of exactly `members` always produces, whenever it
+/// runs and however many times. Sorting first means the id does not depend
+/// on the order the model listed the members in.
+///
+/// Determinism is what makes a replayed apply an upsert instead of a
+/// duplicate (8.4): a crash after this INSERT commits but before the next
+/// batch's watermark advances redoes the same merge, and the same member set
+/// hashes to the same id both times.
+///
+/// `pub`, surfaced from `dreaming::mod` the same way `apply_ops` is: a DB test
+/// needs to precompute this id to force the owner-mismatch case the INSERT's
+/// conflict guard exists for, which is not otherwise reachable (ids are
+/// UUIDv7, so no test can arrive at a real collision by chance).
+pub fn merge_id(members: &[String]) -> String {
+    let mut sorted: Vec<&str> = members.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    let name = sorted.join("\u{1}");
+    uuid::Uuid::new_v5(&MERGE_ID_NAMESPACE, name.as_bytes()).to_string()
+}
+
+/// Do `a` and `b` share no `(dimension, value)` pair at all?
+///
+/// This is the scope guard's own definition of "different scopes cannot
+/// contradict": two entries that agree on at least one scope dimension are
+/// treated as related enough that one may still refute, supersede, or
+/// duplicate the other. Two that share nothing - one scoped to a project, the
+/// other to an unrelated one - are not.
+fn scopes_are_disjoint(a: &KbScope, b: &KbScope) -> bool {
+    !a.0.iter()
+        .any(|(dimension, value)| b.0.get(dimension) == Some(value))
+}
+
+/// Is `id` still a live (not soft-deleted) row?
+///
+/// Used only after a guarded write affects zero rows, to tell apart the two
+/// reasons that can happen: the row is simply gone (ordinary - already
+/// retired, or reaped between the plan being formed and this transaction), or
+/// the row is still there and the guard predicate is what refused it (a hole
+/// in the layer above, worth a warning). Generic over the executor so it can
+/// run against the open transaction the caller already holds.
+async fn row_is_active<'e, E>(executor: E, user_id: &str, id: &str) -> Result<bool, CoreError>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let found: Option<(i32,)> = sqlx::query_as(
+        "SELECT 1 FROM knowledge_base WHERE user_id = $1 AND id = $2 AND deleted_at IS NULL",
+    )
+    .bind(user_id)
+    .bind(id)
+    .fetch_optional(executor)
+    .await
+    .map_err(|e| CoreError::Storage(format!("dreaming: backstop existence check failed: {e}")))?;
+    Ok(found.is_some())
 }
 
 #[cfg(test)]
@@ -525,5 +793,77 @@ mod tests {
         let clusters = b.merge_clusters();
         assert_eq!(clusters.len(), 1);
         assert_eq!(clusters[0].len(), 2);
+    }
+
+    #[test]
+    fn standalone_dispositions_exclude_clustered_ids() {
+        let mut b = OpBuffer::new();
+        b.absorb(ProposedOp::Merge {
+            a: "A".into(),
+            b: "B".into(),
+        });
+        b.absorb(ProposedOp::Disposition {
+            id: "A".into(),
+            disposition: Disposition::Trivial,
+            reason: None,
+            superseded_by: None,
+        });
+        b.absorb(ProposedOp::Disposition {
+            id: "Z".into(),
+            disposition: Disposition::Obsolete,
+            reason: Some("no longer applies".into()),
+            superseded_by: None,
+        });
+        let standalone = b.standalone_dispositions();
+        assert_eq!(
+            standalone.len(),
+            1,
+            "a disposition on a merged member is subsumed by the merge, not applied on its own"
+        );
+        assert_eq!(standalone[0].0, "Z");
+        assert_eq!(standalone[0].1, Disposition::Obsolete);
+    }
+
+    #[test]
+    fn merge_id_is_stable_under_member_reordering() {
+        let forward = merge_id(&["kb-a".to_string(), "kb-b".to_string()]);
+        let reversed = merge_id(&["kb-b".to_string(), "kb-a".to_string()]);
+        assert_eq!(
+            forward, reversed,
+            "the id must not depend on the order the model listed the members in"
+        );
+    }
+
+    #[test]
+    fn merge_id_differs_for_a_different_member_set() {
+        let one = merge_id(&["kb-a".to_string(), "kb-b".to_string()]);
+        let other = merge_id(&["kb-a".to_string(), "kb-c".to_string()]);
+        assert_ne!(one, other);
+    }
+
+    #[test]
+    fn scopes_sharing_a_dimension_and_value_are_not_disjoint() {
+        let a = KbScope::new().with("project", "adelie-ai");
+        let b = KbScope::new()
+            .with("project", "adelie-ai")
+            .with("tool", "vim");
+        assert!(!scopes_are_disjoint(&a, &b));
+    }
+
+    #[test]
+    fn scopes_with_the_same_dimension_and_different_values_are_disjoint() {
+        let a = KbScope::new().with("project", "adelie-ai");
+        let b = KbScope::new().with("project", "other-repo");
+        assert!(
+            scopes_are_disjoint(&a, &b),
+            "the same dimension pointing at different values shares nothing in common"
+        );
+    }
+
+    #[test]
+    fn scopes_with_no_dimension_in_common_are_disjoint() {
+        let a = KbScope::new().with("project", "adelie-ai");
+        let b = KbScope::new().with("host", "workstation-1");
+        assert!(scopes_are_disjoint(&a, &b));
     }
 }

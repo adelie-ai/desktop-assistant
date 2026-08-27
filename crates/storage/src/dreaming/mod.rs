@@ -62,6 +62,20 @@ pub use types::{
 /// so the cross-user ON CONFLICT branch never fires via normal extraction.
 pub use common::update_watermark;
 
+/// Surfaced for the DB-gated consolidation-applier tests (#893). Consolidation's
+/// own guard (`consolidation.rs`, reading the entries it already loaded) and the
+/// applier's SQL predicate always agree when driven through the public
+/// [`run_consolidation_scan`] entry point, because they enforce the same rule -
+/// so the only way to prove the applier's own guard actually holds, rather than
+/// merely riding along behind an app-level filter that already agrees with it,
+/// is to call it directly with an operation that filter would have refused. The
+/// same call also drives the idempotent-replay proof (8.4): apply the same
+/// `SynthesizedMerge` twice and check the second call changes nothing new.
+/// `merge_id` is surfaced alongside them so a test can precompute a merge's
+/// deterministic id and force the INSERT's owner-mismatch guard - the one
+/// case that cannot occur by chance, because ids are UUIDv7.
+pub use reconcile::{OpBuffer, ProposedOp, SynthesizedMerge, apply_ops, merge_id};
+
 /// Run one dreaming scan cycle: extract new facts, write the knowledge
 /// summaries that are missing or stale, and archive old conversations.
 /// Consolidation runs separately (see [`run_consolidation_scan`]) on a slower
@@ -169,44 +183,207 @@ pub async fn run_consolidation_scan(
     let stats =
         consolidation::run_consolidation_phase(pool, llm_fn, policy, cancellation, on_change)
             .await?;
-    if stats.merged_clusters > 0
-        || stats.updated > 0
-        || stats.soft_deleted > 0
-        || stats.scope_added > 0
-    {
-        tracing::info!(
+    match report_for(&stats) {
+        ConsolidationReport::Applied => tracing::info!(
             "consolidation: reviewed {}, merged {} cluster(s), updated {}, scope-added {}, \
-             soft-deleted {}; refused {} prune(s) of user-entered entries and {} \
-             mutation(s) of settled ones; deferred {} prune(s) and {} rewrite(s) over the \
+             dispositioned {}; refused {} disposition(s) of user-entered entries and {} \
+             mutation(s) of settled ones; deferred {} disposition(s) and {} rewrite(s) over the \
              configured share; dropped {} unreadable operation(s)",
             stats.reviewed,
             stats.merged_clusters,
             stats.updated,
             stats.scope_added,
-            stats.soft_deleted,
-            stats.protected_from_delete,
+            stats.dispositioned,
+            stats.explicit_guard_refusals,
             stats.settled_unchanged,
-            stats.prunes_over_cap,
+            stats.dispositions_over_cap,
             stats.rewrites_over_cap,
             stats.dropped_operations,
-        );
-    } else if stats.dropped_operations > 0 {
-        // A run that changed nothing because it could not read what the model
-        // proposed is not a quiet no-op. Say so at a level an operator reads,
-        // or it looks exactly like a run with nothing to do.
-        tracing::warn!(
-            "consolidation: reviewed {} entr{} and changed nothing, after dropping {} \
-             unreadable operation(s)",
+        ),
+        // A run that proposed nothing and a run whose every proposal was
+        // refused both apply zero changes, but they are not the same story
+        // (#712 item 1): the second means the model kept asking and every
+        // answer was no, which a quiet "no changes" line would hide.
+        ConsolidationReport::RefusalsOnly => tracing::info!(
+            "consolidation: reviewed {} entr{}, changed nothing - every proposal was refused: {}",
             stats.reviewed,
             if stats.reviewed == 1 { "y" } else { "ies" },
-            stats.dropped_operations,
-        );
-    } else {
-        tracing::debug!(
+            describe_refusals(&stats),
+        ),
+        ConsolidationReport::Unreadable => {
+            // A run that changed nothing because it could not read what the
+            // model proposed is not a quiet no-op either. Say so at a level
+            // an operator reads, or it looks exactly like a run with nothing
+            // to do.
+            tracing::warn!(
+                "consolidation: reviewed {} entr{} and changed nothing, after dropping {} \
+                 unreadable operation(s)",
+                stats.reviewed,
+                if stats.reviewed == 1 { "y" } else { "ies" },
+                stats.dropped_operations,
+            );
+        }
+        ConsolidationReport::NoOp => tracing::debug!(
             "consolidation: reviewed {} entr{}, no changes",
             stats.reviewed,
             if stats.reviewed == 1 { "y" } else { "ies" }
-        );
+        ),
     }
     Ok(stats)
+}
+
+/// What one consolidation run has to report, decided from its counters.
+///
+/// "Nothing changed" is not one story. A run that proposed nothing looks the
+/// same on the surface as a run whose every proposal was refused, but an
+/// operator needs to tell them apart (#712 item 1): the second means the
+/// guards are earning their keep, and it stops looking that way the moment it
+/// is folded into "no changes".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsolidationReport {
+    /// At least one change applied.
+    Applied,
+    /// Nothing applied, but at least one proposal was refused - by a guard, a
+    /// backstop, or a budget.
+    RefusalsOnly,
+    /// Nothing applied and nothing was refused, but at least one proposed
+    /// operation could not even be read.
+    Unreadable,
+    /// A quiet run: nothing proposed, nothing refused, nothing unreadable.
+    NoOp,
+}
+
+/// Sum of the counters that mean "at least one row changed".
+fn applied_count(stats: &ConsolidationStats) -> usize {
+    stats.merged_clusters + stats.updated + stats.dispositioned + stats.scope_added
+}
+
+/// Sum of the counters that mean "a proposal was understood and refused" -
+/// every guard, budget, and backstop this unit adds.
+fn refusal_count(stats: &ConsolidationStats) -> usize {
+    stats.explicit_guard_refusals
+        + stats.settled_unchanged
+        + stats.scope_guard_refusals
+        + stats.backstop_firings
+        + stats.dispositions_over_cap
+        + stats.rewrites_over_cap
+}
+
+fn report_for(stats: &ConsolidationStats) -> ConsolidationReport {
+    if applied_count(stats) > 0 {
+        ConsolidationReport::Applied
+    } else if refusal_count(stats) > 0 {
+        ConsolidationReport::RefusalsOnly
+    } else if stats.dropped_operations > 0 {
+        ConsolidationReport::Unreadable
+    } else {
+        ConsolidationReport::NoOp
+    }
+}
+
+/// One line naming every refusal counter this unit adds, for the
+/// [`ConsolidationReport::RefusalsOnly`] log line.
+fn describe_refusals(stats: &ConsolidationStats) -> String {
+    format!(
+        "{} explicit-entry, {} settled-entry, {} scope-guard, {} backstop, {} over the \
+         disposition share, {} over the rewrite share",
+        stats.explicit_guard_refusals,
+        stats.settled_unchanged,
+        stats.scope_guard_refusals,
+        stats.backstop_firings,
+        stats.dispositions_over_cap,
+        stats.rewrites_over_cap,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stats_with(f: impl FnOnce(&mut ConsolidationStats)) -> ConsolidationStats {
+        let mut stats = ConsolidationStats::default();
+        f(&mut stats);
+        stats
+    }
+
+    #[test]
+    fn a_run_that_proposed_nothing_is_a_no_op() {
+        assert_eq!(
+            report_for(&ConsolidationStats::default()),
+            ConsolidationReport::NoOp
+        );
+    }
+
+    #[test]
+    fn a_run_that_applied_a_change_reports_applied() {
+        let stats = stats_with(|s| s.updated = 1);
+        assert_eq!(report_for(&stats), ConsolidationReport::Applied);
+    }
+
+    /// #712 item 1, named: a run whose only outcome is refusals must not read
+    /// as "no changes" - it must be its own, distinct report.
+    #[test]
+    fn a_refusal_only_run_logs_at_info_with_the_counts() {
+        let stats = stats_with(|s| {
+            s.reviewed = 3;
+            s.settled_unchanged = 1;
+        });
+
+        assert_eq!(
+            report_for(&stats),
+            ConsolidationReport::RefusalsOnly,
+            "a run with a refusal and no applied change is its own report, not a no-op"
+        );
+        let description = describe_refusals(&stats);
+        assert!(
+            description.contains("1 settled-entry"),
+            "the counts must actually be named, not just their presence: {description}"
+        );
+    }
+
+    #[test]
+    fn each_refusal_counter_alone_is_enough_to_report_refusals_only() {
+        // Every counter this unit adds must actually move the decision, or a
+        // guard could fire with nobody able to see it in the run's report.
+        let fields: Vec<fn(&mut ConsolidationStats)> = vec![
+            |s| s.explicit_guard_refusals = 1,
+            |s| s.settled_unchanged = 1,
+            |s| s.scope_guard_refusals = 1,
+            |s| s.backstop_firings = 1,
+            |s| s.dispositions_over_cap = 1,
+            |s| s.rewrites_over_cap = 1,
+        ];
+        for set in fields {
+            let stats = stats_with(set);
+            assert_eq!(
+                report_for(&stats),
+                ConsolidationReport::RefusalsOnly,
+                "stats {stats:?} must report as refusals-only"
+            );
+        }
+    }
+
+    #[test]
+    fn an_applied_change_wins_over_a_refusal_in_the_same_run() {
+        let stats = stats_with(|s| {
+            s.updated = 1;
+            s.settled_unchanged = 1;
+        });
+        assert_eq!(report_for(&stats), ConsolidationReport::Applied);
+    }
+
+    #[test]
+    fn unreadable_operations_alone_are_their_own_report() {
+        let stats = stats_with(|s| s.dropped_operations = 1);
+        assert_eq!(report_for(&stats), ConsolidationReport::Unreadable);
+    }
+
+    #[test]
+    fn refusals_are_reported_over_unreadable_operations_in_the_same_run() {
+        let stats = stats_with(|s| {
+            s.settled_unchanged = 1;
+            s.dropped_operations = 1;
+        });
+        assert_eq!(report_for(&stats), ConsolidationReport::RefusalsOnly);
+    }
 }
