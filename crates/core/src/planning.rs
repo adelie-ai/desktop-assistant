@@ -977,7 +977,13 @@ pub(crate) fn render_scratchpad_index(keys: &[&str], max_items: usize) -> Option
 /// dereferences at render time and an edit to an entry reaches the block. An id
 /// absent from the map is an attachment whose entry no longer resolves — it was
 /// deleted, trashed, or belongs to another user.
-pub(crate) type PinnedEntries<'a> = std::collections::HashMap<&'a str, &'a str>;
+///
+/// Carries the entry's disposition alongside its content (#893): a pin is
+/// rendered in full, with no bar to clear and no arm to admit it, so it is
+/// the one surface where dropping the disposition on the way in would have
+/// made it unrecoverable by the time [`pinned_chunk`] renders the line.
+pub(crate) type PinnedEntries<'a> =
+    std::collections::HashMap<&'a str, (&'a str, crate::domain::Disposition)>;
 
 /// True when this note attaches a knowledge entry that the round's read did not
 /// find (#1104): the entry was deleted, trashed, or belongs to another user.
@@ -991,12 +997,12 @@ fn dangling_attachment(note: &RawNote<'_>, entries: Option<&PinnedEntries<'_>>) 
     }
 }
 
-/// The live content of the entry this note attaches, when there is one and the
-/// round resolved it.
+/// The live content of the entry this note attaches, and its disposition,
+/// when there is one and the round resolved it.
 fn attached_entry<'a>(
     note: &RawNote<'_>,
     entries: Option<&'a PinnedEntries<'_>>,
-) -> Option<&'a str> {
+) -> Option<(&'a str, crate::domain::Disposition)> {
     let id = note.knowledge_entry_id?;
     entries?.get(id).copied()
 }
@@ -1010,7 +1016,7 @@ fn attached_entry<'a>(
 /// [`MAX_NOTE_BYTES`](crate::ports::scratchpad::MAX_NOTE_BYTES) and an entry is
 /// not. The id travels with it so the model can read the whole entry with
 /// `builtin_knowledge_base_get` when the bounded form is not enough.
-fn pinned_chunk(note: &RawNote<'_>, entry: Option<&str>) -> String {
+fn pinned_chunk(note: &RawNote<'_>, entry: Option<(&str, crate::domain::Disposition)>) -> String {
     let mut chunk = format!("- {}:", note.key);
     if !note.content.is_empty() {
         chunk.push(' ');
@@ -1020,12 +1026,18 @@ fn pinned_chunk(note: &RawNote<'_>, entry: Option<&str>) -> String {
         chunk.push_str("\n  knowledge entry ");
         chunk.push_str(id);
         match entry {
-            Some(text) => {
+            Some((text, disposition)) => {
                 chunk.push_str(": ");
-                chunk.push_str(&desktop_assistant_protocol::one_line(
-                    text,
-                    crate::ports::scratchpad::PINNED_ENTRY_MAX_CHARS,
-                ));
+                // A pin renders in full with no bar to clear (#893), so the
+                // marker is the only thing that can keep a refuted entry from
+                // reading as a current fact here - reserved out of the cap
+                // first, the same way `KnowledgeEntry::display_line` reserves
+                // it, so a marked line still fits the budget.
+                let marker = disposition.marker();
+                let budget = crate::ports::scratchpad::PINNED_ENTRY_MAX_CHARS
+                    .saturating_sub(marker.chars().count());
+                chunk.push_str(marker);
+                chunk.push_str(&desktop_assistant_protocol::one_line(text, budget));
             }
             // The round could not read the entry at all. Saying so is not
             // optional: the block header tells the model its pins are current,
@@ -2913,9 +2925,24 @@ mod tests {
         }
     }
 
-    /// The resolved entries for a round, as [`render_pinned`] takes them.
+    /// The resolved entries for a round, as [`render_pinned`] takes them -
+    /// every one `Active`, which is what every caller but the disposition
+    /// tests below wants.
     fn resolved<'a>(pairs: &[(&'a str, &'a str)]) -> PinnedEntries<'a> {
-        pairs.iter().copied().collect()
+        pairs
+            .iter()
+            .map(|(id, content)| (*id, (*content, crate::domain::Disposition::Active)))
+            .collect()
+    }
+
+    /// The same, with each entry's own disposition stated.
+    fn resolved_with_disposition<'a>(
+        triples: &[(&'a str, &'a str, crate::domain::Disposition)],
+    ) -> PinnedEntries<'a> {
+        triples
+            .iter()
+            .map(|(id, content, disposition)| (*id, (*content, *disposition)))
+            .collect()
     }
 
     #[test]
@@ -3133,6 +3160,99 @@ mod tests {
         assert!(
             second.contains("the new cluster") && !second.contains("the old cluster"),
             "an edit to the entry must reach the block: {second}"
+        );
+    }
+
+    /// Acceptance (#893): a pin renders in full with no bar to clear, so a
+    /// refuted entry attached to it must carry the marker or it reads as a
+    /// current fact on the one surface with no admission logic to stop it.
+    /// The pin sitting beside it, attached to a comparable active entry,
+    /// must carry none - the discriminating pair every other surface's
+    /// marker test uses.
+    #[test]
+    fn pinned_reference_marks_a_refuted_entry_and_leaves_an_active_one_unmarked() {
+        let notes = vec![
+            raw_pinned_ref("refuted-fact", "settled", "kb-refuted"),
+            raw_pinned_ref("active-fact", "settled", "kb-active"),
+        ];
+        let entries = resolved_with_disposition(&[
+            (
+                "kb-refuted",
+                "the annex parking rule",
+                crate::domain::Disposition::Refuted,
+            ),
+            (
+                "kb-active",
+                "the annex parking rule",
+                crate::domain::Disposition::Active,
+            ),
+        ]);
+
+        let out = render_pinned(&notes, Some(&entries), PINNED_BLOCK_BYTE_BUDGET)
+            .expect("something is pinned");
+
+        let refuted_line = out
+            .lines()
+            .find(|l| l.contains("kb-refuted"))
+            .expect("the refuted entry's line is present");
+        let active_line = out
+            .lines()
+            .find(|l| l.contains("kb-active"))
+            .expect("the active entry's line is present");
+
+        assert!(
+            refuted_line.contains("recorded, later refuted: the annex parking rule"),
+            "a refuted pinned entry must carry the marker: {refuted_line}"
+        );
+        assert!(
+            active_line.ends_with(": the annex parking rule"),
+            "an active pinned entry beside it must carry no marker: {active_line}"
+        );
+    }
+
+    /// Acceptance (#893, finding 2): the concrete failure a review found -
+    /// pin an entry, a later consolidation pass marks it `superseded_by` a
+    /// successor, and `[Pinned]` has no resolution logic at all (it is not
+    /// a search - it renders exactly the row it was given). Without a
+    /// marker on `superseded` itself, the pin would show the old content as
+    /// a current fact forever, because nothing in this path ever looks
+    /// again. `Redundant` shares the same marker text - see
+    /// `Disposition::marker`'s own reasoning.
+    #[test]
+    fn pinned_reference_marks_a_superseded_entry_forever_not_only_until_it_is_resolved() {
+        let notes = vec![raw_pinned_ref("deploy-target", "settled", "kb-superseded")];
+        let entries = resolved_with_disposition(&[(
+            "kb-superseded",
+            "the old cluster address",
+            crate::domain::Disposition::Superseded,
+        )]);
+
+        let out = render_pinned(&notes, Some(&entries), PINNED_BLOCK_BYTE_BUDGET)
+            .expect("something is pinned");
+
+        assert!(
+            out.contains("superseded, see its successor: the old cluster address"),
+            "a superseded pinned entry must carry its marker, with no resolution step to              rescue it: {out}"
+        );
+    }
+
+    /// The same property for `obsolete`, which search excludes by default but
+    /// `[Pinned]` has no bar to exclude it with at all.
+    #[test]
+    fn pinned_reference_marks_an_obsolete_entry() {
+        let notes = vec![raw_pinned_ref("deploy-target", "settled", "kb-obsolete")];
+        let entries = resolved_with_disposition(&[(
+            "kb-obsolete",
+            "the old cluster address",
+            crate::domain::Disposition::Obsolete,
+        )]);
+
+        let out = render_pinned(&notes, Some(&entries), PINNED_BLOCK_BYTE_BUDGET)
+            .expect("something is pinned");
+
+        assert!(
+            out.contains("no longer applies: the old cluster address"),
+            "an obsolete pinned entry must carry its marker: {out}"
         );
     }
 

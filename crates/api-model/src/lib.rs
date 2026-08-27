@@ -1370,6 +1370,34 @@ pub struct KnowledgeEntryView {
     /// field existed - a client renders a truncated `content` in that case.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// What consolidation, or a person, has judged this entry to be (#893) -
+    /// the stored spelling (`"active"`, `"refuted"`, ...), not the daemon's
+    /// closed enum, because this crate does not depend on
+    /// `desktop-assistant-core`. Defaults to `"active"` for a payload written
+    /// before this field existed, which is what every such entry always was.
+    ///
+    /// Omitted from the wire when `"active"`, the same way
+    /// [`Self::summary`] is omitted when absent: the ordinary case costs
+    /// nothing extra on the wire, and a client from before this field
+    /// existed sees exactly the payload it always saw for every entry this
+    /// wave has not touched.
+    #[serde(
+        default = "default_disposition",
+        skip_serializing_if = "is_active_disposition"
+    )]
+    pub disposition: String,
+}
+
+/// The spelling [`KnowledgeEntryView::disposition`] takes when a payload
+/// carries none - a client from before this field existed, or a stored
+/// snapshot from the same era.
+fn default_disposition() -> String {
+    "active".to_string()
+}
+
+/// Whether `disposition` is the ordinary, wire-silent case.
+fn is_active_disposition(disposition: &str) -> bool {
+    disposition == "active"
 }
 
 impl KnowledgeEntryView {
@@ -1379,12 +1407,22 @@ impl KnowledgeEntryView {
     /// and ending in `...` when it was cut short - see
     /// [`desktop_assistant_protocol::one_line`].
     ///
+    /// **Carries the refuted marker inside the cap** (#893), through
+    /// [`desktop_assistant_protocol::disposition_marker`] - the same helper
+    /// the daemon's domain type calls, so a client rendering this view marks
+    /// a refuted entry exactly as the daemon's own surfaces do.
+    ///
     /// A client renders this rather than writing its own fallback, so every
     /// surface cuts and marks the line the same way. The daemon's domain type
     /// answers identically from the same shared rule.
     pub fn display_line(&self) -> String {
+        let marker = desktop_assistant_protocol::disposition_marker(&self.disposition);
         let source = self.summary.as_deref().unwrap_or(&self.content);
-        desktop_assistant_protocol::one_line(source, SUMMARY_MAX_CHARS)
+        let budget = SUMMARY_MAX_CHARS.saturating_sub(marker.chars().count());
+        format!(
+            "{marker}{}",
+            desktop_assistant_protocol::one_line(source, budget)
+        )
     }
 }
 
@@ -5658,8 +5696,9 @@ mod tests {
 
     #[test]
     fn a_knowledge_entry_view_without_a_summary_is_byte_identical_to_the_old_shape() {
-        // An absent summary must not appear on the wire, so a client that has
-        // not been rebuilt sees exactly the payload it saw before.
+        // Neither an absent summary nor the ordinary `active` disposition may
+        // appear on the wire, so a client that has not been rebuilt sees
+        // exactly the payload it saw before either field existed.
         let view = KnowledgeEntryView {
             id: "kb-1".to_string(),
             content: "User prefers dark mode".to_string(),
@@ -5668,11 +5707,29 @@ mod tests {
             created_at: "2026-01-01 00:00:00".to_string(),
             updated_at: "2026-01-01 00:00:00".to_string(),
             summary: None,
+            disposition: "active".to_string(),
         };
 
         let json = serde_json::to_string(&view).unwrap();
 
         assert!(!json.contains("summary"), "json: {json}");
+        assert!(!json.contains("disposition"), "json: {json}");
+    }
+
+    /// An old-shaped payload with no `disposition` key at all must still
+    /// deserialize, defaulting to `active` - the same claim the entry always
+    /// carried.
+    #[test]
+    fn an_old_shaped_knowledge_entry_view_without_a_disposition_still_parses() {
+        let old_shaped = serde_json::json!({
+            "id": "kb-1",
+            "content": "User prefers dark mode",
+            "tags": ["preference"],
+            "created_at": "2026-01-01 00:00:00",
+            "updated_at": "2026-01-01 00:00:00",
+        });
+        let view: KnowledgeEntryView = serde_json::from_value(old_shaped).unwrap();
+        assert_eq!(view.disposition, "active");
     }
 
     /// A view carrying `content` and, optionally, a summary.
@@ -5685,6 +5742,7 @@ mod tests {
             created_at: "2026-01-01 00:00:00".to_string(),
             updated_at: "2026-01-01 00:00:00".to_string(),
             summary: summary.map(str::to_string),
+            disposition: "active".to_string(),
         }
     }
 
@@ -5716,6 +5774,28 @@ mod tests {
 
         assert_eq!(line.chars().count(), SUMMARY_MAX_CHARS);
         assert!(line.ends_with("..."));
+    }
+
+    /// Acceptance (#893): a refuted entry's wire view carries the marker on
+    /// its display line, and an active one carries none - the surface a
+    /// D-Bus client (KCM, TUI) reads. Wired through
+    /// `desktop_assistant_protocol::disposition_marker`, the same helper the
+    /// domain type's own `display_line` calls, so a client on either side of
+    /// the wire renders a refuted entry the same way.
+    #[test]
+    fn knowledge_entry_view_marks_a_refuted_line_and_leaves_an_active_one_unmarked() {
+        let mut refuted = kb_view("the annex parking rule", None);
+        refuted.disposition = "refuted".to_string();
+        let active = kb_view("the annex parking rule", None);
+
+        assert!(
+            refuted
+                .display_line()
+                .starts_with("recorded, later refuted: "),
+            "a refuted view's line must carry the marker: {}",
+            refuted.display_line()
+        );
+        assert_eq!(active.display_line(), "the annex parking rule");
     }
 
     #[test]

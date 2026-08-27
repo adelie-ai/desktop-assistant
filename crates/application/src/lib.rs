@@ -1603,6 +1603,13 @@ fn knowledge_entry_to_view(e: KnowledgeEntry) -> api::KnowledgeEntryView {
         created_at: e.created_at,
         updated_at: e.updated_at,
         summary: e.summary,
+        // The one conversion every D-Bus-facing knowledge command routes
+        // through (list, get, search, write), so the wire view's own
+        // `display_line` - and any client that reads `disposition` directly -
+        // sees what consolidation or a person actually judged the entry to
+        // be (#893), not the default every payload carried before this field
+        // existed.
+        disposition: e.disposition.as_str().to_string(),
     }
 }
 
