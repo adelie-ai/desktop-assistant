@@ -149,6 +149,11 @@ const PERSONAL_DATA_TABLES: &[&str] = &[
     // one tenant would read another's conversations whole through this tool.
     "turn_records",
     "turn_round_records",
+    // 059 - one row per turn recording what the [Recall] lookup considered:
+    // every candidate, its score broken down by term, and the prompt text
+    // that was looked up. As personal as the conversation it describes,
+    // before any of the conversation itself is read.
+    "context_plans",
 ];
 
 /// The canonical set of personal-data tables (see `PERSONAL_DATA_TABLES`).

@@ -167,6 +167,20 @@ const ALLOWED_CROSS_USER_QUERIES: &[AllowedCrossUserQuery] = &[
                     started_at. The only statement in the file, and it \
                     removes rows rather than returning any.",
     },
+    // #1327 retention, on the same terms as the turn-record sweep above: the
+    // context-plan sweep deletes by age on behalf of the daemon, not of a
+    // caller, so it names no user. It lives in its own file for the same
+    // reason - the store beside it reads and writes one person's retrieval
+    // plan, and a whole-file exemption there would stop this audit checking
+    // the statements that matter.
+    AllowedCrossUserQuery {
+        file: "src/context_plans/retention.rs",
+        line_hint: 0,
+        rationale: "sweep_expired_context_plans: daemon-wide retention pass \
+                    that deletes every user's expired context plans by \
+                    recorded_at. The only statement in the file, and it \
+                    removes rows rather than returning any.",
+    },
 ];
 
 /// The retention sweep's exemption is whole-file (`line_hint: 0`), and its
@@ -198,6 +212,32 @@ fn the_retention_sweeps_exemption_covers_exactly_one_query() {
     assert!(
         !content.contains("format!") && !content.contains("AssertSqlSafe"),
         "a composed query in src/turn_records/retention.rs is invisible to \
+         both this check and the main scan, so the file may only hold literal \
+         SQL"
+    );
+}
+
+/// As `the_retention_sweeps_exemption_covers_exactly_one_query` above, for
+/// the context-plan sweep's own whole-file exemption.
+#[test]
+fn the_context_plan_sweeps_exemption_covers_exactly_one_query() {
+    let path = storage_src_root().join("context_plans").join("retention.rs");
+    let content =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let sites = extract_query_sites(&content);
+    assert_eq!(
+        sites.len(),
+        1,
+        "src/context_plans/retention.rs is exempt from the user_id scan as a \
+         whole file, on the stated ground that it holds one deliberately \
+         cross-user DELETE. It now holds {} literal query sites, so either \
+         move the new one to the store beside it - where the scan reaches it - \
+         or narrow the exemption.",
+        sites.len()
+    );
+    assert!(
+        !content.contains("format!") && !content.contains("AssertSqlSafe"),
+        "a composed query in src/context_plans/retention.rs is invisible to \
          both this check and the main scan, so the file may only hold literal \
          SQL"
     );
@@ -324,6 +364,22 @@ fn turn_records_are_user_scoped() {
              and one tenant reads another's prompts and replies in full"
         );
     }
+}
+
+/// #1327. The context-plan table holds the query text one person's assistant
+/// looked up and every candidate the lookup considered, which names their
+/// conversations and their knowledge base before any of the knowledge itself
+/// is read. The db_query tool's grafting set has to cover it or LLM-supplied
+/// SQL reads another tenant's retrieval plans whole.
+#[test]
+fn context_plans_are_user_scoped() {
+    let canonical = personal_data_tables();
+    assert!(
+        canonical.contains(&"context_plans"),
+        "canonical personal-data list must include `context_plans`; without \
+         it the db_query tool grafts no `user_id` predicate onto SQL naming \
+         it, and one tenant reads another's retrieval plans in full"
+    );
 }
 
 // ---------- helpers ---------------------------------------------------------

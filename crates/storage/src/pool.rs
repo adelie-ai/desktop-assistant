@@ -256,6 +256,10 @@ const MIGRATIONS: &[Migration] = &[
     // to say what happened - live where the successor still exists, active
     // where it was hard-reaped. Prune tombstones are untouched.
     migration!("058_revive_merge_tombstones.sql"),
+    // #1327: one row per turn recording the retrieval plan the [Recall]
+    // lookup considered, each candidate's activation score broken down by
+    // term, and which candidates were offered and later opened.
+    migration!("059_context_plans.sql"),
 ];
 
 /// Second half of the advisory-lock key: the schema the migrations write to.
