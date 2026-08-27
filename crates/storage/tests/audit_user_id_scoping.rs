@@ -221,7 +221,9 @@ fn the_retention_sweeps_exemption_covers_exactly_one_query() {
 /// the context-plan sweep's own whole-file exemption.
 #[test]
 fn the_context_plan_sweeps_exemption_covers_exactly_one_query() {
-    let path = storage_src_root().join("context_plans").join("retention.rs");
+    let path = storage_src_root()
+        .join("context_plans")
+        .join("retention.rs");
     let content =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let sites = extract_query_sites(&content);

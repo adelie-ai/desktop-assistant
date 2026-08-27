@@ -35,7 +35,15 @@ async fn fixture() -> Option<support::DbFixture> {
     support::DbFixture::try_new("plan1327").await
 }
 
-fn arm(median: f64, deviation: f64, measured: bool, cue: bool, limit: usize, rows: usize, capped: bool) -> ArmSummary {
+fn arm(
+    median: f64,
+    deviation: f64,
+    measured: bool,
+    cue: bool,
+    limit: usize,
+    rows: usize,
+    capped: bool,
+) -> ArmSummary {
     ArmSummary {
         dispersion: RecallDispersion::assumed(median, deviation),
         dispersion_measured: measured,
@@ -266,9 +274,15 @@ async fn a_reused_request_id_cannot_move_a_plan_between_conversations() {
             "the record still names the conversation whose turn it describes"
         );
 
-        let c1_rows = store.list_for_conversation("c1", 50, 0).await.expect("list c1");
+        let c1_rows = store
+            .list_for_conversation("c1", 50, 0)
+            .await
+            .expect("list c1");
         assert_eq!(c1_rows.len(), 1, "c1 keeps the row it recorded first");
-        let c2_rows = store.list_for_conversation("c2", 50, 0).await.expect("list c2");
+        let c2_rows = store
+            .list_for_conversation("c2", 50, 0)
+            .await
+            .expect("list c2");
         assert!(
             c2_rows.is_empty(),
             "c2 gains nothing from a reused id, and takes nothing away from c1"
@@ -414,11 +428,7 @@ async fn plan_reads_are_scoped_to_the_calling_user() {
 
     with_user_id(UserId::from("owner"), async {
         assert!(
-            store
-                .get_by_request_id("r1")
-                .await
-                .expect("get")
-                .is_some(),
+            store.get_by_request_id("r1").await.expect("get").is_some(),
             "the owner still reads their own row"
         );
     })
@@ -447,7 +457,10 @@ async fn the_sweep_deletes_plans_past_the_retention_window_and_no_younger_row() 
     };
     let store = PgContextPlanStore::new(fx.pool.clone());
     with_user_id(UserId::from("u1"), async {
-        store.record(&rich_plan("old", "c1")).await.expect("record old");
+        store
+            .record(&rich_plan("old", "c1"))
+            .await
+            .expect("record old");
         store
             .record(&rich_plan("fresh", "c1"))
             .await
@@ -467,7 +480,11 @@ async fn the_sweep_deletes_plans_past_the_retention_window_and_no_younger_row() 
             "the row past the window is gone"
         );
         assert!(
-            store.get_by_request_id("fresh").await.expect("get").is_some(),
+            store
+                .get_by_request_id("fresh")
+                .await
+                .expect("get")
+                .is_some(),
             "the row inside the window is untouched by the sweep"
         );
     })
@@ -506,7 +523,9 @@ fn n_candidates(n: usize) -> Vec<PlannedCandidate> {
 #[tokio::test]
 async fn a_hundred_candidate_plan_serializes_under_64_kib() {
     let Some(fx) = fixture().await else {
-        eprintln!("skip: TEST_DATABASE_URL not set; a_hundred_candidate_plan_serializes_under_64_kib");
+        eprintln!(
+            "skip: TEST_DATABASE_URL not set; a_hundred_candidate_plan_serializes_under_64_kib"
+        );
         return;
     };
     let store = PgContextPlanStore::new(fx.pool.clone());
@@ -515,7 +534,10 @@ async fn a_hundred_candidate_plan_serializes_under_64_kib() {
         plan.candidates = n_candidates(100);
         plan.considered_count = 100;
         plan.truncated = false;
-        store.record(&plan).await.expect("record a hundred candidates");
+        store
+            .record(&plan)
+            .await
+            .expect("record a hundred candidates");
 
         // The JSON text length, not the on-disk (TOAST-compressed) column
         // size: compression on a real column can hide a regression in the

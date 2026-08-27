@@ -170,11 +170,7 @@ impl PgContextPlanStore {
     /// the same entry) leaves the array unchanged rather than growing it. A
     /// request id with no matching row - a fetch outside any turn's scope -
     /// updates zero rows and is not an error.
-    pub async fn append_opened(
-        &self,
-        request_id: &str,
-        opened_id: &str,
-    ) -> Result<(), CoreError> {
+    pub async fn append_opened(&self, request_id: &str, opened_id: &str) -> Result<(), CoreError> {
         let user_id = current_user_id();
         // Three-way CASE: already present (idempotent no-op), at the cap
         // (refuse to grow further - also a no-op), otherwise append. The cap
@@ -388,7 +384,10 @@ fn arm_summary_from_json(stored: &Value) -> ArmSummary {
             .get("rows_returned")
             .and_then(Value::as_u64)
             .unwrap_or(0) as usize,
-        capped: stored.get("capped").and_then(Value::as_bool).unwrap_or(false),
+        capped: stored
+            .get("capped")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     }
 }
 
@@ -552,7 +551,9 @@ fn opened_from_json(stored: &Value) -> Vec<String> {
 
 fn row_to_plan(row: &PgRow) -> Result<ContextPlan, CoreError> {
     let read = |column: &str, cause: sqlx::Error| -> CoreError {
-        CoreError::Storage(format!("malformed context_plans row: column {column}: {cause}"))
+        CoreError::Storage(format!(
+            "malformed context_plans row: column {column}: {cause}"
+        ))
     };
     let weights_json: Value = row.try_get("weights").map_err(|e| read("weights", e))?;
     let arms_json: Value = row.try_get("arms").map_err(|e| read("arms", e))?;
@@ -567,12 +568,18 @@ fn row_to_plan(row: &PgRow) -> Result<ContextPlan, CoreError> {
         .try_get("recorded_at")
         .map_err(|e| read("recorded_at", e))?;
     Ok(ContextPlan {
-        request_id: row.try_get("request_id").map_err(|e| read("request_id", e))?,
+        request_id: row
+            .try_get("request_id")
+            .map_err(|e| read("request_id", e))?,
         conversation_id: row
             .try_get("conversation_id")
             .map_err(|e| read("conversation_id", e))?,
-        recall_ran: row.try_get("recall_ran").map_err(|e| read("recall_ran", e))?,
-        query_text: row.try_get("query_text").map_err(|e| read("query_text", e))?,
+        recall_ran: row
+            .try_get("recall_ran")
+            .map_err(|e| read("recall_ran", e))?,
+        query_text: row
+            .try_get("query_text")
+            .map_err(|e| read("query_text", e))?,
         query_text_truncated: row
             .try_get("query_text_truncated")
             .map_err(|e| read("query_text_truncated", e))?,

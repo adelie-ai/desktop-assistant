@@ -1903,8 +1903,9 @@ async fn main() -> Result<()> {
     // opened-append; the read surface is a later unit. Needs a Postgres pool;
     // without one the plan is built in memory and then dropped, and nothing
     // about the turn changes.
-    let mut context_plan_store: Option<Arc<desktop_assistant_storage::context_plans::PgContextPlanStore>> =
-        None;
+    let mut context_plan_store: Option<
+        Arc<desktop_assistant_storage::context_plans::PgContextPlanStore>,
+    > = None;
 
     if let Some(pool) = &pg_pool {
         tracing::info!("wiring database query into builtin tools");
