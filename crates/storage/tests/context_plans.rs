@@ -59,12 +59,13 @@ fn arm(
 /// eight candidates, spanning all three arms and both `RecallRelevance`
 /// kinds, so the round trip has something of every shape to lose.
 fn rich_candidates() -> Vec<PlannedCandidate> {
-    let terms = |semantic: Option<f64>, lex, rf, sit, sal, total| ActivationTerms {
+    let terms = |semantic: Option<f64>, lex, rf, sit, sal, disp, total| ActivationTerms {
         semantic,
         lexical: lex,
         reinforcement: rf,
         situation: sit,
         salience: sal,
+        disposition: disp,
         total,
     };
     vec![
@@ -73,7 +74,7 @@ fn rich_candidates() -> Vec<PlannedCandidate> {
             arm: RecallArm::Entry,
             id: "kb-offered".to_string(),
             relevance: RecallRelevance::Distance(0.42),
-            terms: terms(Some(9.1), 0.0, 1.2, 0.4, 0.1, 10.8),
+            terms: terms(Some(9.1), 0.0, 1.2, 0.4, 0.1, 0.0, 10.8),
             use_counts: Some(PlannedUseCounts {
                 offered: 4,
                 opened: 2,
@@ -88,7 +89,7 @@ fn rich_candidates() -> Vec<PlannedCandidate> {
             arm: RecallArm::Entry,
             id: "kb-width".to_string(),
             relevance: RecallRelevance::Distance(0.51),
-            terms: terms(Some(8.0), 0.0, 0.0, 0.0, 0.0, 8.0),
+            terms: terms(Some(8.0), 0.0, 0.0, 0.0, 0.0, 0.0, 8.0),
             use_counts: None,
             cleared_bar: true,
             rank: Some(1),
@@ -99,7 +100,7 @@ fn rich_candidates() -> Vec<PlannedCandidate> {
             arm: RecallArm::Entry,
             id: "kb-pinned".to_string(),
             relevance: RecallRelevance::Distance(0.60),
-            terms: terms(Some(7.0), 0.0, 0.0, 0.0, 0.0, 7.0),
+            terms: terms(Some(7.0), 0.0, 0.0, 0.0, 0.0, 0.0, 7.0),
             use_counts: Some(PlannedUseCounts {
                 offered: 1,
                 opened: 0,
@@ -114,7 +115,7 @@ fn rich_candidates() -> Vec<PlannedCandidate> {
             arm: RecallArm::Note,
             id: "note-in-view".to_string(),
             relevance: RecallRelevance::Distance(0.30),
-            terms: terms(Some(6.0), 0.0, 0.0, 0.0, 0.0, 6.0),
+            terms: terms(Some(6.0), 0.0, 0.0, 0.0, 0.0, 0.0, 6.0),
             use_counts: None,
             cleared_bar: true,
             // Notes are never reordered by activation, so a note candidate
@@ -127,7 +128,7 @@ fn rich_candidates() -> Vec<PlannedCandidate> {
             arm: RecallArm::Note,
             id: "note-empty".to_string(),
             relevance: RecallRelevance::Distance(0.35),
-            terms: terms(Some(5.5), 0.0, 0.0, 0.0, 0.0, 5.5),
+            terms: terms(Some(5.5), 0.0, 0.0, 0.0, 0.0, 0.0, 5.5),
             use_counts: None,
             cleared_bar: true,
             rank: None,
@@ -138,7 +139,7 @@ fn rich_candidates() -> Vec<PlannedCandidate> {
             arm: RecallArm::Note,
             id: "note-external".to_string(),
             relevance: RecallRelevance::Distance(0.38),
-            terms: terms(Some(5.0), 0.0, 0.0, 0.0, 0.0, 5.0),
+            terms: terms(Some(5.0), 0.0, 0.0, 0.0, 0.0, 0.0, 5.0),
             use_counts: None,
             cleared_bar: true,
             rank: None,
@@ -149,7 +150,7 @@ fn rich_candidates() -> Vec<PlannedCandidate> {
             arm: RecallArm::Skill,
             id: "skill-unrenderable".to_string(),
             relevance: RecallRelevance::Distance(0.20),
-            terms: terms(Some(4.0), 0.0, 0.3, 0.0, 0.0, 4.3),
+            terms: terms(Some(4.0), 0.0, 0.3, 0.0, 0.0, 0.0, 4.3),
             use_counts: Some(PlannedUseCounts {
                 offered: 2,
                 opened: 2,
@@ -166,7 +167,7 @@ fn rich_candidates() -> Vec<PlannedCandidate> {
             arm: RecallArm::Skill,
             id: "skill-refused".to_string(),
             relevance: RecallRelevance::LexicalMatch,
-            terms: terms(None, 0.0, 0.0, 0.0, 0.0, 0.0),
+            terms: terms(None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
             use_counts: None,
             cleared_bar: false,
             rank: None,
@@ -191,6 +192,7 @@ fn rich_plan(request_id: &str, conversation_id: &str) -> ContextPlan {
                 model_mark: 2.5,
                 person_mark: 9.25,
             },
+            trivial_penalty: 1.4,
         },
         scorer_version: "1327-v1".to_string(),
         arms: ArmSummaries {

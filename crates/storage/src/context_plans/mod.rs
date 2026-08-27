@@ -302,6 +302,7 @@ fn weights_to_json(weights: &ActivationWeights) -> Value {
             "model_mark": weights.use_score.model_mark,
             "person_mark": weights.use_score.person_mark,
         },
+        "trivial_penalty": weights.trivial_penalty,
     })
 }
 
@@ -331,6 +332,14 @@ fn weights_from_json(stored: &Value) -> ActivationWeights {
                 .and_then(Value::as_f64)
                 .unwrap_or(defaults.use_score.person_mark),
         },
+        // A row written before #893 added this weight has no key for it, and
+        // that is not a value this build can recover - so it falls back to
+        // the scorer's own default, the same rule every field in this
+        // function follows.
+        trivial_penalty: stored
+            .get("trivial_penalty")
+            .and_then(Value::as_f64)
+            .unwrap_or(defaults.trivial_penalty),
     }
 }
 
@@ -433,6 +442,7 @@ fn candidate_to_json(candidate: &PlannedCandidate) -> Value {
         "rf": candidate.terms.reinforcement,
         "sit": candidate.terms.situation,
         "sal": candidate.terms.salience,
+        "dsp": candidate.terms.disposition,
         "a": candidate.terms.total,
         "use": candidate.use_counts.map(|u| {
             json!({ "off": u.offered, "op": u.opened, "mk": u.marked })
@@ -463,6 +473,13 @@ fn candidate_from_json(stored: &Value) -> Option<PlannedCandidate> {
         reinforcement: stored.get("rf")?.as_f64()?,
         situation: stored.get("sit")?.as_f64()?,
         salience: stored.get("sal")?.as_f64()?,
+        // A row written before #893 added this term has no "dsp" key. `0.0`
+        // is not a guess standing in for a missing value: it is the term's
+        // true historical value, because every candidate scored before the
+        // term existed was scored as if it contributed nothing - which is
+        // exactly what an absent disposition term means. `?` here would make
+        // every plan row already on disk unparseable.
+        disposition: stored.get("dsp").and_then(Value::as_f64).unwrap_or(0.0),
         total: stored.get("a")?.as_f64()?,
     };
     let use_counts = stored.get("use").and_then(|u| {
@@ -644,6 +661,7 @@ mod tests {
                 model_mark: 2.5,
                 person_mark: 9.25,
             },
+            trivial_penalty: 1.4,
         };
         let json = weights_to_json(&written);
         let read = weights_from_json(&json);
@@ -674,6 +692,7 @@ mod tests {
                 reinforcement: 1.5,
                 situation: 0.25,
                 salience: 0.0,
+                disposition: -0.9,
                 total: 1.75,
             },
             use_counts: None,
@@ -699,6 +718,7 @@ mod tests {
                 reinforcement: 0.0,
                 situation: 0.0,
                 salience: 0.0,
+                disposition: 0.0,
                 total: 9.0,
             },
             use_counts: None,
@@ -711,6 +731,85 @@ mod tests {
         assert!(
             candidate_from_json(&json).is_none(),
             "a candidate with no total activation must not silently read as 0.0"
+        );
+    }
+
+    /// Acceptance (#1342/#893): the disposition term - the sixth term #1337's
+    /// breakdown gained after the `trivial` penalty landed - survives a
+    /// write-then-read exactly, not merely as part of `total`. Without this,
+    /// a candidate deranked for being `trivial` would show an unexplained
+    /// drop in `total` on read-back and nothing saying why: the whole point
+    /// of persisting the plan is answering "why did retrieval rank this
+    /// where it did", and a lost term is a lost answer.
+    #[test]
+    fn the_disposition_term_round_trips_through_json() {
+        let written = PlannedCandidate {
+            arm: RecallArm::Entry,
+            id: "kb-trivial".to_string(),
+            relevance: RecallRelevance::Distance(0.6),
+            terms: ActivationTerms {
+                semantic: Some(4.0),
+                lexical: 0.0,
+                reinforcement: 0.0,
+                situation: 0.0,
+                salience: 0.0,
+                disposition: -1.4,
+                total: 2.6,
+            },
+            use_counts: None,
+            cleared_bar: true,
+            rank: Some(2),
+            offered: false,
+            drop_reason: None,
+        };
+        let json = candidate_to_json(&written);
+        let read = candidate_from_json(&json).expect("a well-formed candidate parses");
+        assert_eq!(
+            read.terms.disposition, -1.4,
+            "the disposition term must survive the round trip unchanged"
+        );
+        assert_eq!(read, written);
+    }
+
+    /// Acceptance (#1342/#893, backward compatibility): a plan row written
+    /// before the disposition term existed has no `"dsp"` key at all - not a
+    /// null, an absent key. It must still parse, and the term it never
+    /// recorded must read back as `0.0`: not a guess standing in for a
+    /// missing value, but the term's true historical value, because every
+    /// candidate scored before the term existed was scored as if it
+    /// contributed nothing. A `?` on this field, the same as the other
+    /// required terms use, would make every plan row already on disk
+    /// unparseable - this test is the one that catches a future edit that
+    /// tightens `disposition` back to required.
+    #[test]
+    fn a_candidate_from_before_the_disposition_term_existed_still_parses_as_zero() {
+        let mut json = candidate_to_json(&PlannedCandidate {
+            arm: RecallArm::Entry,
+            id: "kb-old-row".to_string(),
+            relevance: RecallRelevance::Distance(0.4),
+            terms: ActivationTerms {
+                semantic: Some(9.0),
+                lexical: 0.0,
+                reinforcement: 0.0,
+                situation: 0.0,
+                salience: 0.0,
+                disposition: 0.0,
+                total: 9.0,
+            },
+            use_counts: None,
+            cleared_bar: true,
+            rank: Some(0),
+            offered: true,
+            drop_reason: None,
+        });
+        json.as_object_mut().expect("object").remove("dsp");
+
+        let read = candidate_from_json(&json)
+            .expect("a row written before the disposition term existed must still parse");
+
+        assert_eq!(
+            read.terms.disposition, 0.0,
+            "a candidate with no stored disposition term must read back as 0.0, not fail"
         );
     }
 
