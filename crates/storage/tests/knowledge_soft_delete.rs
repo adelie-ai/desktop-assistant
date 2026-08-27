@@ -70,7 +70,9 @@ async fn set_embedding(pool: &PgPool, id: &str, chunks: Vec<Vec<f32>>) {
     .expect("stamp embedding");
 }
 
-/// Soft-delete a row the way consolidation does.
+/// Soft-delete a row directly, as a fixture setup step. Not a claim about
+/// which production path produces a tombstone this way - consolidation
+/// itself no longer soft-deletes anything (#893).
 async fn soft_delete(pool: &PgPool, id: &str) {
     let res = sqlx::query("UPDATE knowledge_base SET deleted_at = NOW() WHERE id = $1")
         .bind(id)
@@ -366,8 +368,12 @@ async fn write_to_a_retired_entry_is_refused_and_changes_nothing() {
     // never revives, so the new content lands in a row no read can reach and
     // the reap removes it on its original clock. The write reported success.
     //
-    // Reachable without a race: consolidation retires an entry overnight and
-    // the assistant still holds that id the next day.
+    // Reachable without a race: a person deletes an entry (or a tombstone
+    // reap runs) overnight and the assistant still holds that id the next
+    // day. Consolidation itself no longer produces a tombstone at all (#893)
+    // - this scenario needs some other source of one, which is why the
+    // fixture calls `soft_delete` directly rather than driving it through a
+    // consolidation run.
     let Some(fx) = fixture().await else {
         eprintln!("skip: TEST_DATABASE_URL not set");
         return;

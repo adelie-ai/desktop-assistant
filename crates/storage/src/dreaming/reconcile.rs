@@ -63,7 +63,7 @@ pub enum ProposedOp {
 /// Synthesized result of merging a cluster, produced by an LLM synthesis call.
 ///
 /// Carries no id of its own: the row `merge_new` writes gets a deterministic
-/// id derived from the sorted member ids (see [`merge_id`]), computed at apply
+/// id derived from the sorted member ids (see `merge_id`), computed at apply
 /// time rather than decided by the caller.
 #[derive(Debug, Clone)]
 pub struct SynthesizedMerge {

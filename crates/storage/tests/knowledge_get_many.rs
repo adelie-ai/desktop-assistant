@@ -48,7 +48,9 @@ async fn write_as(store: &PgKnowledgeBaseStore, user: &str, id: &str, content: &
     .await;
 }
 
-/// Retire a row the way consolidation does.
+/// Retire a row directly, as a fixture setup step. Not a claim about which
+/// production path produces a tombstone this way - consolidation itself no
+/// longer soft-deletes anything (#893).
 async fn soft_delete(pool: &PgPool, id: &str) {
     let res = sqlx::query("UPDATE knowledge_base SET deleted_at = NOW() WHERE id = $1")
         .bind(id)

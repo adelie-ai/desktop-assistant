@@ -17,7 +17,7 @@ All live in `crates/storage/src/dreaming/` + `crates/storage/src/embedding_backf
 | **Extraction** | `run_dreaming_scan` | Scans conversations past their watermark, asks an LLM to extract durable facts, writes them (+ archival of long-quiet conversations). A finding that is a **method** goes to the skill catalog as an unapproved candidate instead - see "A method is not a fact". | frequent (hourly) |
 | **Summary backfill** | `run_dreaming_scan` | Writes the one-line `summary` for entries that have none, and rewrites one whose body changed after it was written. Batched, capped per cycle, and never touches `content`. | frequent (hourly) |
 | **Mis-filed procedure sweep** | `run_dreaming_scan` | Reads knowledge entries for routines written as facts and **proposes** each as an unapproved skill naming the entry it came from. Never rewrites the entry. Bounded per cycle, and a ledger stops it re-reading an entry until its text changes - see "A method is not a fact". | frequent (hourly) |
-| **Consolidation** | `run_consolidation_scan` | Loads a user's whole active KB and recomputes it holistically (prune / merge / tighten) with a stronger model, applied transactionally with soft-delete and bounded by the rules below. | slow (daily) |
+| **Consolidation** | `run_consolidation_scan` | Loads a user's whole active KB and recomputes it holistically (disposition / merge / tighten) with a stronger model, applied transactionally and bounded by the rules below. Nothing it does sets `deleted_at`: an entry it judges wrong, stale or redundant is dispositioned - marked with what it is and why - and stays live (#893). | slow (daily) |
 | **Embedding recompute** | `backfill_knowledge_embeddings` | Re-embeds rows. The periodic backfill only touches NULL/stale/model-mismatched rows; the **force** path (`invalidate_all_knowledge_embeddings` → backfill) re-embeds everything. | periodic + on-demand |
 | **Trash sweep** | `sweep_expired_trash` | Frees soft-deleted entries past their retention window. No LLM, no embeddings — a single indexed DELETE per user. | frequent (hourly) |
 
@@ -279,39 +279,56 @@ line says which terms the run was blind to.
 
 The model sees the whole active store and returns a plan. The plan is not applied
 verbatim, because the judgment behind it is formed from prose alone with no
-signal about whether an entry was ever retrieved or cited. Four rules bound it
-(`crates/storage/src/dreaming/consolidation.rs`):
+signal about whether an entry was ever retrieved or cited. Consolidation has no
+delete verb (#893): the op schema is `keep` / `edit` / `set_scope` / `merge_new` /
+`disposition`, and every one of those either leaves a row alone, edits its
+prose, or marks it with a disposition (`active` | `refuted` | `superseded` |
+`redundant` | `obsolete` | `trivial`) while it stays live. Four rules bound the
+plan (`crates/storage/src/dreaming/consolidation.rs`,
+`crates/storage/src/dreaming/reconcile.rs`):
 
-1. **A deliberately promoted entry is never pruned.** Rows written during a live
-   turn carry `source = 'explicit'` - the user asked, or Adele decided in the
-   moment that a fact was worth keeping. Consolidation may rewrite or merge such
-   an entry, but a proposed delete is refused and counted in the run's stats. The
-   provenance follows the content: an edit keeps it, and a merge stamps the
-   surviving canonical row `explicit` if any member was, so the protection cannot
-   be laundered away over successive nights.
+1. **A deliberately promoted entry may not be dispositioned `trivial` or
+   `redundant`.** Rows written during a live turn carry `source = 'explicit'` -
+   the user asked, or Adele decided in the moment that a fact was worth keeping.
+   Consolidation may still edit, merge, or disposition such an entry `refuted`,
+   `superseded`, or `obsolete` - a user-entered fact can still be corrected by
+   the user's own later statement - but a proposed `trivial` or `redundant` is
+   refused and counted in the run's stats. The provenance follows the content: an
+   edit keeps it, and a merge stamps the new row `explicit` if any member was, so
+   the protection cannot be laundered away over successive nights.
 2. **Settled prose is left alone.** `review_generation` counts how many times
    consolidation has rewritten an entry. At `MAX_REVIEW_GENERATION` (2) the entry
-   is settled: further edits and merges touching it are refused, because
-   consolidation re-reads its own output every pass and an uncapped entry becomes
-   a paraphrase of a paraphrase, drifting from what was observed toward what the
-   model believes. This settles individual entries, not the store - extraction
-   keeps adding generation-0 rows, scope can still be attached, and a settled
-   entry stays prunable, so consolidation's own output never becomes permanent.
-3. **Outright prunes are capped per run** at `[backend_tasks]
+   is settled: further edits touching it are refused, because consolidation
+   re-reads its own output every pass and an uncapped entry becomes a paraphrase
+   of a paraphrase, drifting from what was observed toward what the model
+   believes. This settles an entry's own prose, not the store - extraction keeps
+   adding generation-0 rows, scope can still be attached, and a settled entry may
+   still be merged (into a *new* row, so its own prose is never rewritten) or
+   dispositioned, so consolidation's own output never becomes permanent.
+3. **The disposition budget is capped per run** at `[backend_tasks]
    knowledge_prune_fraction` (default 0.1) of the active set, floor 1, with the
-   excess deferred to a later run and a warning logged. Merges do not count
-   against it: their content survives in the canonical row. The cap is a
-   blast-radius bound on one run's unreviewed opinion. A fraction of `0` is the
-   documented "merge, but do not destroy" setting: the run applies its merges
-   and edits and retires nothing, and the floor of 1 does not apply.
+   excess deferred to a later run and a warning logged. It is computed *after*
+   clustering: an id a merge already absorbs does not spend it. Merges do not
+   count against it either way - their content survives, unified, in a row of
+   its own. The cap is a blast-radius bound on one run's unreviewed opinion, not
+   a data-safety bound - a disposition is reversible. A fraction of `0` is the
+   documented "merge, but do not disposition" setting: the run applies its
+   merges and edits and dispositions nothing, and the floor of 1 does not apply.
 4. **Rewrites are capped per run** at `[backend_tasks]
    knowledge_rewrite_fraction` (default 0.25) of the active set, on the same
-   floor-and-defer rule. An edit and a merge both overwrite `content` and no
-   prior version is kept, so the prune cap says nothing about how much text one
+   floor-and-defer rule. An edit and a merge both write `content` with no prior
+   version kept, so the disposition cap says nothing about how much text one
    answer can restate. A merge counts once whatever its cluster size, because
-   only the canonical row's content is replaced - every other member keeps its
-   own text on its tombstone. Merges are taken before edits, since merging
-   duplicates is the work consolidation exists to do.
+   only the new row's content is written - every member's own row is untouched.
+   Merges are taken before edits, since merging duplicates is the work
+   consolidation exists to do.
+
+A `refuted`, `superseded`, or `redundant` disposition names the entry it
+contradicts or duplicates (`superseded_by`). When both entries carry a scope and
+the scopes share nothing, the disposition is refused - two facts about different
+scopes cannot contradict each other. This guard has no application-level
+pre-filter; it is enforced only in the apply path, because it needs a fresh read
+of both rows' metadata.
 
 ### Reading an answer that is not quite right
 
@@ -394,8 +411,16 @@ Two shapes stay unrecoverable, and each keeps its own verdict:
 
 ## The trash: soft delete, retention, reaping
 
-Consolidation retires an entry by stamping `deleted_at`, not by deleting the
-row. A retired entry is excluded from every read path — search, list, get, the
+Consolidation no longer stamps `deleted_at` at all (#893): an entry it judges
+wrong, stale or redundant is dispositioned - marked with what it is and why -
+and stays live, findable, and excluded from re-judging rather than retired. The
+rest of this section describes the trash a *person's* delete still produces,
+which the reap below still frees on the same clock; the `deleted_kind` /
+`deleted_reason` column names below were renamed to `disposition` /
+`disposition_reason` by migration 056 and this section has not been updated for
+that rename yet.
+
+A retired entry is excluded from every read path — search, list, get, the
 embedding pipeline — so the tombstone behaves as if it were gone while staying
 recoverable and auditable.
 

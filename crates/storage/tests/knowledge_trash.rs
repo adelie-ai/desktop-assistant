@@ -61,7 +61,10 @@ async fn write_entry(store: &PgKnowledgeBaseStore, user: &str, id: &str, content
     .await;
 }
 
-/// Soft-delete a row the way consolidation does, `age_days` in the past.
+/// Soft-delete a row directly, `age_days` in the past, as a fixture setup
+/// step for the reap. Not a claim about which production path produces a
+/// tombstone this way - consolidation itself no longer soft-deletes
+/// anything (#893).
 async fn soft_delete_aged(pool: &PgPool, id: &str, age_days: i32) {
     let res = sqlx::query(
         "UPDATE knowledge_base \

@@ -112,14 +112,31 @@ async fn kb_content(pool: &PgPool, id: &str) -> Option<String> {
         .expect("read content")
 }
 
-async fn kb_count_active(pool: &PgPool, user_id: &str) -> i64 {
+/// How many of `user_id`'s rows carry `disposition`. Consolidation never sets
+/// `deleted_at` any more, so this is what "how many did the prune budget
+/// retire" means now: a dispositioned row stays live.
+async fn kb_count_with_disposition(pool: &PgPool, user_id: &str, disposition: &str) -> i64 {
     sqlx::query_scalar(
-        "SELECT COUNT(*) FROM knowledge_base WHERE user_id = $1 AND deleted_at IS NULL",
+        "SELECT COUNT(*) FROM knowledge_base WHERE user_id = $1 AND disposition = $2",
     )
     .bind(user_id)
+    .bind(disposition)
     .fetch_one(pool)
     .await
-    .expect("count active")
+    .expect("count rows by disposition")
+}
+
+/// The id of the one row carrying exactly `content`, for a caller that does
+/// not know a `merge_new` row's deterministic id in advance.
+async fn kb_id_with_content(pool: &PgPool, user_id: &str, content: &str) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT id FROM knowledge_base WHERE user_id = $1 AND content = $2 AND deleted_at IS NULL",
+    )
+    .bind(user_id)
+    .bind(content)
+    .fetch_optional(pool)
+    .await
+    .expect("look up kb row by content")
 }
 
 /// Collects everything the code under test writes to `tracing`, so a test can
@@ -180,14 +197,18 @@ fn run_capturing_logs<F: std::future::Future>(
     (out, captured.text())
 }
 
-/// A delete plan naming every id.
-fn delete_plan(ids: &[String]) -> String {
-    let list = ids
+/// A disposition plan naming every id `trivial`. `disposition` names exactly
+/// one entry per op, unlike the old `delete`'s array of ids, so this builds
+/// one op per id.
+fn disposition_plan(ids: &[String]) -> String {
+    let ops = ids
         .iter()
-        .map(|id| format!("\"{id}\""))
+        .map(|id| {
+            format!(r#"{{"op":"disposition","id":"{id}","as":"trivial","reason":"trivial"}}"#)
+        })
         .collect::<Vec<_>>()
         .join(",");
-    format!(r#"{{"operations":[{{"op":"delete","ids":[{list}],"reason":"trivial"}}]}}"#)
+    format!(r#"{{"operations":[{ops}]}}"#)
 }
 
 /// An edit plan rewriting every id.
@@ -217,21 +238,30 @@ async fn prune_fraction_is_read_from_configuration() {
     }
 
     // Half, not the shipped tenth. A run that still read the old constant
-    // would prune one row.
+    // would disposition one row.
     let policy = KnowledgeDeletePolicy {
         prune_fraction: 0.5,
         ..KnowledgeDeletePolicy::default()
     };
-    let llm = llm_returning(&delete_plan(&ids));
+    let llm = llm_returning(&disposition_plan(&ids));
     let stats = run_consolidation_scan(pool, &llm, policy, &CancellationToken::new(), None)
         .await
         .expect("consolidation scan succeeds");
 
     assert_eq!(
         stats.soft_deleted, 5,
-        "the prune cap must come from the configured fraction, not a constant"
+        "the disposition cap must come from the configured fraction, not a constant"
     );
-    assert_eq!(kb_count_active(pool, ALICE).await, 5);
+    assert_eq!(
+        kb_count_with_disposition(pool, ALICE, "trivial").await,
+        5,
+        "exactly the capped share was dispositioned"
+    );
+    assert_eq!(
+        kb_count_with_disposition(pool, ALICE, "active").await,
+        5,
+        "the rest stays active, not deleted - disposition never destroys a row"
+    );
 
     fx.cleanup().await;
 }
@@ -249,12 +279,12 @@ async fn zero_prune_fraction_merges_and_edits_but_deletes_nothing() {
     seed_kb(pool, ALICE, "zero-prune", "trivial").await;
 
     let plan = r#"{"operations":[
-        {"op":"merge","ids":["zero-merge-a","zero-merge-b"],"content":"UNIFIED","scope":null},
+        {"op":"merge_new","ids":["zero-merge-a","zero-merge-b"],"content":"UNIFIED","scope":null},
         {"op":"edit","id":"zero-edit","content":"TIGHTENED"},
-        {"op":"delete","ids":["zero-prune"],"reason":"trivial"}
+        {"op":"disposition","id":"zero-prune","as":"trivial","reason":"trivial"}
     ]}"#;
-    // Only the prune share is under test here, so the rewrite share is opened
-    // up to keep its own cap out of the result.
+    // Only the prune (now disposition) share is under test here, so the
+    // rewrite share is opened up to keep its own cap out of the result.
     let policy = KnowledgeDeletePolicy {
         prune_fraction: 0.0,
         rewrite_fraction: 1.0,
@@ -267,17 +297,25 @@ async fn zero_prune_fraction_merges_and_edits_but_deletes_nothing() {
 
     assert_eq!(stats.merged_clusters, 1, "merges still apply");
     assert_eq!(stats.updated, 1, "edits still apply");
-    assert_eq!(
-        kb_content(pool, "zero-merge-a").await.as_deref(),
-        Some("UNIFIED")
-    );
+    // The merge writes a NEW row for the unified content; neither original
+    // member is rewritten in place any more.
+    let merged_id = kb_id_with_content(pool, ALICE, "UNIFIED")
+        .await
+        .expect("the merge wrote a new row for the unified content");
+    assert_ne!(merged_id, "zero-merge-a");
+    assert_ne!(merged_id, "zero-merge-b");
     assert_eq!(
         kb_content(pool, "zero-edit").await.as_deref(),
         Some("TIGHTENED")
     );
-    assert!(
-        !kb_is_deleted(pool, "zero-prune").await,
-        "a zero prune fraction must retire nothing on its own"
+    assert_eq!(
+        kb_count_with_disposition(pool, ALICE, "trivial").await,
+        0,
+        "a zero disposition fraction must retire nothing on its own"
+    );
+    assert_eq!(
+        stats.prunes_over_cap, 1,
+        "the one proposed disposition was deferred, not silently dropped"
     );
 
     fx.cleanup().await;
@@ -471,7 +509,7 @@ async fn the_consolidation_reap_is_refused_while_the_safety_flag_is_set() {
     seed_kb(pool, ALICE, "consol-b", "beta").await;
 
     let llm = llm_returning(
-        r#"{"operations":[{"op":"merge","ids":["consol-a","consol-b"],"content":"UNIFIED","scope":null}]}"#,
+        r#"{"operations":[{"op":"merge_new","ids":["consol-a","consol-b"],"content":"UNIFIED","scope":null}]}"#,
     );
     run_consolidation_scan(
         pool,
@@ -483,10 +521,22 @@ async fn the_consolidation_reap_is_refused_while_the_safety_flag_is_set() {
     .await
     .expect("consolidation scan succeeds");
 
-    assert_eq!(
-        kb_content(pool, "consol-a").await.as_deref(),
-        Some("UNIFIED"),
+    // The merge still writes its new row (and dispositions its members) even
+    // though the reap in the same transaction is refused - only the person-only
+    // safety flag on the reap is under test here.
+    assert!(
+        kb_id_with_content(pool, ALICE, "UNIFIED").await.is_some(),
         "the merge still applies; only the reap is refused"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT disposition FROM knowledge_base WHERE id = 'consol-a'"
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read consol-a's disposition"),
+        "redundant",
+        "the merge member is dispositioned, not left untouched"
     );
     assert!(
         kb_exists(pool, "consol-reap").await,
@@ -556,8 +606,16 @@ async fn a_merge_cluster_costs_one_rewrite_whatever_its_size() {
 
     // cap = ceil(8 * 0.25) = 2. Merging is what consolidation is for, so the
     // cluster is taken first and one edit fits behind it.
+    //
+    // The invariant under test survives `merge_new` unchanged: the rewrite
+    // budget still charges a cluster ONE slot regardless of its member count
+    // (`take_within_rewrite_cap` counts merge ops, not members - untouched by
+    // this unit). What changed is only how a merge is applied - a new row for
+    // the synthesized content, every member dispositioned `redundant` rather
+    // than one member rewritten in place - so the content assertion below
+    // points at the new row instead of at `cl-a`.
     let plan = r#"{"operations":[
-        {"op":"merge","ids":["cl-a","cl-b","cl-c","cl-d"],"content":"UNIFIED","scope":null},
+        {"op":"merge_new","ids":["cl-a","cl-b","cl-c","cl-d"],"content":"UNIFIED","scope":null},
         {"op":"edit","id":"ed-e","content":"REWRITTEN e"},
         {"op":"edit","id":"ed-f","content":"REWRITTEN f"},
         {"op":"edit","id":"ed-g","content":"REWRITTEN g"},
@@ -573,12 +631,24 @@ async fn a_merge_cluster_costs_one_rewrite_whatever_its_size() {
         .expect("consolidation scan succeeds");
 
     assert_eq!(stats.merged_clusters, 1, "the four-member cluster applies");
-    assert_eq!(stats.updated, 1, "the cluster leaves room for one edit");
     assert_eq!(
-        kb_content(pool, "cl-a").await.as_deref(),
-        Some("UNIFIED"),
-        "a cluster of four costs one rewrite, not four"
+        stats.updated, 1,
+        "the cluster leaves room for exactly one edit - it cost one rewrite \
+         slot, not four"
     );
+    let merged_id = kb_id_with_content(pool, ALICE, "UNIFIED").await;
+    assert!(
+        merged_id.is_some(),
+        "a cluster of four still costs one rewrite, not four - the budget still \
+         let it through alongside one edit"
+    );
+    for member in ["cl-a", "cl-b", "cl-c", "cl-d"] {
+        assert_eq!(
+            kb_content(pool, member).await.as_deref(),
+            Some("cluster member"),
+            "{member}'s own content is never rewritten under merge_new"
+        );
+    }
 
     fx.cleanup().await;
 }
