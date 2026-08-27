@@ -28,6 +28,7 @@ mod parent_wake;
 mod provider_reindex;
 mod purposes;
 mod recall;
+mod recall_replay;
 mod registry;
 mod replay_eval;
 mod routing_llm;
@@ -824,6 +825,15 @@ async fn run_inline_server_login(
         }
     }
     Ok(())
+}
+
+/// Read `--flag value` out of the process's own argument list, for the
+/// `--recall-case-add` operator command, which mixes positional arguments
+/// (user id, expected entry id) with named ones (`--query`, `--note`,
+/// `--from-turn`, `--baseline`).
+fn recall_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    let pos = args.iter().position(|a| a == flag)?;
+    args.get(pos + 1).map(String::as_str)
 }
 
 #[tokio::main]
@@ -2975,6 +2985,105 @@ async fn main() -> Result<()> {
             let model = args.get(pos + 2).filter(|a| !a.starts_with("--")).cloned();
             let report =
                 replay_eval::run(&conversation_store, Arc::clone(&llm), user.clone(), model)
+                    .await?;
+            println!("{report}");
+            return Ok(());
+        }
+    }
+
+    // Recall snapshot, labelled set, and replay commands (#1328): freeze the
+    // knowledge store into a snapshot, seed known-correct-answer cases, and
+    // replay them against a frozen substrate so two measurements are
+    // comparable. Each prints a report and exits without starting the
+    // daemon, on the same operator-command precedent as `--replay-eval`
+    // above. Placed here for the same reason: this is the first point where
+    // both the database pool and the resolved embedding client exist.
+    {
+        let args: Vec<String> = std::env::args().collect();
+
+        if let Some(pos) = args.iter().position(|a| a == "--recall-snapshot") {
+            let user = args.get(pos + 1).ok_or_else(|| {
+                anyhow::anyhow!("--recall-snapshot requires the user id to snapshot")
+            })?;
+            let name = args
+                .get(pos + 2)
+                .filter(|a| !a.starts_with("--"))
+                .cloned()
+                .unwrap_or_else(|| {
+                    format!("snapshot-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"))
+                });
+            let pool = pg_pool.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("--recall-snapshot requires a configured database")
+            })?;
+            let report = recall_replay::run_snapshot(pool, user, &name).await?;
+            println!("{report}");
+            return Ok(());
+        }
+
+        if let Some(pos) = args.iter().position(|a| a == "--recall-snapshot-drop") {
+            let user = args.get(pos + 1).ok_or_else(|| {
+                anyhow::anyhow!("--recall-snapshot-drop requires the user id and the snapshot id")
+            })?;
+            let snapshot_id = args.get(pos + 2).ok_or_else(|| {
+                anyhow::anyhow!("--recall-snapshot-drop requires the snapshot id")
+            })?;
+            let pool = pg_pool.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("--recall-snapshot-drop requires a configured database")
+            })?;
+            let report = recall_replay::run_snapshot_drop(pool, user, snapshot_id).await?;
+            println!("{report}");
+            return Ok(());
+        }
+
+        if let Some(pos) = args.iter().position(|a| a == "--recall-case-add") {
+            let user = args.get(pos + 1).ok_or_else(|| {
+                anyhow::anyhow!("--recall-case-add requires the user id and the expected entry id")
+            })?;
+            let expected_entry_id = args.get(pos + 2).ok_or_else(|| {
+                anyhow::anyhow!("--recall-case-add requires the expected entry id")
+            })?;
+            let baseline_snapshot_id = recall_flag_value(&args, "--baseline");
+            let source = if let Some(request_id) = recall_flag_value(&args, "--from-turn") {
+                recall_replay::CaseSource::FromTurn { request_id }
+            } else {
+                let query_text = recall_flag_value(&args, "--query").ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--recall-case-add needs either --from-turn <request-id> or \
+                         --query \"...\" [--note \"...\"]"
+                    )
+                })?;
+                recall_replay::CaseSource::Query {
+                    query_text,
+                    note: recall_flag_value(&args, "--note"),
+                }
+            };
+            let pool = pg_pool.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("--recall-case-add requires a configured database")
+            })?;
+            let report = recall_replay::run_case_add(
+                pool,
+                user,
+                expected_entry_id,
+                source,
+                baseline_snapshot_id,
+            )
+            .await?;
+            println!("{report}");
+            return Ok(());
+        }
+
+        if let Some(pos) = args.iter().position(|a| a == "--recall-replay") {
+            let user = args.get(pos + 1).ok_or_else(|| {
+                anyhow::anyhow!("--recall-replay requires the user id and the snapshot id")
+            })?;
+            let snapshot_id = args
+                .get(pos + 2)
+                .ok_or_else(|| anyhow::anyhow!("--recall-replay requires the snapshot id"))?;
+            let pool = pg_pool
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("--recall-replay requires a configured database"))?;
+            let report =
+                recall_replay::run_replay(pool, user, snapshot_id, embedding_client.as_ref())
                     .await?;
             println!("{report}");
             return Ok(());

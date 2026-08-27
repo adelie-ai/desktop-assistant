@@ -260,6 +260,11 @@ const MIGRATIONS: &[Migration] = &[
     // lookup considered, each candidate's activation score broken down by
     // term, and which candidates were offered and later opened.
     migration!("059_context_plans.sql"),
+    // #1328: freeze a corpus into a snapshot, and hold a labelled set of
+    // queries with known-correct answers, so a replay can compare two
+    // rankings of the same substrate instead of two rankings of a corpus
+    // that moved underneath them.
+    migration!("060_recall_snapshots.sql"),
 ];
 
 /// Second half of the advisory-lock key: the schema the migrations write to.

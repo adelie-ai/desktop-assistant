@@ -20,6 +20,7 @@ pub mod knowledge_use;
 pub mod migrate_json;
 pub mod negative_memory;
 pub mod pool;
+pub mod recall_replay;
 pub mod scan_bound;
 pub mod scratchpad;
 pub mod skill_index;
@@ -60,6 +61,12 @@ pub use migrate_json::{
 };
 pub use negative_memory::PgNegativeMemoryStore;
 pub use pool::{create_pool, run_migrations};
+pub use recall_replay::{
+    CaseInput, CaseOutcome, CaseRecord, CaseReplayResult, RankedSnapshotEntry, ReplayReport,
+    SMALL_SET_CASE_THRESHOLD, SMALL_SET_NOTICE, SnapshotManifest, add_case, cache_case_embedding,
+    case_from_turn, drop_snapshot, get_cached_case_embedding, get_snapshot, list_active_cases,
+    ranked_snapshot_scan, run_replay, set_case_baseline, take_snapshot,
+};
 pub use scan_bound::begin_bounded;
 pub use scratchpad::{NearestNotes, PgScratchpadStore};
 pub use skill_index::{
