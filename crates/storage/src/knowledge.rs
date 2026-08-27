@@ -1,8 +1,8 @@
 use desktop_assistant_core::CoreError;
-use desktop_assistant_core::domain::KnowledgeEntry;
 use desktop_assistant_core::domain::activation::LexicalMatch;
 use desktop_assistant_core::domain::knowledge_use::KnowledgeUseRecord;
 use desktop_assistant_core::domain::situation::{Situation, SituationRecord};
+use desktop_assistant_core::domain::{Disposition, KnowledgeEntry};
 use desktop_assistant_core::ports::auth::current_user_id;
 use desktop_assistant_core::ports::knowledge::{
     AVAILABLE_TAGS_LIMIT, KNOWLEDGE_TAG_CENSUS_SAMPLE, KnowledgeBaseStore, KnowledgeListPage,
@@ -138,7 +138,7 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
                 WHERE knowledge_base.user_id = $2 \
                   AND knowledge_base.deleted_at IS NULL \
              RETURNING id, content, tags, metadata, created_at, updated_at, \
-                       source, summary",
+                       source, summary, disposition",
         )
         .bind(&entry.id)
         .bind(user_id.as_str())
@@ -246,7 +246,7 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
         let limit_i64 = limit as i64;
         let offset_i64 = offset as i64;
         let rows: Vec<KbRow> = sqlx::query_as(
-            "SELECT id, content, tags, metadata, created_at, updated_at, source, summary
+            "SELECT id, content, tags, metadata, created_at, updated_at, source, summary, disposition
              FROM knowledge_base
              WHERE user_id = $4
                AND deleted_at IS NULL
@@ -283,7 +283,7 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
     async fn get(&self, id: &str) -> Result<Option<KnowledgeEntry>, CoreError> {
         let user_id = current_user_id();
         let row: Option<KbRow> = sqlx::query_as(
-            "SELECT id, content, tags, metadata, created_at, updated_at, source, summary
+            "SELECT id, content, tags, metadata, created_at, updated_at, source, summary, disposition
              FROM knowledge_base \
              WHERE user_id = $1 AND id = $2 AND deleted_at IS NULL",
         )
@@ -632,7 +632,7 @@ impl PgKnowledgeBaseStore {
         let result_limit = limit as i64;
         let rows: Vec<KbRow> = sqlx::query_as(
             "WITH q AS (SELECT plainto_tsquery('english', $1) AS query)
-             SELECT id, content, tags, metadata, created_at, updated_at, source, summary
+             SELECT id, content, tags, metadata, created_at, updated_at, source, summary, disposition
              FROM knowledge_base
              WHERE user_id = $4
                AND deleted_at IS NULL
@@ -679,7 +679,7 @@ impl PgKnowledgeBaseStore {
         }
         let user_id = current_user_id();
         let rows: Vec<KbRow> = sqlx::query_as(
-            "SELECT id, content, tags, metadata, created_at, updated_at, source, summary \
+            "SELECT id, content, tags, metadata, created_at, updated_at, source, summary, disposition \
              FROM knowledge_base \
              WHERE user_id = $1 AND id = ANY($2) AND deleted_at IS NULL",
         )
@@ -824,7 +824,7 @@ impl PgKnowledgeBaseStore {
                  SELECT to_tsquery('english', string_agg(quote_literal(lexeme), ' | ')) AS query
                  FROM unnest(to_tsvector('english', $1))
              )
-             SELECT id, content, tags, metadata, created_at, updated_at, source, summary
+             SELECT id, content, tags, metadata, created_at, updated_at, source, summary, disposition
              FROM knowledge_base, q
              WHERE user_id = $3
                AND deleted_at IS NULL
@@ -889,7 +889,7 @@ impl PgKnowledgeBaseStore {
         // operator, so the SQL is never assembled from runtime values.
         let sql = match q.order.0 {
             ListOrder::NewestFirst => {
-                "SELECT id, content, tags, metadata, created_at, updated_at, source, summary
+                "SELECT id, content, tags, metadata, created_at, updated_at, source, summary, disposition
                  FROM knowledge_base
                  WHERE user_id = $1
                    AND deleted_at IS NULL
@@ -902,7 +902,7 @@ impl PgKnowledgeBaseStore {
                  LIMIT $7"
             }
             ListOrder::OldestFirst => {
-                "SELECT id, content, tags, metadata, created_at, updated_at, source, summary
+                "SELECT id, content, tags, metadata, created_at, updated_at, source, summary, disposition
                  FROM knowledge_base
                  WHERE user_id = $1
                    AND deleted_at IS NULL
@@ -1035,7 +1035,7 @@ const NEAREST_BY_EMBEDDING_SQL: &str = "\
          FROM d CROSS JOIN m
          GROUP BY m.median, m.rows_read
      )
-     SELECT kb.id, kb.content, kb.tags, kb.created_at, kb.updated_at, kb.source, kb.summary,
+     SELECT kb.id, kb.content, kb.tags, kb.created_at, kb.updated_at, kb.source, kb.summary, kb.disposition,
             d.distance, s.median, s.rows_read, s.deviation
      FROM d
      JOIN knowledge_base kb ON kb.id = d.id AND kb.user_id = $2
@@ -1071,6 +1071,7 @@ struct KbNearestRow {
     updated_at: chrono::DateTime<chrono::Utc>,
     source: Option<String>,
     summary: Option<String>,
+    disposition: String,
     distance: f64,
     median: Option<f64>,
     rows_read: i64,
@@ -1087,6 +1088,7 @@ impl KbNearestRow {
             created_at: self.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
             updated_at: self.updated_at.format("%Y-%m-%d %H:%M:%S").to_string(),
             source: self.source,
+            disposition: parse_disposition(&self.disposition),
             summary: self.summary,
         }
     }
@@ -1112,6 +1114,7 @@ struct KbRow {
     updated_at: chrono::DateTime<chrono::Utc>,
     source: Option<String>,
     summary: Option<String>,
+    disposition: String,
 }
 
 impl KbRow {
@@ -1124,6 +1127,7 @@ impl KbRow {
             created_at: self.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
             updated_at: self.updated_at.format("%Y-%m-%d %H:%M:%S").to_string(),
             source: self.source,
+            disposition: parse_disposition(&self.disposition),
             summary: self.summary,
         }
     }
@@ -1209,11 +1213,29 @@ impl KbSearchRow {
             created_at: self.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
             updated_at: self.updated_at.format("%Y-%m-%d %H:%M:%S").to_string(),
             source: self.source,
+            // `HYBRID_SEARCH_SQL` does not select disposition yet: every row it
+            // can reach is already filtered to `deleted_at IS NULL`, and
+            // nothing before this unit ever sets a live row's disposition away
+            // from the default. Reading it for real is retrieval's job, not
+            // this row mapping's.
+            disposition: Disposition::Active,
             // Search does select the summary: it is what a caller reads to
             // decide whether a hit is worth pulling the body for.
             summary: self.summary,
         }
     }
+}
+
+/// A row's stored disposition, or [`Disposition::Active`] for a spelling no
+/// variant claims.
+///
+/// The `knowledge_base_disposition_chk` CHECK constraint (migration 056)
+/// means a row this store reads can never actually carry an unrecognized
+/// spelling, so the fallback is not reachable in practice; it exists so a
+/// read path degrades to the safe default rather than panicking if it ever
+/// is.
+fn parse_disposition(value: &str) -> Disposition {
+    Disposition::parse(value).unwrap_or(Disposition::Active)
 }
 
 /// Fold a tag-census result into what the search page should report.

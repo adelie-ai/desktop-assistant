@@ -248,6 +248,10 @@ const MIGRATIONS: &[Migration] = &[
     // #1252: the full text of every turn - the request as sent, the reply, the
     // tool calls and their results. One row per turn, one per round inside it.
     migration!("055_turn_records.sql"),
+    // #893: widen delete provenance into a disposition vocabulary, decoupled
+    // from `deleted_at`, so consolidation can mark an entry wrong, stale or
+    // redundant without erasing it.
+    migration!("056_kb_disposition.sql"),
 ];
 
 /// Second half of the advisory-lock key: the schema the migrations write to.
