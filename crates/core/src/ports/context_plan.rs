@@ -13,7 +13,7 @@
 //! ranking the corpus again, and hoping the rebuild used the same weights the
 //! turn did.
 //!
-//! This type is what [`crate::recall::render_recall`] builds instead, from
+//! This type is what `render_recall` builds instead, from
 //! the same ranking pass that renders the block - see
 //! [`crate::ports::recall::rank_by_activation_traced`]. The score a reader
 //! sees here is the score the turn ranked on, because it is the same
@@ -190,7 +190,7 @@ pub struct ArmSummary {
     /// How many rows this arm's scan actually returned.
     pub rows_returned: usize,
     /// Whether the scan filled up to [`Self::scan_limit`] with rows that all
-    /// cleared the bar - the same hedge [`crate::recall::render_recall`]
+    /// cleared the bar - the same hedge `render_recall`
     /// reports in its own "and N more" line, so `considered_count` on a
     /// capped turn is a lower bound rather than an exact count.
     pub capped: bool,

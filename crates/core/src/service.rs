@@ -1040,7 +1040,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
     ///
     /// Additive: without it the `[Recall]` lookup ranks and renders exactly as
     /// before, and the plan it built in memory is dropped rather than kept. A
-    /// write that fails never fails the turn - see [`Self::persist_context_plan`].
+    /// write that fails never fails the turn - see `persist_context_plan`.
     pub fn with_context_plan_recorder(mut self, record: ContextPlanRecordFn) -> Self {
         self.record_context_plan = Some(record);
         self

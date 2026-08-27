@@ -551,7 +551,7 @@ pub const ACTIVATION_SCORER_VERSION: &str = "1327-v1";
 /// One candidate's activation score, kept broken out by term (#1327).
 ///
 /// [`crate::ports::recall::rank_by_activation_traced`] is the only place this
-/// is built, and [`activation`] reads its [`Self::total`] rather than
+/// is built, and `activation` reads its [`Self::total`] rather than
 /// recomputing one - so the number a reader is shown and the number the
 /// ranking used are the same value, not two computations that are supposed to
 /// agree.
@@ -564,7 +564,7 @@ pub struct ActivationTerms {
     /// How many of its own source's median absolute deviations the candidate
     /// stands below that source's median, or `None` for a candidate with no
     /// semantic signal - a full-text match, which carries a match instead of a
-    /// distance (see [`RecallRelevance::semantic_signal`] in
+    /// distance (see [`crate::ports::recall::RecallRelevance::semantic_signal`] in
     /// `crate::ports::recall`).
     pub semantic: Option<f64>,
     /// How much of the query's own words the candidate carries, and how far
