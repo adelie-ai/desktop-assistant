@@ -252,6 +252,10 @@ const MIGRATIONS: &[Migration] = &[
     // from `deleted_at`, so consolidation can mark an entry wrong, stale or
     // redundant without erasing it.
     migration!("056_kb_disposition.sql"),
+    // #694: revive merge-member tombstones where the disk still holds enough
+    // to say what happened - live where the successor still exists, active
+    // where it was hard-reaped. Prune tombstones are untouched.
+    migration!("058_revive_merge_tombstones.sql"),
 ];
 
 /// Second half of the advisory-lock key: the schema the migrations write to.
