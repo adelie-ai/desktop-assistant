@@ -190,10 +190,10 @@ pub async fn run_consolidation_phase(
                 total.merged_clusters += stats.merged_clusters;
                 total.updated += stats.updated;
                 total.scope_added += stats.scope_added;
-                total.soft_deleted += stats.soft_deleted;
-                total.protected_from_delete += stats.protected_from_delete;
+                total.dispositioned += stats.dispositioned;
+                total.explicit_guard_refusals += stats.explicit_guard_refusals;
                 total.settled_unchanged += stats.settled_unchanged;
-                total.prunes_over_cap += stats.prunes_over_cap;
+                total.dispositions_over_cap += stats.dispositions_over_cap;
                 total.rewrites_over_cap += stats.rewrites_over_cap;
                 total.dropped_operations += stats.dropped_operations;
                 total.scope_guard_refusals += stats.scope_guard_refusals;
@@ -202,7 +202,7 @@ pub async fn run_consolidation_phase(
                 // panels refetch as the scan progresses.
                 if (stats.merged_clusters > 0
                     || stats.updated > 0
-                    || stats.soft_deleted > 0
+                    || stats.dispositioned > 0
                     || stats.scope_added > 0)
                     && let Some(notify) = on_change
                 {
@@ -289,7 +289,7 @@ async fn consolidate_user(
         Vec::new();
     // Refusals, reported so an operator can see what the model keeps asking
     // for and the guards keep declining.
-    let mut protected_from_delete = 0usize;
+    let mut explicit_guard_refusals = 0usize;
     let mut settled_unchanged = 0usize;
     // Operations the model proposed that could not be read back. Counted so a
     // repaired answer is never quietly smaller than the one the model sent.
@@ -379,7 +379,7 @@ async fn consolidate_user(
                     if matches!(disposition, Disposition::Trivial | Disposition::Redundant)
                         && protected.contains(id.as_str())
                     {
-                        protected_from_delete += 1;
+                        explicit_guard_refusals += 1;
                         tracing::debug!(
                             "dreaming: refusing to disposition deliberately-entered entry \
                              {id} {target}"
@@ -572,7 +572,7 @@ async fn consolidate_user(
     tracing::info!(
         "dreaming: holistic consolidation plan for {total_entries} entries — \
          {} merge(s), {} edit(s)/scope-add(s), {} disposition(s); \
-         {protected_from_delete} protected, {settled_unchanged} settled, \
+         {explicit_guard_refusals} protected, {settled_unchanged} settled, \
          {rewrites_over_cap} rewrite(s) and {dispositions_over_cap} disposition(s) over the \
          configured share, {dropped_operations} operation(s) unreadable and dropped",
         synthesized.len(),
@@ -581,9 +581,9 @@ async fn consolidate_user(
     );
 
     let mut stats = apply_ops(pool, &buffer, &synthesized, policy).await?;
-    stats.protected_from_delete = protected_from_delete;
+    stats.explicit_guard_refusals = explicit_guard_refusals;
     stats.settled_unchanged = settled_unchanged;
-    stats.prunes_over_cap = dispositions_over_cap;
+    stats.dispositions_over_cap = dispositions_over_cap;
     stats.rewrites_over_cap = rewrites_over_cap;
     stats.dropped_operations = dropped_operations;
     Ok(stats)
@@ -1513,7 +1513,7 @@ mod tests {
             "the settled-entry guard must be stated: {prompt}"
         );
         assert!(
-            prompt.contains("scopes share nothing") || prompt.contains("different scopes"),
+            prompt.contains("scopes share nothing") && prompt.contains("different scopes"),
             "the scope guard must be stated: {prompt}"
         );
         assert!(

@@ -175,14 +175,14 @@ pub struct ConsolidationStats {
     /// Entries dispositioned this run: a standalone `disposition` op, plus
     /// every merge member dispositioned [`Disposition::Redundant`]. None of
     /// these rows are deleted - disposition is orthogonal to `deleted_at`.
-    pub soft_deleted: usize,
+    pub dispositioned: usize,
     pub scope_added: usize,
     /// Entries whose proposed disposition was refused because they carry
     /// [`SOURCE_EXPLICIT`] and the disposition was [`Disposition::Trivial`] or
     /// [`Disposition::Redundant`] - the two an explicit entry may not receive.
     /// Reported so an operator can see that the model keeps asking, even
     /// though the answer is always no.
-    pub protected_from_delete: usize,
+    pub explicit_guard_refusals: usize,
     /// Proposed edits declined because the entry has already been rewritten
     /// [`MAX_REVIEW_GENERATION`] times, so its prose is settled. A settled
     /// entry may still be merged or dispositioned; only `edit` is refused.
@@ -191,7 +191,7 @@ pub struct ConsolidationStats {
     /// the active set, computed after clustering and subsumption so an id a
     /// merge already absorbed does not spend the budget. The work is not
     /// lost - the next run sees the same entries.
-    pub prunes_over_cap: usize,
+    pub dispositions_over_cap: usize,
     /// Proposed edits and merges dropped because the run had spent its rewrite
     /// share. Reported for the same reason.
     pub rewrites_over_cap: usize,

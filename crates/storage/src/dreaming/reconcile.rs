@@ -13,6 +13,21 @@
 //! rewritten or removed, so a merge can never deadlock against the settled
 //! rule and never drops a member's own provenance.
 //!
+//! **The real invariant, stated once.** An explicit entry (`source =
+//! 'explicit'`) can never be dispositioned `trivial` or `redundant` by a
+//! *standalone* proposal - that guard is enforced twice, in
+//! `consolidation.rs`'s pre-filter and again by this module's own SQL
+//! predicate. It is NOT true that an explicit entry can never carry
+//! `redundant` at all: a merge dispositions every member `redundant`
+//! unconditionally, including an explicit one, because the design accepts
+//! explicit members into a cluster on purpose (design section 4.3). What
+//! carries the protection forward is the new row, not the member: a cluster
+//! with an explicit member stamps the new row `source = 'explicit'` (below),
+//! so the fact stays protected under its new id even though the member row
+//! that used to hold it now reads `redundant`. A reader of this table -
+//! restore, a browse filter, an audit - must not assume `redundant` implies
+//! `source <> 'explicit'`; it does not.
+//!
 //! Two layers back every disposition guard here. Consolidation's own
 //! pre-filter (`crates/storage/src/dreaming/consolidation.rs`) reads the
 //! entries it already loaded and refuses what it can see is wrong before an
@@ -318,6 +333,20 @@ pub async fn apply_ops(
         }
         let tags: Vec<String> = tags.into_iter().collect();
 
+        // Deliberately empty except `scope`: a merge can absorb any number of
+        // members, each with its own `source_conversation_id`, so writing any
+        // one of them onto the new row would misrepresent an N-source
+        // synthesis as coming from a single conversation - the old in-place
+        // merge did exactly that (picked whichever member sorted lowest) and
+        // it was never anything but arbitrary. The true provenance is not
+        // lost: every member stays a live row, carries its own
+        // `source_conversation_id` untouched, and is reachable from the new
+        // row by `WHERE superseded_by = <new row's id>`. That link is the
+        // recovery path today, pinned by
+        // `a_merged_rows_conversation_provenance_is_recoverable_through_its_members`
+        // below; #696's derived-from table gives it a proper index later, at
+        // which point this row can be re-cast as one of several sources
+        // rather than staying silent about the count.
         let mut metadata = KbMetadata::new();
         metadata.scope = merge.new_scope.clone();
 
@@ -329,7 +358,7 @@ pub async fn apply_ops(
         // cross-tenant collision is not expected, but the guard costs
         // nothing and turns an impossible case into a silent no-op rather
         // than a cross-tenant write.
-        sqlx::query(
+        let inserted = sqlx::query(
             "INSERT INTO knowledge_base \
                 (id, user_id, content, tags, metadata, source, review_generation, reviewed_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) \
@@ -351,6 +380,23 @@ pub async fn apply_ops(
         .await
         .map_err(|e| CoreError::Storage(format!("dreaming: merge insert failed: {e}")))?;
 
+        // Fail closed: the conflict guard above can affect zero rows (the id
+        // exists under a different owner - unreachable today, since the id is
+        // a UUIDv5 hash of member ids that already belong to this user, but
+        // the guard exists for exactly this case). Dispositioning the members
+        // against a row that was never actually written would strand them
+        // pointing at nothing. No member is touched this run; the cluster is
+        // simply not unified, the same outcome as the too-few-live-members
+        // case above.
+        if inserted.rows_affected() == 0 {
+            tracing::warn!(
+                "dreaming: merge_new insert for {new_id} (members {:?}) did not land; \
+                 skipping this cluster's member disposition rather than stranding them",
+                merge.member_ids
+            );
+            continue;
+        }
+
         // Every member stays a live row, dispositioned `redundant` and
         // pointing at the row that absorbed it. No reason is written: the
         // model states none per member, and `superseded_by` already says
@@ -371,7 +417,7 @@ pub async fn apply_ops(
         // Count rows the statement actually touched, so a member already
         // dispositioned by an earlier op in the same run is not counted
         // twice.
-        stats.soft_deleted += result.rows_affected() as usize;
+        stats.dispositioned += result.rows_affected() as usize;
 
         stats.merged_clusters += 1;
     }
@@ -535,7 +581,7 @@ pub async fn apply_ops(
         .map_err(|e| CoreError::Storage(format!("dreaming: disposition failed: {e}")))?;
 
         if result.rows_affected() > 0 {
-            stats.soft_deleted += 1;
+            stats.dispositioned += 1;
         } else if row_is_active(&mut *tx, user_id.as_str(), &id).await? {
             tracing::warn!(
                 "dreaming: consolidation disposition of {id} to {} was refused by the \
@@ -583,7 +629,12 @@ const MERGE_ID_NAMESPACE: uuid::Uuid = uuid::Uuid::from_bytes(*b"adelie-kb-merge
 /// duplicate (8.4): a crash after this INSERT commits but before the next
 /// batch's watermark advances redoes the same merge, and the same member set
 /// hashes to the same id both times.
-fn merge_id(members: &[String]) -> String {
+///
+/// `pub`, surfaced from `dreaming::mod` the same way `apply_ops` is: a DB test
+/// needs to precompute this id to force the owner-mismatch case the INSERT's
+/// conflict guard exists for, which is not otherwise reachable (ids are
+/// UUIDv7, so no test can arrive at a real collision by chance).
+pub fn merge_id(members: &[String]) -> String {
     let mut sorted: Vec<&str> = members.iter().map(String::as_str).collect();
     sorted.sort_unstable();
     let name = sorted.join("\u{1}");

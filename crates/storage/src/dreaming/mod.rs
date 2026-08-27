@@ -71,7 +71,10 @@ pub use common::update_watermark;
 /// is to call it directly with an operation that filter would have refused. The
 /// same call also drives the idempotent-replay proof (8.4): apply the same
 /// `SynthesizedMerge` twice and check the second call changes nothing new.
-pub use reconcile::{OpBuffer, ProposedOp, SynthesizedMerge, apply_ops};
+/// `merge_id` is surfaced alongside them so a test can precompute a merge's
+/// deterministic id and force the INSERT's owner-mismatch guard - the one
+/// case that cannot occur by chance, because ids are UUIDv7.
+pub use reconcile::{OpBuffer, ProposedOp, SynthesizedMerge, apply_ops, merge_id};
 
 /// Run one dreaming scan cycle: extract new facts, write the knowledge
 /// summaries that are missing or stale, and archive old conversations.
@@ -190,10 +193,10 @@ pub async fn run_consolidation_scan(
             stats.merged_clusters,
             stats.updated,
             stats.scope_added,
-            stats.soft_deleted,
-            stats.protected_from_delete,
+            stats.dispositioned,
+            stats.explicit_guard_refusals,
             stats.settled_unchanged,
-            stats.prunes_over_cap,
+            stats.dispositions_over_cap,
             stats.rewrites_over_cap,
             stats.dropped_operations,
         ),
@@ -252,17 +255,17 @@ enum ConsolidationReport {
 
 /// Sum of the counters that mean "at least one row changed".
 fn applied_count(stats: &ConsolidationStats) -> usize {
-    stats.merged_clusters + stats.updated + stats.soft_deleted + stats.scope_added
+    stats.merged_clusters + stats.updated + stats.dispositioned + stats.scope_added
 }
 
 /// Sum of the counters that mean "a proposal was understood and refused" -
 /// every guard, budget, and backstop this unit adds.
 fn refusal_count(stats: &ConsolidationStats) -> usize {
-    stats.protected_from_delete
+    stats.explicit_guard_refusals
         + stats.settled_unchanged
         + stats.scope_guard_refusals
         + stats.backstop_firings
-        + stats.prunes_over_cap
+        + stats.dispositions_over_cap
         + stats.rewrites_over_cap
 }
 
@@ -284,11 +287,11 @@ fn describe_refusals(stats: &ConsolidationStats) -> String {
     format!(
         "{} explicit-entry, {} settled-entry, {} scope-guard, {} backstop, {} over the \
          disposition share, {} over the rewrite share",
-        stats.protected_from_delete,
+        stats.explicit_guard_refusals,
         stats.settled_unchanged,
         stats.scope_guard_refusals,
         stats.backstop_firings,
-        stats.prunes_over_cap,
+        stats.dispositions_over_cap,
         stats.rewrites_over_cap,
     )
 }
@@ -343,11 +346,11 @@ mod tests {
         // Every counter this unit adds must actually move the decision, or a
         // guard could fire with nobody able to see it in the run's report.
         let fields: Vec<fn(&mut ConsolidationStats)> = vec![
-            |s| s.protected_from_delete = 1,
+            |s| s.explicit_guard_refusals = 1,
             |s| s.settled_unchanged = 1,
             |s| s.scope_guard_refusals = 1,
             |s| s.backstop_firings = 1,
-            |s| s.prunes_over_cap = 1,
+            |s| s.dispositions_over_cap = 1,
             |s| s.rewrites_over_cap = 1,
         ];
         for set in fields {

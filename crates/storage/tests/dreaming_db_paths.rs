@@ -32,8 +32,8 @@ mod support;
 
 use desktop_assistant_storage::dreaming::{
     BackfillEmbedFn, Disposition, DreamingLlmFn, MAX_DELETE_REASON_CHARS, MAX_REVIEW_GENERATION,
-    OpBuffer, ProposedOp, SOURCE_EXPLICIT, SynthesizedMerge, apply_ops, run_consolidation_scan,
-    run_dreaming_scan, update_watermark,
+    OpBuffer, ProposedOp, SOURCE_EXPLICIT, SynthesizedMerge, apply_ops, merge_id,
+    run_consolidation_scan, run_dreaming_scan, update_watermark,
 };
 use desktop_assistant_storage::knowledge_delete::{DEFAULT_PRUNE_FRACTION, KnowledgeDeletePolicy};
 use desktop_assistant_storage::{UserId, with_user_id};
@@ -204,6 +204,28 @@ async fn seed_kb_scoped(
     .expect("seed scoped knowledge_base row");
 }
 
+/// Seed an active KB row carrying the given `source_conversation_id`, as
+/// extraction stamps one on every fact it writes.
+async fn seed_kb_with_conversation(
+    pool: &PgPool,
+    user_id: &str,
+    id: &str,
+    content: &str,
+    conversation_id: &str,
+) {
+    let metadata = serde_json::json!({"source_conversation_id": conversation_id});
+    sqlx::query(
+        "INSERT INTO knowledge_base (id, user_id, content, metadata) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(id)
+    .bind(user_id)
+    .bind(content)
+    .bind(metadata)
+    .execute(pool)
+    .await
+    .expect("seed knowledge_base row with a source conversation");
+}
+
 async fn seed_conversation(pool: &PgPool, user_id: &str, id: &str) {
     sqlx::query("INSERT INTO conversations (id, title, user_id) VALUES ($1, 'test', $2)")
         .bind(id)
@@ -327,6 +349,19 @@ async fn kb_id_with_content(pool: &PgPool, user_id: &str, content: &str) -> Opti
     .expect("look up kb row by content")
 }
 
+/// The `metadata.source_conversation_id` stored for `id`, or `None` when the
+/// entry carries no such field (the merged row this unit produces is
+/// deliberately one of these).
+async fn kb_source_conversation_id(pool: &PgPool, id: &str) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT metadata ->> 'source_conversation_id' FROM knowledge_base WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("read source_conversation_id")
+}
+
 async fn kb_review_generation(pool: &PgPool, id: &str) -> i16 {
     sqlx::query_scalar("SELECT review_generation FROM knowledge_base WHERE id = $1")
         .bind(id)
@@ -395,7 +430,7 @@ async fn a_merge_writes_a_new_row_and_dispositions_members_redundant_with_links(
 
     assert_eq!(stats.merged_clusters, 1, "one merge cluster applied");
     assert_eq!(
-        stats.soft_deleted, 2,
+        stats.dispositioned, 2,
         "both members dispositioned redundant"
     );
 
@@ -450,6 +485,72 @@ async fn a_merge_writes_a_new_row_and_dispositions_members_redundant_with_links(
             "{member}'s own content is never rewritten - the synthesis lives on the new row"
         );
     }
+
+    fx.cleanup().await;
+}
+
+/// A merge's new row deliberately carries no `source_conversation_id` of its
+/// own - a cluster can absorb any number of members, each from a different
+/// conversation, so stamping the new row with any one of them would
+/// misrepresent an N-source synthesis as coming from a single conversation.
+/// The true provenance is not lost: it stays on each live member, reachable
+/// from the new row through `superseded_by`.
+#[tokio::test]
+async fn a_merged_rows_conversation_provenance_is_recoverable_through_its_members() {
+    let Some(fx) = support::DbFixture::try_new("dream893").await else {
+        return;
+    };
+    let pool = &fx.pool;
+
+    seed_kb_with_conversation(pool, "u1", "kb-aaa", "alpha fact", "conv-77").await;
+    seed_kb_with_conversation(pool, "u1", "kb-bbb", "beta fact", "conv-88").await;
+
+    let llm = llm_returning(
+        r#"{"operations":[{"op":"merge_new","ids":["kb-aaa","kb-bbb"],"content":"UNIFIED","scope":null}]}"#,
+    );
+    run_consolidation_scan(
+        pool,
+        &llm,
+        KnowledgeDeletePolicy::default(),
+        &CancellationToken::new(),
+        None,
+    )
+    .await
+    .expect("consolidation scan succeeds");
+
+    let new_id = kb_id_with_content(pool, "u1", "UNIFIED")
+        .await
+        .expect("the merge wrote a new row");
+
+    assert_eq!(
+        kb_source_conversation_id(pool, &new_id).await,
+        None,
+        "the new row names no single conversation - it has more than one source"
+    );
+
+    // The recovery path: find the members through the link the new row does
+    // carry, then read each member's own, untouched conversation id.
+    let member_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM knowledge_base WHERE user_id = 'u1' AND superseded_by = $1 ORDER BY id",
+    )
+    .bind(&new_id)
+    .fetch_all(pool)
+    .await
+    .expect("find members through superseded_by");
+    assert_eq!(
+        member_ids,
+        vec!["kb-aaa".to_string(), "kb-bbb".to_string()],
+        "both members are reachable from the new row through superseded_by"
+    );
+    assert_eq!(
+        kb_source_conversation_id(pool, "kb-aaa").await.as_deref(),
+        Some("conv-77"),
+        "a member's own conversation id survives the merge untouched"
+    );
+    assert_eq!(
+        kb_source_conversation_id(pool, "kb-bbb").await.as_deref(),
+        Some("conv-88")
+    );
 
     fx.cleanup().await;
 }
@@ -557,7 +658,7 @@ async fn disposition_cap_is_enforced_at_the_documented_fraction() {
     .expect("consolidation scan succeeds");
 
     assert_eq!(
-        stats.soft_deleted, 1,
+        stats.dispositioned, 1,
         "disposition plan clamped to ceil(10 * the configured prune fraction)"
     );
     assert_eq!(kb_count_active(pool, "u1").await, 10, "no row is deleted");
@@ -629,7 +730,7 @@ async fn an_explicit_entry_refuses_trivial_and_redundant_but_accepts_refuted() {
         "a source = 'explicit' entry must survive a proposed trivial disposition"
     );
     assert_eq!(
-        stats.protected_from_delete, 1,
+        stats.explicit_guard_refusals, 1,
         "the refusal is reported in the run's stats"
     );
     // The protected id does not consume the disposition budget, so the
@@ -1027,8 +1128,8 @@ async fn empty_knowledge_base_consolidates_to_a_clean_no_op() {
     .expect("consolidation over an empty active KB succeeds");
 
     assert_eq!(stats.reviewed, 0);
-    assert_eq!(stats.soft_deleted, 0);
-    assert_eq!(stats.protected_from_delete, 0);
+    assert_eq!(stats.dispositioned, 0);
+    assert_eq!(stats.explicit_guard_refusals, 0);
     assert_eq!(stats.settled_unchanged, 0);
     assert_eq!(
         kb_disposition(pool, "kb-gone").await.as_deref(),
@@ -1542,7 +1643,7 @@ async fn the_disposition_budget_is_computed_after_clustering() {
     .expect("consolidation scan succeeds");
 
     assert_eq!(
-        stats.prunes_over_cap, 0,
+        stats.dispositions_over_cap, 0,
         "kb-a's disposition is subsumed by the merge and must not count against the cap"
     );
     assert_eq!(
@@ -1590,7 +1691,7 @@ async fn a_plan_whose_dispositions_are_all_subsumed_by_merges_leaves_the_full_bu
     .expect("consolidation scan succeeds");
 
     assert_eq!(
-        stats.prunes_over_cap, 0,
+        stats.dispositions_over_cap, 0,
         "both subsumed dispositions are excluded before the cap is computed, so the cap of 1 \
          is spent only by kb-d and nothing overflows"
     );
@@ -1769,6 +1870,72 @@ async fn replaying_an_applied_batch_is_a_no_op() {
     assert_eq!(
         kb_superseded_by(pool, "kb-a").await.as_deref(),
         Some(new_id.as_str())
+    );
+
+    fx.cleanup().await;
+}
+
+/// Hardening, not a live bug (traced and confirmed unreachable today, since
+/// ids are UUIDv7): the merge INSERT's conflict guard
+/// (`WHERE knowledge_base.user_id = $2`) can affect zero rows when the
+/// deterministic id already belongs to a different owner. The applier must
+/// fail closed - disposition no member against a row that was never actually
+/// written for this user - rather than stranding them.
+#[tokio::test]
+async fn a_merge_insert_that_lands_on_another_owners_row_dispositions_no_member() {
+    let Some(fx) = support::DbFixture::try_new("dream712").await else {
+        return;
+    };
+    let pool = &fx.pool;
+
+    // Precompute the id this exact member set will hash to, and seed a row
+    // at that id owned by a DIFFERENT user - the collision the INSERT's
+    // conflict guard exists for.
+    let member_ids = vec!["kb-a".to_string(), "kb-b".to_string()];
+    let colliding_id = merge_id(&member_ids);
+    seed_kb(pool, "u2", &colliding_id, "belongs to u2, not u1").await;
+
+    // u1 owns the two members the merge will actually cluster.
+    seed_kb(pool, "u1", "kb-a", "alpha fact").await;
+    seed_kb(pool, "u1", "kb-b", "beta fact").await;
+
+    let merge = SynthesizedMerge {
+        member_ids: member_ids.clone(),
+        new_content: "UNIFIED".to_string(),
+        new_scope: None,
+    };
+    let policy = KnowledgeDeletePolicy::default();
+
+    let (stats, logged) = support::capture_tracing_at(tracing::Level::WARN, || {
+        with_user_id(UserId::new("u1".to_string()), async {
+            apply_ops(pool, &OpBuffer::new(), std::slice::from_ref(&merge), policy)
+                .await
+                .expect("apply_ops succeeds even when the insert cannot land")
+        })
+    })
+    .await;
+
+    assert_eq!(
+        stats.merged_clusters, 0,
+        "a merge whose insert did not land is not counted as applied"
+    );
+    for member in ["kb-a", "kb-b"] {
+        assert_eq!(
+            kb_disposition(pool, member).await.as_deref(),
+            Some("active"),
+            "{member} must not be dispositioned against a row that was never written for u1"
+        );
+        assert_eq!(kb_superseded_by(pool, member).await, None);
+    }
+    // u2's row at the colliding id is untouched - the conflict guard refused
+    // the write rather than overwriting another tenant's row.
+    assert_eq!(
+        kb_content(pool, &colliding_id).await.as_deref(),
+        Some("belongs to u2, not u1")
+    );
+    assert!(
+        logged.contains(&colliding_id),
+        "the warning must name the id that did not land: {logged}"
     );
 
     fx.cleanup().await;

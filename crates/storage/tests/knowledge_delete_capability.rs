@@ -249,7 +249,7 @@ async fn prune_fraction_is_read_from_configuration() {
         .expect("consolidation scan succeeds");
 
     assert_eq!(
-        stats.soft_deleted, 5,
+        stats.dispositioned, 5,
         "the disposition cap must come from the configured fraction, not a constant"
     );
     assert_eq!(
@@ -314,7 +314,7 @@ async fn zero_prune_fraction_merges_and_edits_but_deletes_nothing() {
         "a zero disposition fraction must retire nothing on its own"
     );
     assert_eq!(
-        stats.prunes_over_cap, 1,
+        stats.dispositions_over_cap, 1,
         "the one proposed disposition was deferred, not silently dropped"
     );
 
