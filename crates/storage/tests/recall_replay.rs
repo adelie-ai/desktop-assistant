@@ -153,11 +153,11 @@ async fn a_snapshot_excludes_rows_embedded_under_another_model_and_reports_the_c
         .await
         .expect("take_snapshot succeeds");
 
+    assert_eq!(manifest.embedding_model, MODEL_A, "the majority model wins");
     assert_eq!(
-        manifest.embedding_model, MODEL_A,
-        "the majority model wins"
+        manifest.entry_count, 2,
+        "the minority-model row is excluded"
     );
-    assert_eq!(manifest.entry_count, 2, "the minority-model row is excluded");
     assert_eq!(
         manifest.excluded_count, 1,
         "the exclusion is counted, not silently dropped"
@@ -196,12 +196,11 @@ async fn replaying_a_set_against_a_snapshot_twice_gives_identical_ranks() {
         .await
         .expect("second replay succeeds");
 
-    let rank_of = |report: &desktop_assistant_storage::ReplayReport| match &report.results[0]
-        .outcome
-    {
-        CaseOutcome::Ranked { rank, .. } => *rank,
-        CaseOutcome::ExpectedEntryMissing { .. } => panic!("expected entry must be found"),
-    };
+    let rank_of =
+        |report: &desktop_assistant_storage::ReplayReport| match &report.results[0].outcome {
+            CaseOutcome::Ranked { rank, .. } => *rank,
+            CaseOutcome::ExpectedEntryMissing { .. } => panic!("expected entry must be found"),
+        };
     assert_eq!(
         rank_of(&first),
         rank_of(&second),
@@ -262,7 +261,11 @@ async fn a_case_whose_expected_entry_no_longer_exists_is_reported_not_skipped() 
         .expect("replay succeeds even when a case's expected entry is missing");
 
     assert_eq!(report.case_count, 1);
-    assert_eq!(report.results.len(), 1, "the case must be reported, not skipped");
+    assert_eq!(
+        report.results.len(),
+        1,
+        "the case must be reported, not skipped"
+    );
     match &report.results[0].outcome {
         CaseOutcome::ExpectedEntryMissing { .. } => {}
         CaseOutcome::Ranked { .. } => panic!("an entry that was never seeded cannot have ranked"),
@@ -336,12 +339,13 @@ async fn replay_ranks_a_seeded_corpus_exactly_as_the_live_scan_ranks_it() {
     })
     .await;
 
-    let snapshot_order: Vec<String> = ranked_snapshot_scan(&fx.pool, USER, &manifest.id, query, Utc::now())
-        .await
-        .expect("snapshot scan succeeds")
-        .into_iter()
-        .map(|r| r.entry_id)
-        .collect();
+    let snapshot_order: Vec<String> =
+        ranked_snapshot_scan(&fx.pool, USER, &manifest.id, query, Utc::now())
+            .await
+            .expect("snapshot scan succeeds")
+            .into_iter()
+            .map(|r| r.entry_id)
+            .collect();
 
     assert_eq!(
         live_order, snapshot_order,
