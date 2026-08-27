@@ -5957,6 +5957,57 @@ mod tests {
         );
     }
 
+    /// #1327, the same defect and the same fix, on the skill arm: a mixed
+    /// relevance set leaves `ranked_skills` unsorted, and a skill with
+    /// nothing left after bounding drops out of `showable_skills` the same
+    /// way a pinned entry drops out of `showable`. Filtering the
+    /// already-traced vector keeps the plan and the block reading one order;
+    /// re-ranking a fresh, now-pure copy would not.
+    #[test]
+    fn a_mixed_relevance_skill_set_records_the_same_order_it_rendered() {
+        let candidates = RecallCandidates {
+            skills: vec![
+                // Lexical, so it clears the bar unconditionally and carries
+                // no semantic term - this is what makes the set mixed. Its
+                // description is empty, so it drops out of `showable_skills`
+                // and leaves a pure distance set behind it - the skill arm's
+                // equivalent of a pinned entry.
+                RecallSkill {
+                    relevance: RecallRelevance::LexicalMatch,
+                    ..skill("skill-lexical-empty", "", true, 0.10)
+                },
+                // Arrives before the higher-scoring skill, so raw scan order
+                // and total order disagree once the lexical row is filtered
+                // out.
+                skill(
+                    "skill-second-by-total",
+                    "ranks second",
+                    true,
+                    at(RECALL_BAR + 2.0),
+                ),
+                skill(
+                    "skill-first-by-total",
+                    "ranks first",
+                    true,
+                    at(RECALL_BAR + 6.0),
+                ),
+            ],
+            ..RecallCandidates::default()
+        };
+        let outcome = render_full(&candidates);
+        let block = outcome
+            .block
+            .as_ref()
+            .expect("the distance skills cleared the bar");
+
+        assert_eq!(
+            plan_rendered_order(&outcome.plan),
+            block.skill_names,
+            "the plan's rank order must match the order the block actually rendered, even when \
+             that order is the raw scan order a mixed set left unsorted"
+        );
+    }
+
     #[test]
     fn a_turn_persists_every_candidate_retrieval_considered_not_only_those_offered() {
         let candidates = RecallCandidates {
@@ -6126,9 +6177,10 @@ mod tests {
         let refused = hit("kb-refused", "refused", &["topic"], far());
 
         let candidates = RecallCandidates {
-            // `close_second` arrives first despite scoring lower, so a bug
-            // that fell back to arrival order for a near-tie moves it ahead
-            // of `close_first` and the test catches it.
+            // `close_second` arrives first despite scoring lower, so a
+            // comparator that fell back to arrival order for a near-tie
+            // would place it ahead of `close_first` - see the exact-order
+            // assertion below, which is what actually catches that.
             entries: vec![close_second, close_first, reinforced, leader, refused],
             ..RecallCandidates::default()
         };
@@ -6138,6 +6190,38 @@ mod tests {
             .as_ref()
             .expect("the admitted candidates cleared the bar");
 
+        // The exact order this fixture must produce: `leader` first by a
+        // wide distance margin, `reinforced` next on its use-log boost, then
+        // the near-tie broken by its 0.01-deviation edge rather than by
+        // arrival. Naming the sequence is what makes this a real check.
+        // `plan_rendered_order` and `block.entry_ids` are both read off the
+        // same `ranked_entries` vector (`plan_entries` assigns `rank` from
+        // its enumeration index, and `showable` filters it directly), so
+        // comparing them only to each other holds even when
+        // `rank_by_activation_traced` itself sorts wrong - both sides would
+        // just carry the same wrong order. Comparing each to a hardcoded
+        // sequence is what a wrong sort cannot survive.
+        let expected_order = vec![
+            "kb-leader",
+            "kb-reinforced",
+            "kb-close-first",
+            "kb-close-second",
+        ];
+        assert_eq!(
+            plan_rendered_order(&outcome.plan),
+            expected_order,
+            "the plan must rank by total score - leader ahead of the reinforced candidate \
+             ahead of the near-tie broken by its 0.01-deviation edge, not by arrival order"
+        );
+        assert_eq!(
+            block.entry_ids, expected_order,
+            "the block must render in the same order the plan claims to have ranked"
+        );
+
+        // A regression pin, not a substitute for the assertions above: this
+        // is what catches someone re-splitting the plan and the render back
+        // into two independent computations, which is the defect the arms'
+        // dedup fixed (#1327).
         assert_eq!(
             plan_rendered_order(&outcome.plan),
             block.entry_ids,
