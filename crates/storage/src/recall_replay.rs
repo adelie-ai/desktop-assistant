@@ -15,7 +15,7 @@
 //! case answers the second: a query, the entry that should win, and where
 //! that expectation came from. Replay runs the same public ranking function
 //! the live `[Recall]` block uses
-//! ([`rank_by_activation_traced`](desktop_assistant_core::ports::recall::rank_by_activation_traced))
+//! ([`rank_by_activation_traced`])
 //! against the frozen tables, with `now` fixed to the snapshot's own
 //! `taken_at` rather than the wall clock — the reinforcement term decays with
 //! time, so an unfrozen replay would give a different rank on every run and

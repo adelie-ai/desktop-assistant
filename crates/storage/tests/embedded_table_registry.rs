@@ -26,7 +26,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use desktop_assistant_storage::embedded_tables::EMBEDDED_TABLES;
+use desktop_assistant_storage::embedded_tables::{EMBEDDED_TABLE_EXEMPTIONS, EMBEDDED_TABLES};
 use desktop_assistant_storage::embedding_backfill::{
     BackfillEmbedFn, backfill_tag_embeddings, invalidate_stale_embeddings,
 };
@@ -144,21 +144,136 @@ async fn every_table_with_a_vector_column_is_registered() {
 
     let found: BTreeSet<String> = in_schema.into_iter().map(|(t,)| t).collect();
     let declared: BTreeSet<String> = EMBEDDED_TABLES.iter().map(|t| t.to_string()).collect();
+    // A vector table the sweep must never touch (#1328) is not "not yet
+    // registered" -- it is deliberately outside EMBEDDED_TABLES, and belongs
+    // here with its reason instead. Folded into the same accounted-for set
+    // so this test still fails for a vector table in neither list.
+    let exempt: BTreeSet<String> = EMBEDDED_TABLE_EXEMPTIONS
+        .iter()
+        .map(|(t, _reason)| t.to_string())
+        .collect();
+    let accounted_for: BTreeSet<String> = declared.union(&exempt).cloned().collect();
 
     assert!(
         !found.is_empty(),
         "the migrations must create at least one embedded table for this test to mean anything"
     );
-    let missing: Vec<&String> = found.difference(&declared).collect();
+    let missing: Vec<&String> = found.difference(&accounted_for).collect();
     assert!(
         missing.is_empty(),
-        "these tables hold embeddings but are absent from EMBEDDED_TABLES, so the \
-         lifecycle sweeps skip them and a model change strands their vectors: {missing:?}"
+        "these tables hold embeddings but are absent from both EMBEDDED_TABLES and \
+         EMBEDDED_TABLE_EXEMPTIONS, so nobody has decided whether the lifecycle sweeps should \
+         reach them: {missing:?}"
     );
     let phantom: Vec<&String> = declared.difference(&found).collect();
     assert!(
         phantom.is_empty(),
         "EMBEDDED_TABLES names tables that do not hold embeddings: {phantom:?}"
+    );
+    let phantom_exempt: Vec<&String> = exempt.difference(&found).collect();
+    assert!(
+        phantom_exempt.is_empty(),
+        "EMBEDDED_TABLE_EXEMPTIONS names tables that do not hold embeddings: {phantom_exempt:?}"
+    );
+
+    fx.cleanup().await;
+}
+
+/// Acceptance (#1328): the exemption is honoured in practice, not only
+/// declared. A snapshot's frozen vectors, and a case's per-model cached
+/// vector, must survive a model change untouched -- exactly the sweep that
+/// would otherwise strand or destroy them.
+#[tokio::test]
+async fn a_stale_sweep_leaves_exempted_tables_untouched() {
+    let Some(fx) = fixture("reg1328exempt").await else {
+        eprintln!("skip: TEST_DATABASE_URL not set");
+        return;
+    };
+
+    let snapshot_id = "snap-exempt";
+    let case_id = "case-exempt";
+    sqlx::query(
+        "INSERT INTO recall_snapshots \
+             (id, user_id, name, embedding_model, entry_count, use_count, excluded_count) \
+         VALUES ($1, 'exempt-user', 'snap', $2, 1, 0, 0)",
+    )
+    .bind(snapshot_id)
+    .bind(old_model())
+    .execute(&fx.pool)
+    .await
+    .expect("seed snapshot manifest");
+
+    let snapshot_vectors: Vec<Vector> = vec![Vector::from(vec![0.1_f32, 0.2, 0.3])];
+    sqlx::query(
+        "INSERT INTO recall_snapshot_entries \
+             (snapshot_id, user_id, entry_id, content, embedding, embedding_model, \
+              created_at, updated_at, disposition) \
+         VALUES ($1, 'exempt-user', 'kb-frozen', 'frozen content', $2::vector[], $3, \
+                 NOW(), NOW(), 'active')",
+    )
+    .bind(snapshot_id)
+    .bind(&snapshot_vectors)
+    .bind(old_model())
+    .execute(&fx.pool)
+    .await
+    .expect("seed a frozen snapshot entry");
+
+    sqlx::query(
+        "INSERT INTO recall_cases (id, user_id, query_text, expected_entry_id, note) \
+         VALUES ($1, 'exempt-user', 'a query', 'kb-frozen', 'seeded for the exemption test')",
+    )
+    .bind(case_id)
+    .execute(&fx.pool)
+    .await
+    .expect("seed a case");
+
+    let case_vector = Vector::from(vec![0.4_f32, 0.5, 0.6]);
+    sqlx::query(
+        "INSERT INTO recall_case_embeddings (case_id, user_id, embedding_model, embedding) \
+         VALUES ($1, 'exempt-user', $2, $3)",
+    )
+    .bind(case_id)
+    .bind(old_model())
+    .bind(&case_vector)
+    .execute(&fx.pool)
+    .await
+    .expect("seed a cached case embedding");
+
+    invalidate_stale_embeddings(&fx.pool, &new_model())
+        .await
+        .expect("the sweep must complete even though it never visits these tables");
+
+    let (snapshot_has_embedding, snapshot_model): (bool, Option<String>) = sqlx::query_as(
+        "SELECT embedding IS NOT NULL, embedding_model FROM recall_snapshot_entries \
+         WHERE snapshot_id = $1 AND entry_id = 'kb-frozen'",
+    )
+    .bind(snapshot_id)
+    .fetch_one(&fx.pool)
+    .await
+    .expect("read the frozen entry back");
+    assert!(
+        snapshot_has_embedding,
+        "a stale sweep must never clear a frozen snapshot's vectors -- there is no backfill \
+         that could ever refill them"
+    );
+    assert_eq!(
+        snapshot_model.as_deref(),
+        Some(old_model().as_str()),
+        "the snapshot's own embedding model must survive a live model change unchanged"
+    );
+
+    let case_row_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM recall_case_embeddings WHERE case_id = $1 AND embedding_model = $2",
+    )
+    .bind(case_id)
+    .bind(old_model())
+    .fetch_one(&fx.pool)
+    .await
+    .expect("count the case's cached embeddings");
+    assert_eq!(
+        case_row_count, 1,
+        "a case's old-model cache entry must survive a live model change -- deleting it would \
+         strand any snapshot still frozen under that model with no way to ever replay it again"
     );
 
     fx.cleanup().await;
