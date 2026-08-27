@@ -124,7 +124,7 @@ pub const DISCOVERY_TOOL: &str = "builtin_tool_search";
 /// are capability-gated on a wired closure and are absent until it is present,
 /// so a figure taken from `BuiltinToolService::new()` describes a core four
 /// smaller than the one a turn actually carries.
-pub const CORE_TOOL_COUNT: usize = 19;
+pub const CORE_TOOL_COUNT: usize = 20;
 
 /// The most tools the always-advertised built-in core may hold.
 ///

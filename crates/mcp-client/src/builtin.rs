@@ -16,8 +16,9 @@ use desktop_assistant_core::ports::database::DbQueryFn;
 use desktop_assistant_core::ports::embedding::{EMBED_TIMEOUT, EmbedFn};
 use desktop_assistant_core::ports::knowledge::{
     AVAILABLE_TAGS_LIMIT, KNOWLEDGE_GET_MAX_IDS, KNOWLEDGE_TAG_CENSUS_SAMPLE, KnowledgeDeleteFn,
-    KnowledgeGetFn, KnowledgeGetManyFn, KnowledgeListFn, KnowledgeListQuery, KnowledgeSearchFn,
-    KnowledgeTagResolveFn, KnowledgeWriteFn, ListOrder, ListOrderOpt, ProposedTag, ScopeSize,
+    KnowledgeGetFn, KnowledgeGetManyFn, KnowledgeListFn, KnowledgeListQuery, KnowledgeRestoreFn,
+    KnowledgeSearchFn, KnowledgeSearchTrashFn, KnowledgeSetDispositionFn, KnowledgeTagResolveFn,
+    KnowledgeWriteFn, ListOrder, ListOrderOpt, ProposedTag, RestoreOutcome, ScopeSize,
 };
 use desktop_assistant_core::ports::knowledge_use::{
     KnowledgeMarkFn, KnowledgeOfferedFn, KnowledgeOpenedFn, KnowledgeSituationFn, MarkRequest,
@@ -311,6 +312,10 @@ const TOOL_KB_DELETE: &str = "builtin_knowledge_base_delete";
 const TOOL_KB_LIST: &str = "builtin_knowledge_base_list";
 const TOOL_KB_GET: &str = "builtin_knowledge_base_get";
 const TOOL_KB_MARK: &str = "builtin_knowledge_base_mark";
+const TOOL_KB_RESTORE: &str = "builtin_knowledge_base_restore";
+/// Largest `limit` `builtin_knowledge_base_restore`'s trash search will
+/// honour, matching the shape `KB_SEARCH_MAX_LIMIT` gives the live search.
+const KB_TRASH_SEARCH_MAX_LIMIT: u64 = 100;
 const TOOL_SEARCH: &str = "builtin_tool_search";
 const TOOL_NOTIFY: &str = "builtin_notify";
 const TOOL_SYS_PROPS: &str = "builtin_sys_props";
@@ -363,6 +368,9 @@ pub struct BuiltinToolService {
     kb_list_fn: Option<KnowledgeListFn>,
     kb_get_fn: Option<KnowledgeGetFn>,
     kb_get_many_fn: Option<KnowledgeGetManyFn>,
+    kb_restore_fn: Option<KnowledgeRestoreFn>,
+    kb_search_trash_fn: Option<KnowledgeSearchTrashFn>,
+    kb_set_disposition_fn: Option<KnowledgeSetDispositionFn>,
     kb_tag_resolve_fn: Option<KnowledgeTagResolveFn>,
     kb_offered_fn: Option<KnowledgeOfferedFn>,
     kb_opened_fn: Option<KnowledgeOpenedFn>,
@@ -411,6 +419,9 @@ impl BuiltinToolService {
             kb_list_fn: None,
             kb_get_fn: None,
             kb_get_many_fn: None,
+            kb_restore_fn: None,
+            kb_search_trash_fn: None,
+            kb_set_disposition_fn: None,
             kb_tag_resolve_fn: None,
             kb_offered_fn: None,
             kb_opened_fn: None,
@@ -514,6 +525,35 @@ impl BuiltinToolService {
     /// flat in the number of ids.
     pub fn with_knowledge_get_many(mut self, get_many_fn: KnowledgeGetManyFn) -> Self {
         self.kb_get_many_fn = Some(get_many_fn);
+        self
+    }
+
+    /// Wire the trash: restoring a tombstone by id, and finding one by full
+    /// text (`builtin_knowledge_base_restore`, #710). Additive and separate
+    /// from [`Self::with_knowledge_base`] for the same reason
+    /// [`Self::with_knowledge_get_many`] is: a caller wired before this
+    /// existed keeps compiling, and the tool then answers "knowledge base not
+    /// configured" the way every other unwired knowledge tool does.
+    pub fn with_knowledge_restore(
+        mut self,
+        restore_fn: KnowledgeRestoreFn,
+        search_trash_fn: KnowledgeSearchTrashFn,
+    ) -> Self {
+        self.kb_restore_fn = Some(restore_fn);
+        self.kb_search_trash_fn = Some(search_trash_fn);
+        self
+    }
+
+    /// Wire the optional `disposition` argument on `builtin_knowledge_base_write`
+    /// (design doc section 3.2 of #694's wave-1 plan), so a person's "no,
+    /// that is wrong" can land as `refuted` when the user says it, not only
+    /// through consolidation's own judgement. Absent, the argument is simply
+    /// refused with a clear error rather than silently ignored.
+    pub fn with_knowledge_disposition(
+        mut self,
+        set_disposition_fn: KnowledgeSetDispositionFn,
+    ) -> Self {
+        self.kb_set_disposition_fn = Some(set_disposition_fn);
         self
     }
 
@@ -710,7 +750,12 @@ impl BuiltinToolService {
                  description is what the check compares. When the response carries \
                  `tag_check: \"UNKNOWN\"`, at least one tag on that write was stored without \
                  being checked, so treat those tags as your own wording and not as established \
-                 vocabulary."
+                 vocabulary. Give `disposition` when the user directly corrects an existing \
+                 entry - 'active' (the default; a live claim), 'refuted' (established untrue), \
+                 'obsolete' (was true, no longer applies) or 'trivial' (harmless, not worth \
+                 surfacing); pair it with `disposition_reason` to say why. 'superseded' and \
+                 'redundant' are refused here, because they name a successor entry this tool has \
+                 no argument for."
                 ),
                 serde_json::json!({
                     "type": "object",
@@ -736,6 +781,15 @@ impl BuiltinToolService {
                             "additionalProperties": {"type": "string"},
                             "description": "Optional map from a tag in `tags` to a one-line description of what that tag means, e.g. {'topic:embeddings': 'Vector embedding generation, models, and backfill'}. Needed only for a tag you believe is new: it is what decides whether your tag means the same as one already in use. A tag already in use ignores its entry here. Omitting a description never fails the write, it only makes the check weaker. Keep it to one line: a description longer than 200 characters is truncated to 200, never rejected."
                         },
+                        "disposition": {
+                            "type": "string",
+                            "enum": ["active", "refuted", "obsolete", "trivial"],
+                            "description": "Set what this entry is judged to be, when the user directly says so - e.g. 'refuted' after 'no, that's wrong'. Almost always paired with `id`, naming the entry being corrected. Leave unset to store or edit the content without changing its disposition."
+                        },
+                        "disposition_reason": {
+                            "type": "string",
+                            "description": "Short statement of why, in your own words. Send with `disposition`, especially 'refuted' or 'obsolete'."
+                        },
                         "id": {
                             "type": "string",
                             "description": "Optional ID. Omit to create a new entry with a generated \
@@ -755,7 +809,7 @@ impl BuiltinToolService {
                         },
                         "entries": {
                             "type": "array",
-                            "description": "Batch form: a list of {content?, tags?, summary?, id?, new_tag_descriptions?} objects. When present, every top-level field is ignored — content, tags, summary, id and new_tag_descriptions alike — so summarise each entry, and describe its new tags, inside that entry.",
+                            "description": "Batch form: a list of {content?, tags?, summary?, id?, new_tag_descriptions?, disposition?, disposition_reason?} objects. When present, every top-level field is ignored — content, tags, summary, id, new_tag_descriptions, disposition and disposition_reason alike — so summarise each entry, describe its new tags, and set its disposition, inside that entry.",
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -774,6 +828,11 @@ impl BuiltinToolService {
                                         "additionalProperties": {"type": "string"},
                                         "description": "Per-entry map from a tag in this entry's `tags` to a one-line description of what it means. Needed only for a tag you believe is new. A description longer than 200 characters is truncated to 200, never rejected."
                                     },
+                                    "disposition": {
+                                        "type": "string",
+                                        "enum": ["active", "refuted", "obsolete", "trivial"]
+                                    },
+                                    "disposition_reason": {"type": "string"},
                                     "id": {"type": "string"}
                                 }
                             }
@@ -929,6 +988,40 @@ impl BuiltinToolService {
                             "type": "array",
                             "items": {"type": "string"},
                             "description": "IDs of multiple entries to delete in one call"
+                        }
+                    }
+                }),
+            ),
+            ToolDefinition::new(
+                TOOL_KB_RESTORE,
+                format!(
+                    "Find and bring back a soft-deleted knowledge entry. Deleting a knowledge \
+                     entry (as {TOOL_KB_DELETE} does when you are not acting on the user's \
+                     explicit, immediate request to forget something) retires it to a trash \
+                     rather than erasing it, so a wrong disposition or an over-eager delete is \
+                     recoverable. Give `query` to search the trash by full text when you do not \
+                     know the id; give `id` to restore that one entry. A restore clears every \
+                     verdict the entry carried - it comes back an ordinary live fact, not one \
+                     still marked as retired."
+                ),
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search the trash by full text. Returns matching \
+                                             tombstones with their id, a content excerpt, why \
+                                             they were retired, and when."
+                        },
+                        "id": {
+                            "type": "string",
+                            "description": "Restore the single tombstone with this id."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": KB_TRASH_SEARCH_MAX_LIMIT,
+                            "description": "Max trash search results (default 10)."
                         }
                     }
                 }),
@@ -1452,6 +1545,7 @@ impl BuiltinToolService {
         TOOL_KB_LIST,
         TOOL_KB_GET,
         TOOL_KB_MARK,
+        TOOL_KB_RESTORE,
         TOOL_SEARCH,
         TOOL_NOTIFY,
         TOOL_SYS_PROPS,
@@ -1475,7 +1569,7 @@ impl BuiltinToolService {
     pub fn provider_group(tool_name: &str) -> Option<&'static str> {
         match tool_name {
             TOOL_KB_WRITE | TOOL_KB_SEARCH | TOOL_KB_DELETE | TOOL_KB_LIST | TOOL_KB_GET
-            | TOOL_KB_MARK => Some("knowledge"),
+            | TOOL_KB_MARK | TOOL_KB_RESTORE => Some("knowledge"),
             TOOL_SCRATCHPAD_WRITE
             | TOOL_SCRATCHPAD_SEARCH
             | TOOL_SCRATCHPAD_DELETE
@@ -1514,6 +1608,7 @@ impl BuiltinToolService {
             TOOL_KB_LIST => self.kb_list(arguments).await,
             TOOL_KB_GET => self.kb_get(arguments).await,
             TOOL_KB_MARK => self.kb_mark(arguments).await,
+            TOOL_KB_RESTORE => self.kb_restore(arguments).await,
             TOOL_SEARCH => self.tool_search(arguments).await,
             TOOL_NOTIFY => self.notify(arguments).await,
             TOOL_SYS_PROPS => Ok(self.sys_props()),
@@ -1667,6 +1762,17 @@ impl BuiltinToolService {
                     break;
                 }
             };
+            // Parsed before anything is written, so a spec naming an unknown
+            // spelling or a disposition this tool cannot set (#710 - see
+            // `parse_disposition_arg`) fails the spec without landing content
+            // under a disposition argument that was never actually honoured.
+            let disposition_arg = match parse_disposition_arg(spec) {
+                Ok(d) => d,
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            };
             // Embedding generation is decoupled from the write: the entry lands
             // immediately (NULL embedding on create, stale embedding left in
             // place on update) and the background embedding-backfill task
@@ -1679,6 +1785,23 @@ impl BuiltinToolService {
                     break;
                 }
             };
+            if let Some((disposition, reason)) = disposition_arg {
+                let set_disposition_fn = match self.kb_set_disposition_fn.as_ref() {
+                    Some(f) => f,
+                    None => {
+                        failure = Some(CoreError::ToolExecution(
+                            "knowledge_base write: `disposition` was given, but this instance \
+                             has no disposition control wired"
+                                .to_string(),
+                        ));
+                        break;
+                    }
+                };
+                if let Err(e) = set_disposition_fn(saved.id.clone(), disposition, reason).await {
+                    failure = Some(e);
+                    break;
+                }
+            }
             saved_out.push(serde_json::json!({
                 "id": saved.id,
                 // The tags actually stored, which the vocabulary check may have
@@ -2380,6 +2503,94 @@ impl BuiltinToolService {
             "ok": true,
             "deleted": deleted,
             "ids": ids,
+        })
+        .to_string())
+    }
+
+    /// `builtin_knowledge_base_restore` (#710): `id` restores one tombstone,
+    /// `query` searches the trash by full text. `id` wins when both are
+    /// given, matching `builtin_knowledge_base_delete`'s "id names one entry"
+    /// precedence.
+    async fn kb_restore(&self, arguments: serde_json::Value) -> Result<String, CoreError> {
+        if let Some(id) = optional_string(&arguments, "id") {
+            return self.kb_restore_one(&id).await;
+        }
+        if let Some(query) = optional_string(&arguments, "query") {
+            return self.kb_search_trash(&query, &arguments).await;
+        }
+        Err(CoreError::ToolExecution(
+            "knowledge_base restore requires `id` to restore one entry, or `query` to search \
+             the trash"
+                .to_string(),
+        ))
+    }
+
+    async fn kb_restore_one(&self, id: &str) -> Result<String, CoreError> {
+        let restore_fn = self
+            .kb_restore_fn
+            .as_ref()
+            .ok_or_else(|| CoreError::ToolExecution("knowledge base not configured".to_string()))?;
+
+        let outcome = restore_fn(id.to_string()).await?;
+        let (ok, restored, status) = match outcome {
+            RestoreOutcome::Restored => (true, true, "restored"),
+            RestoreOutcome::NotInTrash => (true, false, "not_in_trash"),
+            RestoreOutcome::NoLongerExists => (true, false, "no_longer_exists"),
+        };
+
+        Ok(serde_json::json!({
+            "ok": ok,
+            "id": id,
+            "restored": restored,
+            "status": status,
+            "message": match outcome {
+                RestoreOutcome::Restored => "The entry is live again.".to_string(),
+                RestoreOutcome::NotInTrash => {
+                    "That id names an entry that is not in the trash.".to_string()
+                }
+                RestoreOutcome::NoLongerExists => {
+                    "That id names no entry any more; it was reaped, or it never existed."
+                        .to_string()
+                }
+            },
+        })
+        .to_string())
+    }
+
+    async fn kb_search_trash(
+        &self,
+        query: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<String, CoreError> {
+        let search_trash_fn = self
+            .kb_search_trash_fn
+            .as_ref()
+            .ok_or_else(|| CoreError::ToolExecution("knowledge base not configured".to_string()))?;
+
+        let limit = arguments
+            .get("limit")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(10)
+            .clamp(1, KB_TRASH_SEARCH_MAX_LIMIT) as usize;
+
+        let hits = search_trash_fn(query.to_string(), limit).await?;
+        let items: Vec<serde_json::Value> = hits
+            .into_iter()
+            .map(|h| {
+                serde_json::json!({
+                    "id": h.id,
+                    "content_excerpt": h.content_excerpt,
+                    "disposition": h.disposition.as_str(),
+                    "disposition_reason": h.disposition_reason,
+                    "deleted_at": h.deleted_at,
+                })
+            })
+            .collect();
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "count": items.len(),
+            "results": items,
         })
         .to_string())
     }
@@ -3601,6 +3812,43 @@ fn optional_string(args: &serde_json::Value, key: &str) -> Option<String> {
         .and_then(serde_json::Value::as_str)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Parse `builtin_knowledge_base_write`'s optional `disposition` and
+/// `disposition_reason` arguments (#710, design doc section 3.2 of #694's
+/// wave-1 plan).
+///
+/// `None` when the spec names no disposition at all - the ordinary write,
+/// unaffected. [`Disposition::Superseded`] and [`Disposition::Redundant`] are
+/// refused here, before anything is written: both need a successor named in
+/// `superseded_by`, and this tool carries no argument for one -
+/// consolidation's own `merge_new`/`disposition` ops are what set those two,
+/// with the successor already in hand.
+fn parse_disposition_arg(
+    spec: &serde_json::Value,
+) -> Result<Option<(Disposition, Option<String>)>, CoreError> {
+    let Some(raw) = optional_string(spec, "disposition") else {
+        return Ok(None);
+    };
+    let disposition = Disposition::parse(&raw).ok_or_else(|| {
+        CoreError::ToolExecution(format!(
+            "knowledge_base write: unknown disposition '{raw}'; use one of active, refuted, \
+             obsolete, trivial"
+        ))
+    })?;
+    if matches!(
+        disposition,
+        Disposition::Superseded | Disposition::Redundant
+    ) {
+        return Err(CoreError::ToolExecution(format!(
+            "knowledge_base write: disposition '{raw}' names a successor entry, which this \
+             tool has no argument for. Use 'refuted' or 'obsolete' instead."
+        )));
+    }
+    Ok(Some((
+        disposition,
+        optional_string(spec, "disposition_reason"),
+    )))
 }
 
 fn optional_string_array(args: &serde_json::Value, key: &str) -> Vec<String> {
@@ -6079,6 +6327,306 @@ mod tests {
             .execute_tool(TOOL_KB_SEARCH, serde_json::json!({"query": "test"}))
             .await;
         assert!(matches!(result, Err(CoreError::ToolExecution(_))));
+    }
+
+    // -----------------------------------------------------------------
+    // builtin_knowledge_base_restore (#710)
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn kb_restore_without_store_returns_error() {
+        let service = BuiltinToolService::new();
+        let result = service
+            .execute_tool(TOOL_KB_RESTORE, serde_json::json!({"id": "kb-1"}))
+            .await;
+        assert!(matches!(result, Err(CoreError::ToolExecution(_))));
+    }
+
+    #[tokio::test]
+    async fn kb_restore_requires_id_or_query() {
+        let restore_fn: KnowledgeRestoreFn =
+            Arc::new(|_id| Box::pin(async { Ok(RestoreOutcome::Restored) }));
+        let search_trash_fn: KnowledgeSearchTrashFn =
+            Arc::new(|_q, _limit| Box::pin(async { Ok(vec![]) }));
+        let service = BuiltinToolService::new().with_knowledge_restore(restore_fn, search_trash_fn);
+
+        let err = service
+            .execute_tool(TOOL_KB_RESTORE, serde_json::json!({}))
+            .await
+            .expect_err("neither id nor query was given");
+        assert!(
+            matches!(&err, CoreError::ToolExecution(msg) if msg.contains("id") && msg.contains("query")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_restore_by_id_reports_each_outcome() {
+        for (outcome, status, restored) in [
+            (RestoreOutcome::Restored, "restored", true),
+            (RestoreOutcome::NotInTrash, "not_in_trash", false),
+            (RestoreOutcome::NoLongerExists, "no_longer_exists", false),
+        ] {
+            let restore_fn: KnowledgeRestoreFn =
+                Arc::new(move |_id| Box::pin(async move { Ok(outcome) }));
+            let search_trash_fn: KnowledgeSearchTrashFn =
+                Arc::new(|_q, _limit| Box::pin(async { Ok(vec![]) }));
+            let service =
+                BuiltinToolService::new().with_knowledge_restore(restore_fn, search_trash_fn);
+
+            let raw = service
+                .execute_tool(TOOL_KB_RESTORE, serde_json::json!({"id": "kb-1"}))
+                .await
+                .expect("restore call succeeds");
+            let value: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+            assert_eq!(value["status"], status, "{value}");
+            assert_eq!(value["restored"], restored, "{value}");
+            assert_eq!(value["ok"], true, "{value}");
+        }
+    }
+
+    #[tokio::test]
+    async fn kb_restore_by_query_searches_the_trash() {
+        use desktop_assistant_core::ports::knowledge::TrashEntry;
+
+        let restore_fn: KnowledgeRestoreFn =
+            Arc::new(|_id| Box::pin(async { Ok(RestoreOutcome::Restored) }));
+        let search_trash_fn: KnowledgeSearchTrashFn = Arc::new(|query, limit| {
+            let query = query.clone();
+            Box::pin(async move {
+                assert_eq!(query, "printer driver");
+                assert_eq!(limit, 5);
+                Ok(vec![TrashEntry {
+                    id: "kb-trash-1".to_string(),
+                    content_excerpt: "the printer driver needs a restart".to_string(),
+                    disposition: Disposition::Trivial,
+                    disposition_reason: Some("looked stale".to_string()),
+                    deleted_at: "2026-01-01 00:00:00".to_string(),
+                }])
+            })
+        });
+        let service = BuiltinToolService::new().with_knowledge_restore(restore_fn, search_trash_fn);
+
+        let raw = service
+            .execute_tool(
+                TOOL_KB_RESTORE,
+                serde_json::json!({"query": "printer driver", "limit": 5}),
+            )
+            .await
+            .expect("search succeeds");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+        assert_eq!(value["count"], 1, "{value}");
+        assert_eq!(value["results"][0]["id"], "kb-trash-1", "{value}");
+        assert_eq!(value["results"][0]["disposition"], "trivial", "{value}");
+    }
+
+    #[tokio::test]
+    async fn kb_restore_id_wins_over_query_when_both_are_given() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let called_restore = Arc::new(AtomicUsize::new(0));
+        let called_search = Arc::new(AtomicUsize::new(0));
+        let restore_calls = Arc::clone(&called_restore);
+        let restore_fn: KnowledgeRestoreFn = Arc::new(move |_id| {
+            restore_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(RestoreOutcome::Restored) })
+        });
+        let search_calls = Arc::clone(&called_search);
+        let search_trash_fn: KnowledgeSearchTrashFn = Arc::new(move |_q, _limit| {
+            search_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(vec![]) })
+        });
+        let service = BuiltinToolService::new().with_knowledge_restore(restore_fn, search_trash_fn);
+
+        service
+            .execute_tool(
+                TOOL_KB_RESTORE,
+                serde_json::json!({"id": "kb-1", "query": "anything"}),
+            )
+            .await
+            .expect("restore succeeds");
+
+        assert_eq!(called_restore.load(Ordering::SeqCst), 1);
+        assert_eq!(called_search.load(Ordering::SeqCst), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // The optional `disposition` argument on builtin_knowledge_base_write
+    // -----------------------------------------------------------------
+
+    /// The in-memory store [`kb_write_only_service`] backs its write/get
+    /// closures with.
+    type KbWriteOnlyStore =
+        Arc<std::sync::Mutex<std::collections::HashMap<String, KnowledgeEntry>>>;
+
+    /// A minimal `with_knowledge_base` wiring backed by an in-memory map, so
+    /// the disposition tests can write an entry without pulling in the whole
+    /// closures test fixture.
+    fn kb_write_only_service() -> (BuiltinToolService, KbWriteOnlyStore) {
+        let store: KbWriteOnlyStore =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let write_store = Arc::clone(&store);
+        let write_fn: KnowledgeWriteFn = Arc::new(move |mut entry| {
+            let s = Arc::clone(&write_store);
+            Box::pin(async move {
+                entry.created_at = "2026-01-01".to_string();
+                entry.updated_at = "2026-01-01".to_string();
+                s.lock().unwrap().insert(entry.id.clone(), entry.clone());
+                Ok(entry)
+            })
+        });
+        let get_store = Arc::clone(&store);
+        let get_fn: KnowledgeGetFn = Arc::new(move |id| {
+            let s = Arc::clone(&get_store);
+            Box::pin(async move { Ok(s.lock().unwrap().get(&id).cloned()) })
+        });
+        let search_fn: KnowledgeSearchFn = Arc::new(|_q, _emb, _model, _tags, _exclude, _limit| {
+            Box::pin(async {
+                Ok(KnowledgeSearchPage {
+                    entries: vec![],
+                    scope_size: ScopeSize::None,
+                    available_tags: vec![],
+                })
+            })
+        });
+        let delete_fn: KnowledgeDeleteFn = Arc::new(|_ids| Box::pin(async { Ok(0) }));
+        let list_fn: KnowledgeListFn = Arc::new(|_q| {
+            Box::pin(async {
+                Ok(
+                    desktop_assistant_core::ports::knowledge::KnowledgeListPage {
+                        entries: vec![],
+                        next_cursor: None,
+                    },
+                )
+            })
+        });
+        let service = BuiltinToolService::new()
+            .with_knowledge_base(write_fn, search_fn, delete_fn, list_fn, get_fn);
+        (service, store)
+    }
+
+    #[tokio::test]
+    async fn kb_write_disposition_argument_calls_the_disposition_closure() {
+        type SeenCall = (String, Disposition, Option<String>);
+
+        let (service, _store) = kb_write_only_service();
+        let seen: Arc<std::sync::Mutex<Vec<SeenCall>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_write = Arc::clone(&seen);
+        let set_disposition_fn: KnowledgeSetDispositionFn =
+            Arc::new(move |id, disposition, reason| {
+                let seen = Arc::clone(&seen_write);
+                Box::pin(async move {
+                    seen.lock().unwrap().push((id, disposition, reason));
+                    Ok(())
+                })
+            });
+        let service = service.with_knowledge_disposition(set_disposition_fn);
+
+        service
+            .execute_tool(
+                TOOL_KB_WRITE,
+                serde_json::json!({
+                    "id": "kb-corrected",
+                    "content": "the meeting is on Thursday",
+                    "disposition": "refuted",
+                    "disposition_reason": "the user said this was wrong"
+                }),
+            )
+            .await
+            .expect("write with a disposition argument succeeds");
+
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].0, "kb-corrected");
+        assert_eq!(calls[0].1, Disposition::Refuted);
+        assert_eq!(calls[0].2.as_deref(), Some("the user said this was wrong"));
+    }
+
+    #[tokio::test]
+    async fn kb_write_without_a_disposition_argument_never_calls_the_disposition_closure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (service, _store) = kb_write_only_service();
+        let called = Arc::new(AtomicUsize::new(0));
+        let called_write = Arc::clone(&called);
+        let set_disposition_fn: KnowledgeSetDispositionFn = Arc::new(move |_id, _d, _r| {
+            called_write.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        });
+        let service = service.with_knowledge_disposition(set_disposition_fn);
+
+        service
+            .execute_tool(
+                TOOL_KB_WRITE,
+                serde_json::json!({"content": "an ordinary fact with no correction"}),
+            )
+            .await
+            .expect("an ordinary write succeeds");
+
+        assert_eq!(
+            called.load(Ordering::SeqCst),
+            0,
+            "a write that never mentions `disposition` must never reach the disposition closure"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_write_refuses_an_unknown_disposition_spelling() {
+        let (service, _store) = kb_write_only_service();
+        let err = service
+            .execute_tool(
+                TOOL_KB_WRITE,
+                serde_json::json!({"content": "x", "disposition": "not-a-real-value"}),
+            )
+            .await
+            .expect_err("an unknown spelling must be refused");
+        assert!(matches!(err, CoreError::ToolExecution(_)));
+    }
+
+    #[tokio::test]
+    async fn kb_write_refuses_a_disposition_that_needs_a_successor() {
+        for value in ["superseded", "redundant"] {
+            let (service, store) = kb_write_only_service();
+            let err = service
+                .execute_tool(
+                    TOOL_KB_WRITE,
+                    serde_json::json!({"content": "x", "disposition": value}),
+                )
+                .await
+                .expect_err("this tool has no argument for a successor");
+            // Not just any refusal: it must be this guard, not (for instance)
+            // the separate "no disposition control wired" refusal a caller
+            // with no `with_knowledge_disposition` closure would also raise -
+            // both are `CoreError::ToolExecution`, so the variant alone
+            // cannot tell them apart.
+            assert!(
+                matches!(&err, CoreError::ToolExecution(msg) if msg.contains("successor")),
+                "{value}: {err:?}"
+            );
+            // The rejection happens before anything is written: a bad
+            // disposition argument must not land content under a disposition
+            // that was never actually honoured.
+            assert!(
+                store.lock().unwrap().is_empty(),
+                "{value}: nothing should have been written"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn kb_write_disposition_without_a_wired_closure_is_refused() {
+        let (service, _store) = kb_write_only_service();
+        // No `with_knowledge_disposition` call: the instance has a knowledge
+        // base but never wired the disposition control.
+        let err = service
+            .execute_tool(
+                TOOL_KB_WRITE,
+                serde_json::json!({"content": "x", "disposition": "refuted"}),
+            )
+            .await
+            .expect_err("a disposition argument with nothing wired must be refused");
+        assert!(matches!(err, CoreError::ToolExecution(_)));
     }
 
     #[tokio::test]

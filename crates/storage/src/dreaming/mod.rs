@@ -51,8 +51,8 @@ use crate::knowledge_delete::KnowledgeDeletePolicy;
 pub use misfiled::{MAX_SWEPT_ENTRIES_PER_CYCLE, MisfiledStats, run_misfiled_sweep_phase};
 pub use summarize::{SummaryStats, run_summary_phase};
 pub use trash::{
-    empty_trash, reap_expired_trash, restore_entry, search_trash, sweep_expired_trash,
-    trash_count,
+    empty_trash, reap_expired_trash, restore_entry, search_trash, set_disposition,
+    sweep_expired_trash, trash_count,
 };
 pub use types::{
     BackfillEmbedFn, ConsolidationStats, Disposition, DreamingLlmFn, KnowledgeChangeFn,

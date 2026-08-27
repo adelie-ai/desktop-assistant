@@ -21,6 +21,9 @@
 //!   existed, nothing in the daemon, a client, or a tool could ever clear
 //!   `deleted_at`, and 30 days after a bad consolidation run every one of its
 //!   tombstones was gone for good.
+//! - [`set_disposition`] sets a live entry's disposition directly, for a
+//!   person's correction arriving through `builtin_knowledge_base_write`
+//!   rather than through consolidation's own judgement.
 //!
 //! Every operation is scoped to a single user's partition. The one cross-user
 //! query is the sweep's "which users have tombstones" scan, which immediately
@@ -32,6 +35,7 @@
 //! its tombstones until a person frees them.
 
 use desktop_assistant_core::CoreError;
+use desktop_assistant_core::domain::{Disposition, SUMMARY_MAX_CHARS};
 use desktop_assistant_core::ports::auth::{UserId, current_user_id, with_user_id};
 use desktop_assistant_core::ports::knowledge::{RestoreOutcome, TrashEntry};
 use sqlx::{PgExecutor, PgPool};
@@ -179,23 +183,186 @@ async fn load_user_ids_with_trash(pool: &PgPool) -> Result<Vec<String>, CoreErro
 /// Bring a tombstoned entry back: live again, judged nothing, as if it had
 /// never been retired (#710).
 ///
-/// The specification is pinned by `crates/storage/tests/knowledge_restore.rs`.
-/// This is a deliberately wrong placeholder - it claims success without
-/// touching a row - so those tests fail on behaviour rather than on a
-/// missing symbol. The real implementation lands in the next commit.
-pub async fn restore_entry(_pool: &PgPool, _id: &str) -> Result<RestoreOutcome, CoreError> {
-    Ok(RestoreOutcome::Restored)
+/// **Disposition always resets to [`Disposition::Active`], whatever it was.**
+/// A prune tombstone reads `disposition = 'trivial'` (migration 056's
+/// backfill; a live one reads whatever consolidation or a person last set.
+/// Clearing only `deleted_at` would bring the row back still marked "not
+/// worth keeping" or "replaced" — visible again, but permanently demoted by a
+/// judgement the restore was supposed to undo. Restoring is a person's own
+/// override of that judgement (design doc section 3.2: "a person may set or
+/// clear anything"), so it goes all the way: `disposition`, its reason, and
+/// `superseded_by` are cleared together, in the one statement, and
+/// `restore_clears_the_delete_provenance_columns` pins a `trivial` tombstone
+/// specifically so this cannot regress to leaving the old verdict in place.
+///
+/// User-scoped by the ambient [`current_user_id`]. Zero rows touched is not
+/// one outcome: an id another user's tombstone holds, an id a live row
+/// already holds, and an id nobody has ever written all reach this call with
+/// nothing to update, and a person asking "bring back X" needs to be told
+/// which. The `UPDATE` runs first because it is the common case — an id
+/// naming this user's own tombstone — so an ordinary restore costs one
+/// statement; the existence check only runs when it touched nothing.
+pub async fn restore_entry(pool: &PgPool, id: &str) -> Result<RestoreOutcome, CoreError> {
+    let user_id = current_user_id();
+    let restored: Option<(String,)> = sqlx::query_as(
+        "UPDATE knowledge_base \
+         SET deleted_at = NULL, \
+             disposition = 'active', \
+             disposition_reason = NULL, \
+             superseded_by = NULL, \
+             updated_at = NOW() \
+         WHERE user_id = $1 AND id = $2 AND deleted_at IS NOT NULL \
+         RETURNING id",
+    )
+    .bind(user_id.as_str())
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| CoreError::Storage(format!("knowledge trash: restore failed: {e}")))?;
+
+    if restored.is_some() {
+        return Ok(RestoreOutcome::Restored);
+    }
+
+    // Nothing matched. Tell apart "this id names a live row" from "this id
+    // names nothing at all" — the first is a mistaken request, the second is
+    // evidence that is actually gone, and #710 asks that the two read
+    // differently rather than both landing on the same opaque zero.
+    let exists: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM knowledge_base WHERE user_id = $1 AND id = $2")
+            .bind(user_id.as_str())
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| {
+                CoreError::Storage(format!(
+                    "knowledge trash: restore existence check failed: {e}"
+                ))
+            })?;
+
+    Ok(if exists.is_some() {
+        RestoreOutcome::NotInTrash
+    } else {
+        RestoreOutcome::NoLongerExists
+    })
+}
+
+/// One tombstone row as [`search_trash`] reads it off the query, before it is
+/// shaped into the port's [`TrashEntry`].
+#[derive(sqlx::FromRow)]
+struct TombstoneRow {
+    id: String,
+    content: String,
+    disposition: String,
+    disposition_reason: Option<String>,
+    deleted_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Find tombstones by full text, for a person who knows roughly what they
 /// lost but not its id (#710).
 ///
-/// Specification pinned by `crates/storage/tests/knowledge_restore.rs`.
-/// Deliberately wrong: implemented in the next commit.
+/// FTS over the same `tsv` generated column every other knowledge search
+/// reads (migration 002), restricted to `deleted_at IS NOT NULL` — the live
+/// half of the store already has `builtin_knowledge_base_search`, and this
+/// exists so the trash is reachable by more than a remembered id.
+///
+/// User-scoped by the ambient [`current_user_id`], the same as every other
+/// read in this module.
 pub async fn search_trash(
-    _pool: &PgPool,
-    _query: &str,
-    _limit: usize,
+    pool: &PgPool,
+    query: &str,
+    limit: usize,
 ) -> Result<Vec<TrashEntry>, CoreError> {
-    Ok(vec![])
+    let user_id = current_user_id();
+    let rows: Vec<TombstoneRow> = sqlx::query_as(
+        "SELECT id, content, disposition, disposition_reason, deleted_at \
+         FROM knowledge_base \
+         WHERE user_id = $1 \
+           AND deleted_at IS NOT NULL \
+           AND tsv @@ plainto_tsquery('english', $2) \
+         ORDER BY ts_rank_cd(tsv, plainto_tsquery('english', $2)) DESC, deleted_at DESC \
+         LIMIT $3",
+    )
+    .bind(user_id.as_str())
+    .bind(query)
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| CoreError::Storage(format!("knowledge trash: search failed: {e}")))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| TrashEntry {
+            id: r.id,
+            content_excerpt: desktop_assistant_protocol::one_line(&r.content, SUMMARY_MAX_CHARS),
+            // The CHECK constraint means a row read back here can never
+            // actually carry an unrecognized spelling; `Active` is the parser's
+            // own documented fallback for a spelling nothing else can produce.
+            disposition: Disposition::parse(&r.disposition).unwrap_or_default(),
+            disposition_reason: r.disposition_reason,
+            deleted_at: r.deleted_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+        })
+        .collect())
+}
+
+/// Set a live entry's disposition directly — the "a person may set or clear
+/// anything" half of the vocabulary (design doc section 3.2), reached from
+/// `builtin_knowledge_base_write`'s optional `disposition` argument rather
+/// than from consolidation's own judgement, so "no, that is wrong" in
+/// conversation can land as [`Disposition::Refuted`] when the user says it.
+///
+/// Confined to the four dispositions that name no successor —
+/// [`Disposition::Active`], [`Disposition::Refuted`],
+/// [`Disposition::Obsolete`], [`Disposition::Trivial`]. [`Disposition::Superseded`]
+/// and [`Disposition::Redundant`] both require `superseded_by`, and this call
+/// carries no argument for one; consolidation's `merge_new`/`disposition` ops
+/// are what set those two, with the successor already in hand.
+///
+/// Live rows only (`deleted_at IS NULL`) — a tombstone's disposition is what
+/// [`restore_entry`] resets, not what this call reaches.
+pub async fn set_disposition(
+    pool: &PgPool,
+    id: &str,
+    disposition: Disposition,
+    reason: Option<&str>,
+) -> Result<(), CoreError> {
+    if matches!(
+        disposition,
+        Disposition::Superseded | Disposition::Redundant
+    ) {
+        return Err(CoreError::InvalidInput {
+            code: "knowledge_disposition_needs_a_successor",
+            description: format!(
+                "disposition '{}' names a successor entry via superseded_by, and this call \
+                 carries no argument for one",
+                disposition.as_str()
+            ),
+            message: "That disposition needs to name the entry that replaced this one, which \
+                      this write cannot do. Use 'refuted' or 'obsolete' instead."
+                .to_string(),
+        });
+    }
+
+    let user_id = current_user_id();
+    let touched = sqlx::query(
+        "UPDATE knowledge_base \
+         SET disposition = $1, disposition_reason = $2, updated_at = NOW() \
+         WHERE user_id = $3 AND id = $4 AND deleted_at IS NULL",
+    )
+    .bind(disposition.as_str())
+    .bind(reason)
+    .bind(user_id.as_str())
+    .bind(id)
+    .execute(pool)
+    .await
+    .map_err(|e| CoreError::Storage(format!("knowledge disposition: set failed: {e}")))?;
+
+    if touched.rows_affected() == 0 {
+        return Err(CoreError::InvalidInput {
+            code: "knowledge_entry_not_found",
+            description: format!("no live knowledge entry {id} for this user"),
+            message: "That entry does not exist, or it is not currently live.".to_string(),
+        });
+    }
+    Ok(())
 }
