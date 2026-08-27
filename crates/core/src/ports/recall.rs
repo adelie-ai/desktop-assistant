@@ -650,51 +650,10 @@ pub fn rank_by_activation<T, A>(
 where
     A: Activatable + ?Sized,
 {
-    // TODO(#1327): this is the old, standalone implementation, kept only so
-    // the pre-existing suite stays a meaningful pin while
-    // `rank_by_activation_traced` is spec'd below. It must become a thin
-    // delegation to `rank_by_activation_traced` - see
-    // `traced_and_untraced_ranking_agree_on_order`.
-    let weights = ActivationWeights::default();
-    let scored: Vec<Option<f64>> = candidates
-        .iter()
-        .map(|candidate| {
-            let hit = activatable(candidate);
-            hit.relevance().semantic_signal(dispersion).map(|semantic| {
-                crate::domain::activation::activation_terms(
-                    Some(semantic),
-                    hit.use_record(),
-                    hit.situation_coverage(situation),
-                    hit.salience_share(),
-                    hit.lexical(),
-                    now,
-                    &weights,
-                )
-                .total
-            })
-        })
-        .collect();
-
-    let with_signal = scored.iter().filter(|score| score.is_some()).count();
-    if mixed == MixedSet::Refuse && with_signal < scored.len() {
-        return candidates;
-    }
-
-    let mut measured: Vec<(f64, T)> = Vec::with_capacity(with_signal);
-    let mut unmeasured: Vec<T> = Vec::with_capacity(scored.len() - with_signal);
-    for (score, candidate) in scored.into_iter().zip(candidates) {
-        match score {
-            Some(score) => measured.push((score, candidate)),
-            None => unmeasured.push(candidate),
-        }
-    }
-    measured.sort_by(|left, right| right.0.total_cmp(&left.0));
-    let mut ranked: Vec<T> = measured
+    rank_by_activation_traced(candidates, activatable, dispersion, situation, now, mixed)
         .into_iter()
-        .map(|(_, candidate)| candidate)
-        .collect();
-    ranked.append(&mut unmeasured);
-    ranked
+        .map(|(candidate, _terms)| candidate)
+        .collect()
 }
 
 /// [`rank_by_activation`], keeping each candidate's [`ActivationTerms`]
@@ -767,10 +726,13 @@ where
             unmeasured.push((candidate, term));
         }
     }
-    // TODO(#1327): sort `measured` by `total`, best first (`total_cmp`, for a
-    // total order stable sort can trust). Left unsorted here on purpose -
-    // `traced_and_untraced_ranking_agree_on_order` is the named test that
-    // must catch this.
+    // `total_cmp` rather than `partial_cmp`, so the comparator is a total order
+    // and the sort cannot depend on which pair it happened to visit first. A
+    // score that is not a number cannot reach here on the block's path: the bar
+    // compares the same distance and a comparison against NaN is false, so such
+    // a candidate was never admitted.
+    measured.sort_by(|left, right| right.1.total.total_cmp(&left.1.total));
+
     measured.append(&mut unmeasured);
     measured
 }

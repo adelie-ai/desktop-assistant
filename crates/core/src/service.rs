@@ -1485,12 +1485,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
     /// correlation id - the same rule [`Self::persist_context_breakdown`]
     /// follows, and for the same reason: a plan keyed by a minted id would
     /// put a row in the log no client can ask for.
-    // TODO(#1327): a failing write must not fail the turn - fire-and-forget
-    // through `record_in_background`, like the offer record beside its call
-    // site. `persisting_the_plan_does_not_fail_the_turn_when_the_write_fails`
-    // states the contract; this awaits the write inline and propagates its
-    // error, which is the wrong shape on purpose.
-    async fn persist_context_plan(
+    fn persist_context_plan(
         &self,
         conversation_id: &ConversationId,
         prompt: &str,
@@ -1514,7 +1509,10 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         };
         let record = Arc::clone(record);
         let plan = plan.identify(request_id.to_string(), conversation_id.0.clone(), prompt);
-        record(plan).await.expect("TODO(#1327): must not propagate");
+        record_in_background(
+            "context_plan",
+            async move { record(plan).await.map(|()| 1) },
+        );
     }
 
     /// Seed a fresh turn's projection from the eviction decisions earlier turns
@@ -4024,15 +4022,11 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
             // feature unwired) still gets a row: `ContextPlan::no_lookup`
             // records that "no retrieval" is a fact about the turn, not a gap
             // in the log.
-            // TODO(#1327): a round with no plan at all (no anchor, or the
-            // feature unwired) must still persist a `ContextPlan::no_lookup`
-            // row - `a_turn_that_retrieved_nothing_persists_an_empty_plan_rather_than_no_record`
-            // states the contract.
-            if tool_rounds_since_anchor == 0
-                && let Some(plan) = assembled.context_plan.take()
-            {
-                self.persist_context_plan(conversation_id, &prompt, plan)
-                    .await;
+            if tool_rounds_since_anchor == 0 {
+                let plan = assembled.context_plan.take().unwrap_or_else(|| {
+                    ContextPlan::no_lookup(String::new(), conversation_id.0.clone())
+                });
+                self.persist_context_plan(conversation_id, &prompt, plan);
             }
             let llm_messages = assembled.messages;
             // The request, kept only when something is going to record it. A

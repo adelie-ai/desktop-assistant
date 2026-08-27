@@ -1046,7 +1046,6 @@ fn render_recall_with_width(surface: &RecallSurface<'_>, max_entries: usize) -> 
 /// What [`render_recall_with_width`] has already computed by the point it
 /// builds the plan, gathered into one value so the plan builder below takes
 /// one argument instead of a dozen (#1327).
-#[allow(dead_code)]
 struct RecallPass<'a> {
     surface: &'a RecallSurface<'a>,
     candidates: &'a RecallCandidates,
@@ -1074,10 +1073,12 @@ struct RecallPass<'a> {
 /// it. The caller that persists the plan fills those in; see
 /// [`ContextPlan::identify`].
 fn build_context_plan(pass: &RecallPass<'_>) -> ContextPlan {
-    // TODO(#1327): every arm's candidates are discarded. Named tests in this
-    // file's `mod tests` state the contract this must satisfy.
-    let mut plan_candidates: Vec<PlannedCandidate> = Vec::new();
-    let _ = pass;
+    let mut plan_candidates = Vec::with_capacity(
+        pass.candidates.entries.len() + pass.candidates.notes.len() + pass.candidates.skills.len(),
+    );
+    plan_candidates.extend(plan_entries(pass));
+    plan_candidates.extend(plan_notes(pass));
+    plan_candidates.extend(plan_skills(pass));
 
     let considered_count = plan_candidates.len();
     let truncated = considered_count > MAX_PLANNED_CANDIDATES;
@@ -1127,7 +1128,6 @@ fn build_context_plan(pass: &RecallPass<'_>) -> ContextPlan {
 }
 
 /// Every knowledge entry the lookup considered, ranked ones first.
-#[allow(dead_code)]
 fn plan_entries(pass: &RecallPass<'_>) -> Vec<PlannedCandidate> {
     let above_bar_ptrs: HashSet<*const RecallEntry> = pass
         .above_bar
@@ -1198,7 +1198,6 @@ fn plan_entries(pass: &RecallPass<'_>) -> Vec<PlannedCandidate> {
 /// not reordered by activation - so `rank` is always `None`, and every term
 /// but `semantic` reads as the "no signal" constant, honestly: no use record
 /// travels with a note.
-#[allow(dead_code)]
 fn plan_notes(pass: &RecallPass<'_>) -> Vec<PlannedCandidate> {
     let weights = ActivationWeights::default();
     pass.candidates
@@ -1252,7 +1251,6 @@ fn plan_notes(pass: &RecallPass<'_>) -> Vec<PlannedCandidate> {
 }
 
 /// Every catalog skill the lookup considered, ranked ones first.
-#[allow(dead_code)]
 fn plan_skills(pass: &RecallPass<'_>) -> Vec<PlannedCandidate> {
     let above_bar_ptrs: HashSet<*const RecallSkill> = pass
         .skills_above_bar
