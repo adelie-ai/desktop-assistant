@@ -1226,16 +1226,26 @@ impl KbSearchRow {
     }
 }
 
-/// A row's stored disposition, or [`Disposition::Active`] for a spelling no
+/// A row's stored disposition, or [`Disposition::Obsolete`] for a spelling no
 /// variant claims.
 ///
+/// `Active` is not a safe fallback: it is the one value that marks a claim
+/// live, and every other variant means some form of "do not treat this as
+/// current". Falling back to it would promote an unrecognized spelling -
+/// possibly a verb this build predates, written by a newer node in a rolling
+/// deploy - to a fact rendered as current. `Obsolete` is excluded from
+/// results by default, so an unrecognized spelling is withheld rather than
+/// shown, without asserting a specific claim (such as `Refuted`'s "this was
+/// established untrue") that the unrecognized spelling does not support.
+///
 /// The `knowledge_base_disposition_chk` CHECK constraint (migration 056)
-/// means a row this store reads can never actually carry an unrecognized
-/// spelling, so the fallback is not reachable in practice; it exists so a
-/// read path degrades to the safe default rather than panicking if it ever
-/// is.
+/// makes the fallback unreachable for a row written by this version against
+/// a database migrated to 056. It does not cover every row this store can
+/// read: an older binary reading a verb a newer one wrote during a rolling
+/// deploy, a read replica, or a restored backup. The fallback exists for
+/// those cases.
 fn parse_disposition(value: &str) -> Disposition {
-    Disposition::parse(value).unwrap_or(Disposition::Active)
+    Disposition::parse(value).unwrap_or(Disposition::Obsolete)
 }
 
 /// Fold a tag-census result into what the search page should report.
@@ -1375,6 +1385,37 @@ mod tests {
         assert!(
             RECALL_SCAN_STATEMENT_TIMEOUT > std::time::Duration::ZERO,
             "a zero timeout means no timeout at all in PostgreSQL"
+        );
+    }
+
+    /// A row can carry a spelling this build's `Disposition` does not name -
+    /// a verb a newer node wrote during a rolling deploy, or a restored
+    /// backup written by a version ahead of this one. Drives the actual read
+    /// path (`KbRow::into_entry`), not `Disposition::parse` in isolation:
+    /// the defect under test is the row mapping's choice of fallback, not
+    /// the parse itself. `Active` renders as a current fact, so a claim
+    /// established untrue by a verb this build cannot name must never come
+    /// out as `Active`.
+    #[test]
+    fn an_unrecognized_disposition_spelling_is_never_read_as_active() {
+        let row = KbRow {
+            id: "kb-1".to_string(),
+            content: "the office moves to the new building".to_string(),
+            tags: Vec::new(),
+            metadata: serde_json::Value::Null,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            source: None,
+            summary: None,
+            disposition: "contested".to_string(),
+        };
+
+        let entry = row.into_entry();
+
+        assert_ne!(
+            entry.disposition,
+            Disposition::Active,
+            "a spelling no variant claims must degrade to withheld, never to a live claim"
         );
     }
 }
