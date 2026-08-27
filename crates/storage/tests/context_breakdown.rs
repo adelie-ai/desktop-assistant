@@ -96,14 +96,23 @@ impl Fixture {
     }
 }
 
+/// The raw per-part figures a fixture writes, before they ever pass through
+/// [`PromptBreakdown`]. A test that wants to check conservation across the
+/// write/read round trip sums these directly, rather than reading the parts
+/// back out through the same accessor the code under test also uses to sum
+/// them - the latter would agree with a broken total by construction.
+fn part_figures() -> Vec<(PromptPart, u64)> {
+    PromptPart::ALL
+        .iter()
+        .enumerate()
+        .map(|(i, part)| (*part, (i as u64 + 1) * 100))
+        .collect()
+}
+
 /// A breakdown whose every part carries a different figure, so a slot written
 /// to the wrong column is visible rather than hidden behind equal values.
 fn parts() -> PromptBreakdown {
-    let figures = PromptPart::ALL
-        .iter()
-        .enumerate()
-        .map(|(i, part)| (*part, (i as u64 + 1) * 100));
-    PromptBreakdown::from_parts(figures, 7)
+    PromptBreakdown::from_parts(part_figures(), 7)
 }
 
 /// One record for `conversation_id`, at `turn_ordinal`, keyed by `request_id`.
@@ -297,9 +306,20 @@ async fn context_breakdown_reports_provider_used_tokens_beside_the_estimate() {
             Some(41_000),
             "the provider's own count is stored as the provider gave it"
         );
+        // The expected total is summed from the figures the fixture wrote,
+        // on the write side, before any of them touched a `PromptBreakdown`
+        // - never by reading the parts back out through `PromptBreakdown`'s
+        // own accessor and re-summing, which would agree with a broken total
+        // by construction (both walk the same backing array). Summing the
+        // fixture's own inputs instead means this assertion exercises the
+        // whole chain: fixture declares each part, the store writes it, the
+        // store reads it back, and only then does production code sum it -
+        // so a write that drops a part, a read that skips one, or a total
+        // that double-counts one all show up as a mismatch here.
+        let expected_total: u64 = part_figures().iter().map(|(_, tokens)| tokens).sum();
         assert_eq!(
             read.estimated_total_tokens(),
-            5_500,
+            expected_total,
             "the estimate is the sum of the measured parts and nothing else"
         );
         assert_ne!(
