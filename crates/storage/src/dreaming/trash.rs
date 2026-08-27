@@ -180,20 +180,33 @@ async fn load_user_ids_with_trash(pool: &PgPool) -> Result<Vec<String>, CoreErro
     Ok(rows.into_iter().map(|(u,)| u).collect())
 }
 
-/// Bring a tombstoned entry back: live again, judged nothing, as if it had
-/// never been retired (#710).
+/// Bring a tombstoned entry back: live again, as if it had never been
+/// retired - with one exception (#710).
 ///
-/// **Disposition always resets to [`Disposition::Active`], whatever it was.**
-/// A prune tombstone reads `disposition = 'trivial'` (migration 056's
-/// backfill; a live one reads whatever consolidation or a person last set.
-/// Clearing only `deleted_at` would bring the row back still marked "not
-/// worth keeping" or "replaced" — visible again, but permanently demoted by a
-/// judgement the restore was supposed to undo. Restoring is a person's own
-/// override of that judgement (design doc section 3.2: "a person may set or
-/// clear anything"), so it goes all the way: `disposition`, its reason, and
-/// `superseded_by` are cleared together, in the one statement, and
-/// `restore_clears_the_delete_provenance_columns` pins a `trivial` tombstone
-/// specifically so this cannot regress to leaving the old verdict in place.
+/// **Five of the six dispositions are curation judgements about the entry
+/// and reset to [`Disposition::Active`]; `refuted` is preserved.**
+/// `trivial`, `redundant`, `superseded`, `obsolete` and `active` all say how
+/// this *record* should be handled - whether it is worth surfacing, still
+/// current, or superseded by another row - and a restore is a person
+/// overriding that handling decision (design doc section 3.2: "a person may
+/// set or clear anything"), so all five reset together with their reason and
+/// `superseded_by` cleared. `refuted` is different in kind: it is a claim
+/// about the *world*, that what the entry asserts was established untrue.
+/// That claim does not stop being true because the row carrying it was
+/// undeleted. A non-person soft delete only ever touches `deleted_at`
+/// (`hard_delete_knowledge`'s `soft_delete_ids` path), so a `refuted` entry
+/// can end up in the trash with its refutation intact, and resetting it to
+/// `active` on restore would silently erase a person's own correction - the
+/// exact forgetting this wave's disposition vocabulary exists to prevent
+/// (design doc section 1: "a negative is instructive"), and worse here
+/// because it destroys the *person's* correction rather than the model's
+/// guess. So a `refuted` tombstone keeps its disposition and its reason;
+/// every other disposition resets. `superseded_by` clears unconditionally -
+/// `refuted` never carries one (the schema's own
+/// `knowledge_base_superseded_by_chk` forbids it), so clearing it costs
+/// nothing on that path and removes a stale successor link on every other.
+/// Pinned by `restoring_a_refuted_entry_keeps_the_refutation` - read that
+/// test before "simplifying" this back to an unconditional reset.
 ///
 /// User-scoped by the ambient [`current_user_id`]. Zero rows touched is not
 /// one outcome: an id another user's tombstone holds, an id a live row
@@ -207,8 +220,9 @@ pub async fn restore_entry(pool: &PgPool, id: &str) -> Result<RestoreOutcome, Co
     let restored: Option<(String,)> = sqlx::query_as(
         "UPDATE knowledge_base \
          SET deleted_at = NULL, \
-             disposition = 'active', \
-             disposition_reason = NULL, \
+             disposition = CASE WHEN disposition = 'refuted' THEN disposition ELSE 'active' END, \
+             disposition_reason = CASE WHEN disposition = 'refuted' THEN disposition_reason \
+                                        ELSE NULL END, \
              superseded_by = NULL, \
              updated_at = NOW() \
          WHERE user_id = $1 AND id = $2 AND deleted_at IS NOT NULL \

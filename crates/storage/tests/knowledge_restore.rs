@@ -23,9 +23,13 @@ mod support;
 use desktop_assistant_core::domain::KnowledgeEntry;
 use desktop_assistant_core::ports::knowledge::{KnowledgeBaseStore, RestoreOutcome};
 use desktop_assistant_storage::dreaming::{restore_entry, search_trash};
+use desktop_assistant_storage::embedding_backfill::{
+    BackfillEmbedFn, backfill_knowledge_embeddings,
+};
 use desktop_assistant_storage::knowledge_delete::KnowledgeDeletePolicy;
 use desktop_assistant_storage::{PgKnowledgeBaseStore, UserId, with_user_id};
 use sqlx::PgPool;
+use tokio_util::sync::CancellationToken;
 
 const ALICE: &str = "kb710-alice";
 const BOB: &str = "kb710-bob";
@@ -107,6 +111,15 @@ async fn needs_backfill(pool: &PgPool, id: &str, model: &str) -> bool {
     .fetch_one(pool)
     .await
     .expect("read backfill eligibility")
+}
+
+/// A fake embed function for driving the real backfill in a test: returns
+/// one fixed 3-dim vector per input text, and never touches the network.
+fn fake_embed_fn() -> BackfillEmbedFn {
+    Box::new(|texts: Vec<String>| {
+        let out: Vec<Vec<f32>> = texts.iter().map(|_| vec![0.1_f32, 0.2, 0.3]).collect();
+        Box::pin(async move { Ok(out) })
+    })
 }
 
 async fn row_exists(pool: &PgPool, id: &str) -> bool {
@@ -243,6 +256,30 @@ async fn restoring_an_entry_with_a_cleared_vector_reembeds_rather_than_resurrect
         "a restored entry with a cleared vector must stay eligible for the embedding backfill"
     );
 
+    // Drive the real backfill and check the "reembeds" half the name
+    // promises, not only the "does not resurrect a wrong vector" half:
+    // the row must come out carrying a fresh vector stamped with the
+    // current model, not stay permanently unembedded.
+    let embed = fake_embed_fn();
+    let updated =
+        backfill_knowledge_embeddings(pool, &embed, "current-model", &CancellationToken::new())
+            .await
+            .expect("backfill");
+    assert_eq!(
+        updated, 1,
+        "the restored row must be the one row the backfill embeds"
+    );
+
+    let (has_embedding, model): (bool, Option<String>) = sqlx::query_as(
+        "SELECT embedding IS NOT NULL, embedding_model FROM knowledge_base WHERE id = $1",
+    )
+    .bind("stale-vector")
+    .fetch_one(pool)
+    .await
+    .expect("read embedded row");
+    assert!(has_embedding, "the backfill must have written a vector");
+    assert_eq!(model.as_deref(), Some("current-model"));
+
     fx.cleanup().await;
 }
 
@@ -294,15 +331,19 @@ async fn restore_clears_the_delete_provenance_columns() {
         .await
         .expect("read restored row");
 
-    // The disposition decision: restore always resets to `active`, whatever
-    // verdict the tombstone carried. Leaving a restored row demoted (still
-    // 'trivial', still pointing at a successor) would mean a person who went
-    // to the trouble of finding and restoring it got back an entry flagged
-    // "not worth keeping" the moment it reappeared - the opposite of what
-    // restoring it means.
+    // The disposition decision: a curation verb ('redundant', here) always
+    // resets to `active` on restore, whatever verdict the tombstone carried.
+    // Leaving a restored row demoted (still 'redundant', still pointing at a
+    // successor) would mean a person who went to the trouble of finding and
+    // restoring it got back an entry flagged "not worth keeping" the moment
+    // it reappeared - the opposite of what restoring it means. `refuted` is
+    // the one exception to this reset, because it is a claim about the world
+    // rather than a curation verdict about the record - see
+    // `restoring_a_refuted_entry_keeps_the_refutation` below and
+    // `restore_entry`'s own doc comment.
     assert_eq!(
         disposition, "active",
-        "restore must clear the disposition, not just deleted_at"
+        "restore must clear a curation disposition, not just deleted_at"
     );
     assert_eq!(
         reason, None,
@@ -311,6 +352,61 @@ async fn restore_clears_the_delete_provenance_columns() {
     assert_eq!(
         successor, None,
         "a restored row must not still point at a successor"
+    );
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn restoring_a_refuted_entry_keeps_the_refutation() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    let pool = &fx.pool;
+    let store = PgKnowledgeBaseStore::new(pool.clone(), KnowledgeDeletePolicy::default());
+
+    write_entry(&store, ALICE, "corrected", "the meeting is on Thursday").await;
+    // A non-person soft delete only ever touches `deleted_at`
+    // (`hard_delete_knowledge`'s `soft_delete_ids` path), so a `refuted`
+    // entry can land in the trash with its refutation fully intact - this is
+    // exactly that shape. `refuted` never carries a `superseded_by` (the
+    // schema forbids it), so this only ever tests the disposition and its
+    // reason.
+    tombstone(
+        pool,
+        "corrected",
+        "refuted",
+        Some("the user said this was wrong; it is actually Friday"),
+        None,
+    )
+    .await;
+
+    let outcome = with_user_id(UserId::new(ALICE), async {
+        restore_entry(pool, "corrected").await
+    })
+    .await
+    .expect("restore succeeds");
+    assert_eq!(outcome, RestoreOutcome::Restored);
+
+    let (disposition, reason): (String, Option<String>) =
+        sqlx::query_as("SELECT disposition, disposition_reason FROM knowledge_base WHERE id = $1")
+            .bind("corrected")
+            .fetch_one(pool)
+            .await
+            .expect("read restored row");
+
+    // `refuted` is a claim about the world, not a curation verdict about the
+    // record: a restore reviving the row must not silently erase a person's
+    // own correction. If this regresses to an unconditional reset, the
+    // assertion below fails with `disposition == "active"`.
+    assert_eq!(
+        disposition, "refuted",
+        "restoring a refuted entry must not erase the refutation"
+    );
+    assert_eq!(
+        reason.as_deref(),
+        Some("the user said this was wrong; it is actually Friday"),
+        "the stated refutation reason must survive the restore"
     );
 
     fx.cleanup().await;
@@ -427,6 +523,52 @@ async fn tombstones_are_searchable_by_full_text_without_knowing_the_id() {
         !hit.deleted_at.is_empty(),
         "a trash result must carry when it was retired"
     );
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn search_trash_is_user_scoped_a_second_tenant_finds_nothing() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    let pool = &fx.pool;
+    let store = PgKnowledgeBaseStore::new(pool.clone(), KnowledgeDeletePolicy::default());
+
+    write_entry(
+        &store,
+        ALICE,
+        "alices-tombstone",
+        "the printer driver needs a manual restart",
+    )
+    .await;
+    tombstone(pool, "alices-tombstone", "trivial", None, None).await;
+
+    // Bob searches for words that match Alice's tombstone exactly. Restore
+    // already has a cross-tenant test
+    // (`restore_is_user_scoped_a_second_tenant_cannot_restore_anothers_tombstone`);
+    // this is the equivalent for the search half - nothing but a person
+    // reading the SQL was checking that `search_trash` carries the same
+    // `user_id` guard before this test existed.
+    let bobs_hits = with_user_id(UserId::new(BOB), async {
+        search_trash(pool, "printer driver", 10).await
+    })
+    .await
+    .expect("search_trash succeeds");
+    assert!(
+        bobs_hits.is_empty(),
+        "another tenant's tombstone must never appear in a search: {bobs_hits:?}"
+    );
+
+    // Alice still finds her own, so the guard is scoping and not merely
+    // breaking the query.
+    let alices_hits = with_user_id(UserId::new(ALICE), async {
+        search_trash(pool, "printer driver", 10).await
+    })
+    .await
+    .expect("search_trash succeeds");
+    assert_eq!(alices_hits.len(), 1);
+    assert_eq!(alices_hits[0].id, "alices-tombstone");
 
     fx.cleanup().await;
 }
