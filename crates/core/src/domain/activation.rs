@@ -512,6 +512,13 @@ pub const NO_SALIENCE: f64 = 0.0;
 /// Widening this back to `pub` reopens that door, so if a caller outside this
 /// crate needs to rank, give it an `Activatable` implementation rather than
 /// this function.
+///
+/// **Test-only from #1327 on.** [`rank_by_activation_traced`](crate::ports::recall::rank_by_activation_traced)
+/// reads [`activation_terms`] directly, so this scalar form has no production
+/// caller left; it stays as the fixture the arithmetic tests below and in
+/// [`crate::domain::replay`] pin their expectations against, and
+/// [`activation_terms`] is what it now delegates to.
+#[cfg(test)]
 pub(crate) fn activation(
     semantic: f64,
     record: Option<&KnowledgeUseRecord>,
@@ -521,12 +528,105 @@ pub(crate) fn activation(
     now: DateTime<Utc>,
     weights: &ActivationWeights,
 ) -> f64 {
+    activation_terms(
+        Some(semantic),
+        record,
+        situation_coverage,
+        salience_share,
+        lexical,
+        now,
+        weights,
+    )
+    .total
+}
+
+/// The [`ActivationWeights`] shape a stored [`ActivationTerms`] was scored
+/// under, bumped whenever a term is added or a term's meaning changes.
+///
+/// A stored row's `weights` travel with this string (#1327) so a reader
+/// comparing an old turn's terms against today's ranking knows whether the two
+/// are the same computation or a different one wearing the same field names.
+pub const ACTIVATION_SCORER_VERSION: &str = "1327-v1";
+
+/// One candidate's activation score, kept broken out by term (#1327).
+///
+/// [`crate::ports::recall::rank_by_activation_traced`] is the only place this
+/// is built, and [`activation`] reads its [`Self::total`] rather than
+/// recomputing one - so the number a reader is shown and the number the
+/// ranking used are the same value, not two computations that are supposed to
+/// agree.
+///
+/// Every field but `semantic` and `total` is a plain deviation, never
+/// negative except where the term's own weight function says a negative mark
+/// may carry through (see [`ActivationWeights::reinforcement`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ActivationTerms {
+    /// How many of its own source's median absolute deviations the candidate
+    /// stands below that source's median, or `None` for a candidate with no
+    /// semantic signal - a full-text match, which carries a match instead of a
+    /// distance (see [`RecallRelevance::semantic_signal`] in
+    /// `crate::ports::recall`).
+    pub semantic: Option<f64>,
+    /// How much of the query's own words the candidate carries, and how far
+    /// its source lets anything stand out for that query (#1239). Zero for
+    /// every candidate on the recall path today, which carries no full-text
+    /// arm - recorded rather than assumed, so a reader sees that the term ran
+    /// and answered zero, not that it never ran.
+    pub lexical: f64,
+    /// What the use log's base-level sum is worth, in deviations (#1123).
+    pub reinforcement: f64,
+    /// How much of what the present situation could have told us about this
+    /// candidate it did tell us (#1125), in deviations.
+    pub situation: f64,
+    /// How much of the salience information this build can detect the
+    /// candidate carries (#1127), in deviations.
+    pub salience: f64,
+    /// `semantic.unwrap_or(0.0) + lexical + reinforcement + situation +
+    /// salience` - what [`rank_by_activation`](crate::ports::recall::rank_by_activation)
+    /// sorts by.
+    pub total: f64,
+}
+
+/// Compute every term of one candidate's activation score, so the score and
+/// its record are one computation (#1327).
+///
+/// `semantic` is `None` for a candidate with no semantic signal to add - see
+/// [`ActivationTerms::semantic`]. The other four terms are computed
+/// regardless, because a candidate that never carried a semantic reading can
+/// still have used the store, been marked, or matched the situation, and the
+/// plan this feeds records what each term actually answered rather than
+/// leaving it blank for want of one input.
+///
+/// [`activation`] is this function's `total`, over a `semantic` that is
+/// always `Some` - every caller of `activation` already has a distance to
+/// read, so its signature keeps that value required rather than optional.
+pub(crate) fn activation_terms(
+    semantic: Option<f64>,
+    record: Option<&KnowledgeUseRecord>,
+    situation_coverage: f64,
+    salience_share: f64,
+    lexical: LexicalMatch,
+    now: DateTime<Utc>,
+    weights: &ActivationWeights,
+) -> ActivationTerms {
     let sum = record.map_or(0.0, |record| record.use_sum(now, &weights.use_score));
-    semantic
-        + weights.lexical(lexical)
-        + weights.reinforcement(sum)
-        + weights.situation(situation_coverage)
-        + weights.salience(salience_share)
+    let lexical_term = weights.lexical(lexical);
+    let reinforcement_term = weights.reinforcement(sum);
+    let situation_term = weights.situation(situation_coverage);
+    let salience_term = weights.salience(salience_share);
+    let total = semantic.unwrap_or(0.0)
+        + lexical_term
+        + reinforcement_term
+        + situation_term
+        + salience_term;
+    ActivationTerms {
+        semantic,
+        lexical: lexical_term,
+        reinforcement: reinforcement_term,
+        situation: situation_term,
+        salience: salience_term,
+        total,
+    }
 }
 
 #[cfg(test)]

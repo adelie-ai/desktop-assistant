@@ -58,6 +58,11 @@ pub mod tool_usage;
 // so this stays a plain comment: a `///` here would merge with that header and
 // resolve its links against THIS module.
 pub mod context_breakdown;
+// One in-memory record per turn of what the `[Recall]` lookup considered, how
+// each candidate scored by activation term, and which it offered (#1327). The
+// module carries its own `//!` header, for the same reason `context_breakdown`
+// does.
+pub mod context_plan;
 pub mod transcript;
 pub mod transport;
 pub mod turn_capability;

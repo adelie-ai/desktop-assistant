@@ -582,6 +582,12 @@ pub(crate) struct AssembledTurn {
     /// the order it rendered them (#1154). Reported for the same reason, and
     /// recorded against the skill use log rather than the knowledge one.
     pub recalled_skill_names: Vec<String>,
+    /// What the recall lookup considered this turn, and how each candidate
+    /// scored (#1327). `None` on any round but a turn's first, and also on a
+    /// first round that ran no lookup at all - the service layer is what
+    /// turns that second case into a `recall_ran: false` record, because only
+    /// it knows the turn's identity.
+    pub context_plan: Option<crate::ports::context_plan::ContextPlan>,
     /// What each part of this prompt cost, in estimated tokens (#1203).
     ///
     /// Reported rather than re-derived, for the reason the ids above are: only
@@ -660,6 +666,7 @@ pub(crate) fn assemble_turn_within_budget(
         window_from: window_start(conversation.messages, max),
         recalled_entry_ids: pass.recalled_entry_ids,
         recalled_skill_names: pass.recalled_skill_names,
+        context_plan: pass.context_plan,
         breakdown: pass.breakdown,
     };
 
@@ -1301,6 +1308,7 @@ fn assemble_turn(
         messages,
         recalled_entry_ids: surfaced.recalled_entry_ids,
         recalled_skill_names: surfaced.recalled_skill_names,
+        context_plan: surfaced.context_plan,
         breakdown,
     }
 }
@@ -1316,6 +1324,8 @@ struct TurnMessages {
     recalled_entry_ids: Vec<String>,
     /// See [`AssembledTurn::recalled_skill_names`].
     recalled_skill_names: Vec<String>,
+    /// See [`AssembledTurn::context_plan`].
+    context_plan: Option<crate::ports::context_plan::ContextPlan>,
     /// See [`AssembledTurn::breakdown`]. Carries every part but the tool
     /// schemas, which are the same on every pass of the shrink loop and are
     /// filled in by the wrapper.
@@ -1409,6 +1419,8 @@ struct SurfacedBlocks {
     recalled_entry_ids: Vec<String>,
     /// See [`AssembledTurn::recalled_skill_names`].
     recalled_skill_names: Vec<String>,
+    /// See [`AssembledTurn::context_plan`].
+    context_plan: Option<crate::ports::context_plan::ContextPlan>,
 }
 
 /// Build the per-turn `[..]` system messages that re-surface durable context so
@@ -1456,6 +1468,7 @@ fn surfaced_blocks(
     let mut blocks = Vec::new();
     let mut recalled_entry_ids = Vec::new();
     let mut recalled_skill_names = Vec::new();
+    let mut context_plan = None;
 
     // Ambient "now": a tiny, always-present line giving the assistant a sense of
     // the current date/time without spending a `builtin_sys_props` tool round.
@@ -1614,7 +1627,8 @@ fn surfaced_blocks(
             },
             ..surface
         };
-        if let Some(recall) = crate::recall::render_recall(&surface) {
+        let outcome = crate::recall::render_recall(&surface);
+        if let Some(recall) = outcome.block {
             blocks.push(SurfacedBlock::new(
                 PromptPart::Recall,
                 format!("[Recall] {}", recall.text),
@@ -1622,10 +1636,12 @@ fn surfaced_blocks(
             recalled_entry_ids = recall.entry_ids;
             recalled_skill_names = recall.skill_names;
         }
+        context_plan = Some(outcome.plan);
     }
 
     SurfacedBlocks {
         blocks,
+        context_plan,
         recalled_entry_ids,
         recalled_skill_names,
     }
