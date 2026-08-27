@@ -329,14 +329,16 @@ pub async fn apply_ops(
         // cross-tenant collision is not expected, but the guard costs
         // nothing and turns an impossible case into a silent no-op rather
         // than a cross-tenant write.
-        //
-        // TODO(#893): write the new row - not yet implemented. `AND FALSE`
-        // makes this insert nothing while keeping the statement (and its
-        // binds) real, so the query itself stays exercised.
         sqlx::query(
             "INSERT INTO knowledge_base \
                 (id, user_id, content, tags, metadata, source, review_generation, reviewed_at) \
-             SELECT $1, $2, $3, $4, $5, $6, $7, NOW() WHERE FALSE",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) \
+             ON CONFLICT (id) DO UPDATE SET \
+                content = EXCLUDED.content, tags = EXCLUDED.tags, \
+                metadata = EXCLUDED.metadata, source = EXCLUDED.source, \
+                review_generation = EXCLUDED.review_generation, \
+                reviewed_at = NOW(), updated_at = NOW() \
+             WHERE knowledge_base.user_id = $2",
         )
         .bind(&new_id)
         .bind(user_id.as_str())
@@ -391,7 +393,7 @@ pub async fn apply_ops(
                  updated_at = NOW(), \
                  reviewed_at = NOW(), \
                  review_generation = LEAST(review_generation + 1, $2) \
-             WHERE user_id = $4 AND id = $3 AND deleted_at IS NULL AND TRUE /* TODO(#893): settled-entry SQL backstop */",
+             WHERE user_id = $4 AND id = $3 AND deleted_at IS NULL AND review_generation < $2",
         )
         .bind(&new_content)
         .bind(MAX_REVIEW_GENERATION)
@@ -449,10 +451,7 @@ pub async fn apply_ops(
     // Standalone dispositions: nothing supersedes them but a superseded or
     // redundant target, so the model's stated reason (and, for those two, the
     // successor) is the record of why the entry now reads the way it does.
-    // TODO(#893): apply standalone dispositions - not yet implemented.
-    for (id, disposition, reason, superseded_by) in
-        buffer.standalone_dispositions().into_iter().take(0)
-    {
+    for (id, disposition, reason, superseded_by) in buffer.standalone_dispositions() {
         // Scope guard: two facts about disjoint, non-empty scopes cannot
         // contradict each other, so a refuted/superseded/redundant
         // disposition naming a target is refused when the scopes share
