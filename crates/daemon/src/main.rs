@@ -1713,6 +1713,49 @@ async fn main() -> Result<()> {
         }));
     }
 
+    // `builtin_knowledge_base_restore` (#710): restoring a tombstone by id,
+    // and finding one by full text. These are free functions over the pool
+    // (`dreaming::restore_entry`/`search_trash`), not `KnowledgeBaseStore`
+    // trait methods - restore is reached only through this tool, not the
+    // client protocol every store implementer must answer.
+    if let Some(pool) = pg_pool.as_ref() {
+        let restore_pool = pool.clone();
+        let search_trash_pool = pool.clone();
+        builtin_tools = builtin_tools.with_knowledge_restore(
+            Arc::new(move |id| {
+                let pool = restore_pool.clone();
+                Box::pin(async move {
+                    desktop_assistant_storage::dreaming::restore_entry(&pool, &id).await
+                })
+            }),
+            Arc::new(move |query, limit| {
+                let pool = search_trash_pool.clone();
+                Box::pin(async move {
+                    desktop_assistant_storage::dreaming::search_trash(&pool, &query, limit).await
+                })
+            }),
+        );
+
+        // The optional `disposition` argument on `builtin_knowledge_base_write`
+        // (design doc section 3.2 of #694's wave-1 plan): a person's own
+        // correction, reached through the write tool rather than
+        // consolidation's judgement.
+        let disposition_pool = pool.clone();
+        builtin_tools =
+            builtin_tools.with_knowledge_disposition(Arc::new(move |id, disposition, reason| {
+                let pool = disposition_pool.clone();
+                Box::pin(async move {
+                    desktop_assistant_storage::dreaming::set_disposition(
+                        &pool,
+                        &id,
+                        disposition,
+                        reason.as_deref(),
+                    )
+                    .await
+                })
+            }));
+    }
+
     // The use log behind the knowledge tools (#698): a search records what it
     // put in front of the model, a read by id records the offers it takes up,
     // and `builtin_knowledge_base_mark` records a judgement.

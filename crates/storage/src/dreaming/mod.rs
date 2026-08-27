@@ -27,6 +27,9 @@
 //! 6. **Trash sweep** (frequent, cheap, no LLM) — frees soft-deleted entries
 //!    past their retention window. Deliberately independent of the passes
 //!    above: see `trash` and [`sweep_expired_trash`].
+//! 7. **Restore** (on demand, no LLM) — brings a tombstoned entry back, and
+//!    finds one by full text without knowing its id (#710). See `trash`,
+//!    [`restore_entry`] and [`search_trash`].
 
 mod archival;
 mod common;
@@ -47,7 +50,10 @@ use crate::knowledge_delete::KnowledgeDeletePolicy;
 
 pub use misfiled::{MAX_SWEPT_ENTRIES_PER_CYCLE, MisfiledStats, run_misfiled_sweep_phase};
 pub use summarize::{SummaryStats, run_summary_phase};
-pub use trash::{empty_trash, reap_expired_trash, sweep_expired_trash, trash_count};
+pub use trash::{
+    empty_trash, reap_expired_trash, restore_entry, search_trash, set_disposition,
+    sweep_expired_trash, trash_count,
+};
 pub use types::{
     BackfillEmbedFn, ConsolidationStats, Disposition, DreamingLlmFn, KnowledgeChangeFn,
     MAX_DELETE_REASON_CHARS, MAX_REVIEW_GENERATION, MAX_SUMMARIES_PER_CYCLE, SOFT_DELETE_TTL_DAYS,

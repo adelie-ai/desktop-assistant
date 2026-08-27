@@ -290,6 +290,76 @@ pub type KnowledgeDeleteFn = Arc<
         + Sync,
 >;
 
+/// What a restore attempt found (#710).
+///
+/// Not a trait method on [`KnowledgeBaseStore`]: restore is reached only
+/// through the trash tool, not the client protocol every store implementer
+/// must answer, so it stays a free function on the storage side
+/// (`desktop_assistant_storage::dreaming::restore_entry`) wired through
+/// [`KnowledgeRestoreFn`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreOutcome {
+    /// The tombstone came back: live again, [`crate::domain::Disposition`]
+    /// reset to `Active`, and the delete provenance cleared.
+    Restored,
+    /// The id names a row, but it was never in the trash - there was nothing
+    /// to restore.
+    NotInTrash,
+    /// The id names no row at all: hard-reaped, or it never existed.
+    NoLongerExists,
+}
+
+/// Boxed async closure that restores one tombstone by id.
+pub type KnowledgeRestoreFn = Arc<
+    dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<RestoreOutcome, CoreError>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// One tombstone [`KnowledgeSearchTrashFn`] found: enough to recognise the
+/// entry and decide whether to restore it, without resolving its id first.
+#[derive(Debug, Clone)]
+pub struct TrashEntry {
+    pub id: String,
+    /// A one-line excerpt, not the full body - the same shape
+    /// [`KnowledgeEntry::display_line`] gives a live entry in a list.
+    pub content_excerpt: String,
+    pub disposition: crate::domain::Disposition,
+    pub disposition_reason: Option<String>,
+    /// When the entry was retired, formatted the same way
+    /// [`KnowledgeEntry::created_at`] is.
+    pub deleted_at: String,
+}
+
+/// Boxed async closure that searches the current user's trash by full text.
+pub type KnowledgeSearchTrashFn = Arc<
+    dyn Fn(
+            String,
+            usize,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<TrashEntry>, CoreError>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Boxed async closure that sets a live entry's disposition directly - the
+/// "a person may set or clear anything" half of the vocabulary (design doc
+/// section 3.2 of #694's wave-1 plan), reached from
+/// `builtin_knowledge_base_write`'s optional `disposition` argument rather
+/// than from consolidation's own judgement.
+///
+/// Args: `(id, disposition, reason)`. Confined by the implementation to the
+/// dispositions that name no successor - `Superseded` and `Redundant` both
+/// require a linked entry, and this call carries no argument for one.
+pub type KnowledgeSetDispositionFn = Arc<
+    dyn Fn(
+            String,
+            crate::domain::Disposition,
+            Option<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), CoreError>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// A tag the knowledge-base write tool proposes, with the one-line description
 /// the model gave for what the tag means.
 ///

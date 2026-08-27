@@ -496,6 +496,11 @@ pub const CLASSIFIED_SOURCES: &[ClassifiedSource] = &[
             // use log, which nothing renders back into a prompt, so a tainted
             // turn's mark cannot carry text to a later one.
             tool("builtin_knowledge_base_mark", Mutate, Trusted),
+            // Brings a retired entry back to a live read path, or searches
+            // the trash for one - either way it is durable state a later,
+            // clean turn reads back, so it is gated the same as the write
+            // tool it complements (#710).
+            tool("builtin_knowledge_base_restore", Mutate, Trusted),
             tool("builtin_tool_search", Read, Trusted),
             tool("builtin_notify", Present, Trusted),
             tool("builtin_sys_props", Read, Trusted),
@@ -1295,6 +1300,7 @@ mod tests {
         // built-ins that change durable state or run code
         ("builtin_knowledge_base_write", Mutate, Trusted),
         ("builtin_knowledge_base_delete", Mutate, Trusted),
+        ("builtin_knowledge_base_restore", Mutate, Trusted),
         ("builtin_db_query", Mutate, Trusted),
         ("builtin_mcp_control", Execution, Trusted),
         ("builtin_scratchpad_write", Mutate, Trusted),
@@ -1975,6 +1981,7 @@ mod tests {
             "builtin_scratchpad_pin",
             "builtin_scratchpad_delete",
             "builtin_knowledge_base_write",
+            "builtin_knowledge_base_restore",
             "builtin_db_query",
         ] {
             assert!(

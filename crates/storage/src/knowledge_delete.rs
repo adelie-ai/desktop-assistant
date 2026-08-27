@@ -21,7 +21,10 @@
 //!   place, so one degraded answer cannot restate everything it was shown.
 //! - `require_person_for_hard_delete` refuses a hard delete that no person
 //!   asked for. Who asked is read from
-//!   [`DeleteInitiator`], not from which function was called.
+//!   [`DeleteInitiator`], not from which function was called. It governs the
+//!   retention reap and emptying the trash; a delete by id from anyone but a
+//!   person never reaches this flag at all any more (#710) — see
+//!   [`hard_delete_knowledge`]'s own doc.
 //! - `trash_retention_days` is how long a tombstone is kept.
 //!
 //! ## What a refusal is
@@ -303,6 +306,19 @@ impl HardDeleteOutcome {
 /// caller, so a path added later inherits the refusal without knowing the
 /// guard exists.
 ///
+/// **A delete by id (`HardDeleteTarget::Ids`) from anyone but a person never
+/// reaches this far (#710).** `builtin_knowledge_base_delete` is the model's
+/// own tool, and with no restore path a wrong call there destroyed evidence
+/// permanently, whatever the policy said — a refusal only ever protected a
+/// row from the *reap*, never from the tool that could erase it outright the
+/// same turn. Now that a tombstone can be brought back
+/// ([`crate::dreaming::restore_entry`]), a non-person delete by id is routed
+/// to the trash instead, in `soft_delete_ids`, before the policy is even
+/// consulted. `ExpiredTombstones` and `AllTombstones` are unaffected: they
+/// are the retention reap and the "empty the trash" control, and both already
+/// mean the row's fate is decided — reaping only ever touches what a person
+/// declined to restore.
+///
 /// `call_path` names the caller for the refusal record, in
 /// `module::function` form.
 ///
@@ -320,6 +336,13 @@ where
     E: PgExecutor<'e>,
 {
     let initiator = current_delete_initiator();
+
+    if let HardDeleteTarget::Ids(ids) = target
+        && !initiator.is_person()
+    {
+        return soft_delete_ids(executor, user_id, ids, call_path).await;
+    }
+
     if !policy.allows(initiator) {
         let (entry_ids, total) = rows_that_would_go(executor, user_id, target, policy).await?;
         return Ok(HardDeleteOutcome {
@@ -365,6 +388,45 @@ where
 
     Ok(HardDeleteOutcome {
         removed: removed.rows_affected(),
+        refusal: None,
+    })
+}
+
+/// Retire rows by id to the trash instead of erasing them (#710), for a
+/// delete nobody in particular asked for.
+///
+/// Only `deleted_at` is touched. Content, tags, and disposition all stay
+/// exactly as they were, so [`crate::dreaming::restore_entry`] can put the
+/// row back unchanged. This never refuses: the whole point is that it is
+/// reversible, so [`KnowledgeDeletePolicy::require_person_for_hard_delete`]
+/// has nothing to guard here any more — it still governs
+/// `ExpiredTombstones` and `AllTombstones`, which really do destroy rows.
+///
+/// Rows already in the trash, and ids naming no row this user owns, are
+/// silently excluded from the count — the same "a no-op on an id that does
+/// not resolve" contract [`hard_delete_knowledge`] gives its own callers.
+async fn soft_delete_ids<'e, E>(
+    executor: E,
+    user_id: &str,
+    ids: &[String],
+    call_path: &'static str,
+) -> Result<HardDeleteOutcome, CoreError>
+where
+    E: PgExecutor<'e>,
+{
+    let touched = sqlx::query(
+        "UPDATE knowledge_base \
+         SET deleted_at = NOW() \
+         WHERE user_id = $1 AND id = ANY($2) AND deleted_at IS NULL",
+    )
+    .bind(user_id)
+    .bind(ids)
+    .execute(executor)
+    .await
+    .map_err(|e| CoreError::Storage(format!("knowledge soft delete failed ({call_path}): {e}")))?;
+
+    Ok(HardDeleteOutcome {
+        removed: touched.rows_affected(),
         refusal: None,
     })
 }
