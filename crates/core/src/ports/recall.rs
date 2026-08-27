@@ -63,7 +63,7 @@ use std::sync::Arc;
 use crate::CoreError;
 use crate::domain::KnowledgeEntry;
 use crate::domain::activation::{
-    ActivationWeights, LexicalMatch, NO_SALIENCE, NO_SITUATION, activation,
+    ActivationTerms, ActivationWeights, LexicalMatch, NO_SALIENCE, NO_SITUATION, activation_terms,
 };
 use crate::domain::knowledge_use::KnowledgeUseRecord;
 use crate::domain::salience::{SalienceReading, SalienceSource};
@@ -650,52 +650,80 @@ pub fn rank_by_activation<T, A>(
 where
     A: Activatable + ?Sized,
 {
+    rank_by_activation_traced(candidates, activatable, dispersion, situation, now, mixed)
+        .into_iter()
+        .map(|(candidate, _terms)| candidate)
+        .collect()
+}
+
+/// [`rank_by_activation`], keeping each candidate's [`ActivationTerms`]
+/// alongside it (#1327).
+///
+/// **One computation, two readers.** [`rank_by_activation`] delegates here and
+/// drops the terms, so the order it returns and the terms a caller reads off
+/// this function can never drift apart - they are the same sort over the same
+/// values. A caller building a record of what the ranking saw calls this
+/// instead of re-deriving the score from [`Activatable`] a second time, which
+/// is exactly the second implementation the module header warns against.
+///
+/// Every candidate gets an [`ActivationTerms`], including one with no semantic
+/// signal - the terms besides `semantic` are computed for it too, because a
+/// candidate the block does not rank on may still have been used, marked, or
+/// matched the situation, and a record of what it scored should say so rather
+/// than leave it blank.
+pub fn rank_by_activation_traced<T, A>(
+    candidates: Vec<T>,
+    activatable: impl Fn(&T) -> &A,
+    dispersion: RecallDispersion,
+    situation: Option<&SituationCue>,
+    now: chrono::DateTime<chrono::Utc>,
+    mixed: MixedSet,
+) -> Vec<(T, ActivationTerms)>
+where
+    A: Activatable + ?Sized,
+{
     let weights = ActivationWeights::default();
-    let scored: Vec<Option<f64>> = candidates
+    let terms: Vec<ActivationTerms> = candidates
         .iter()
         .map(|candidate| {
             let hit = activatable(candidate);
-            // The semantic signal is read first and the rest inside the `map`,
-            // so a candidate with no signal - which no score will be built for -
-            // pays for none of the other terms. A salience reading lowercases
-            // the whole body.
-            hit.relevance().semantic_signal(dispersion).map(|semantic| {
-                activation(
-                    semantic,
-                    hit.use_record(),
-                    hit.situation_coverage(situation),
-                    hit.salience_share(),
-                    hit.lexical(),
-                    now,
-                    &weights,
-                )
-            })
+            let semantic = hit.relevance().semantic_signal(dispersion);
+            activation_terms(
+                semantic,
+                hit.use_record(),
+                hit.situation_coverage(situation),
+                hit.salience_share(),
+                hit.lexical(),
+                now,
+                &weights,
+            )
         })
         .collect();
 
-    let with_signal = scored.iter().filter(|score| score.is_some()).count();
-    if mixed == MixedSet::Refuse && with_signal < scored.len() {
+    let with_signal = terms.iter().filter(|term| term.semantic.is_some()).count();
+    if mixed == MixedSet::Refuse && with_signal < terms.len() {
         // A set of all lexical candidates is the ordinary degraded lookup and
         // says nothing new. A *mixed* set means an adapter fused two modes into
         // one list, which no adapter does today and which silently turns this
         // ranking off - so it is worth a line rather than a shrug.
         if with_signal > 0 {
             tracing::debug!(
-                candidates = scored.len(),
+                candidates = terms.len(),
                 with_semantic_signal = with_signal,
                 "recall: a mixed candidate set carries no one order, so activation ranking is \
                  off for this block"
             );
         }
-        return candidates;
+        return candidates.into_iter().zip(terms).collect();
     }
 
-    let mut measured: Vec<(f64, T)> = Vec::with_capacity(with_signal);
-    let mut unmeasured: Vec<T> = Vec::with_capacity(scored.len() - with_signal);
-    for (score, candidate) in scored.into_iter().zip(candidates) {
-        match score {
-            Some(score) => measured.push((score, candidate)),
-            None => unmeasured.push(candidate),
+    let mut measured: Vec<(T, ActivationTerms)> = Vec::with_capacity(with_signal);
+    let mut unmeasured: Vec<(T, ActivationTerms)> = Vec::with_capacity(terms.len() - with_signal);
+    for (candidate, term) in candidates.into_iter().zip(terms) {
+        if term.semantic.is_some() {
+            measured.push((candidate, term));
+        } else {
+            unmeasured.push((candidate, term));
         }
     }
     // `total_cmp` rather than `partial_cmp`, so the comparator is a total order
@@ -703,14 +731,10 @@ where
     // score that is not a number cannot reach here on the block's path: the bar
     // compares the same distance and a comparison against NaN is false, so such
     // a candidate was never admitted.
-    measured.sort_by(|left, right| right.0.total_cmp(&left.0));
+    measured.sort_by(|left, right| right.1.total.total_cmp(&left.1.total));
 
-    let mut ranked: Vec<T> = measured
-        .into_iter()
-        .map(|(_, candidate)| candidate)
-        .collect();
-    ranked.append(&mut unmeasured);
-    ranked
+    measured.append(&mut unmeasured);
+    measured
 }
 
 /// One scratchpad note offered as a recall candidate (#1101).
@@ -979,5 +1003,52 @@ mod tests {
         // A row further out than the median scores negative, which no bar
         // admits.
         assert!(source.deviations_below_median(0.90) < 0.0);
+    }
+
+    /// A distance-relevance entry at a stated distance (#1327 fixtures).
+    fn entry_at(id: &str, distance: f64) -> RecallEntry {
+        let entry = crate::domain::KnowledgeEntry::new(id, "body", vec!["topic".to_string()]);
+        RecallEntry::new(entry, RecallRelevance::Distance(distance))
+    }
+
+    /// Acceptance (#1327): [`rank_by_activation`] is a thin wrapper over
+    /// [`rank_by_activation_traced`] that drops the terms, so the two cannot
+    /// disagree on order - they are the same sort. This is a regression pin
+    /// against someone re-splitting the two implementations, not evidence
+    /// that two independent computations agree: there is only ever one
+    /// computation here.
+    #[test]
+    fn traced_and_untraced_ranking_agree_on_order() {
+        let source = a_source();
+        let now = chrono::Utc::now();
+        let candidates = vec![
+            entry_at("kb-mid", 0.55),
+            entry_at("kb-near", 0.30),
+            // Two at the same distance, to exercise the tie-break too.
+            entry_at("kb-tie-a", 0.60),
+            entry_at("kb-tie-b", 0.60),
+            entry_at("kb-far", 0.79),
+        ];
+
+        let untraced = rank_by_activation(
+            candidates.clone(),
+            |c| c,
+            source,
+            None,
+            now,
+            MixedSet::Refuse,
+        );
+        let untraced_ids: Vec<&str> = untraced.iter().map(|c| c.entry.id.as_str()).collect();
+
+        let traced =
+            rank_by_activation_traced(candidates, |c| c, source, None, now, MixedSet::Refuse);
+        let traced_ids: Vec<&str> = traced.iter().map(|(c, _)| c.entry.id.as_str()).collect();
+
+        assert_eq!(
+            untraced_ids, traced_ids,
+            "the traced and untraced rankers must return one order"
+        );
+        // Every candidate here carries a distance, so every term is `Some`.
+        assert!(traced.iter().all(|(_, terms)| terms.semantic.is_some()));
     }
 }

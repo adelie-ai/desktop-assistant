@@ -20,6 +20,7 @@ use crate::planning::{self, StepStack};
 use crate::ports::auth::current_user_id;
 use crate::ports::client_tools::current_client_tools;
 use crate::ports::context_breakdown::{ContextBreakdown, ContextBreakdownRecordFn};
+use crate::ports::context_plan::{ContextPlan, ContextPlanOpenedFn, ContextPlanRecordFn};
 use crate::ports::conversation_ctx::with_conversation_id;
 use crate::ports::inbound::ConversationService;
 use crate::ports::knowledge::KnowledgeGetManyFn;
@@ -679,6 +680,16 @@ pub struct ConversationHandler<S, L, T = NoopToolExecutor> {
     /// keyed by the turn's correlation id. `None` - no database - records
     /// nothing and changes no turn.
     record_context_breakdown: Option<ContextBreakdownRecordFn>,
+    /// Optional write for the per-turn context plan (#1327): every candidate
+    /// the `[Recall]` lookup considered, scored by term. Set means the first
+    /// round of every turn leaves one record of what retrieval saw, keyed by
+    /// the turn's correlation id. `None` - no database - records nothing and
+    /// changes no turn.
+    record_context_plan: Option<ContextPlanRecordFn>,
+    /// Optional append for an id the model opens after the plan's first write
+    /// (#1327). Wired with [`Self::record_context_plan`]; a deployment that
+    /// keeps no plan needs no append either.
+    context_plan_opened: Option<ContextPlanOpenedFn>,
     /// Maximum byte length of a tool result the model reads inline (issue
     /// #1302). Over this the round reads the head and a notice, and the row
     /// keeps every byte. Defaults to [`DEFAULT_MAX_TOOL_RESULT_BYTES`];
@@ -766,6 +777,8 @@ impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
             record_burn: None,
             extinguish_burns: None,
             record_context_breakdown: None,
+            record_context_plan: None,
+            context_plan_opened: None,
             scratchpad_list: None,
             scratchpad_delete_subtree: None,
             scratchpad_release_references: None,
@@ -992,6 +1005,8 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             record_burn: None,
             extinguish_burns: None,
             record_context_breakdown: None,
+            record_context_plan: None,
+            context_plan_opened: None,
             scratchpad_list: None,
             scratchpad_delete_subtree: None,
             scratchpad_release_references: None,
@@ -1018,6 +1033,26 @@ impl<S, L, T> ConversationHandler<S, L, T> {
     /// not part of it.
     pub fn with_context_breakdown_recorder(mut self, record: ContextBreakdownRecordFn) -> Self {
         self.record_context_breakdown = Some(record);
+        self
+    }
+
+    /// Wire the per-turn context-plan record (#1327).
+    ///
+    /// Additive: without it the `[Recall]` lookup ranks and renders exactly as
+    /// before, and the plan it built in memory is dropped rather than kept. A
+    /// write that fails never fails the turn - see `persist_context_plan`.
+    pub fn with_context_plan_recorder(mut self, record: ContextPlanRecordFn) -> Self {
+        self.record_context_plan = Some(record);
+        self
+    }
+
+    /// Wire the opened-append for the context plan (#1327): called once per
+    /// id the model fetches during a turn, so a plan gains its `opened`
+    /// entries after the initial write. Wired with
+    /// [`Self::with_context_plan_recorder`]; setting one without the other
+    /// leaves a plan whose `opened` array never grows.
+    pub fn with_context_plan_opened_recorder(mut self, record: ContextPlanOpenedFn) -> Self {
+        self.context_plan_opened = Some(record);
         self
     }
 
@@ -1437,6 +1472,47 @@ impl<S, L, T> ConversationHandler<S, L, T> {
                  itself is unaffected"
             );
         }
+    }
+
+    /// Record this turn's context plan (#1327): every candidate the
+    /// `[Recall]` lookup considered, scored by term, keyed by the turn's
+    /// correlation id.
+    ///
+    /// Fire-and-forget through [`record_in_background`], on the same terms
+    /// the offer record beside its call site is: the write must not add to
+    /// the turn's latency, and a failed write must not fail the turn. Skipped
+    /// with a debug line when no recorder is wired or the turn carries no
+    /// correlation id - the same rule [`Self::persist_context_breakdown`]
+    /// follows, and for the same reason: a plan keyed by a minted id would
+    /// put a row in the log no client can ask for.
+    fn persist_context_plan(
+        &self,
+        conversation_id: &ConversationId,
+        prompt: &str,
+        plan: ContextPlan,
+    ) {
+        let Some(record) = &self.record_context_plan else {
+            return;
+        };
+        let request_id = current_request_id();
+        let Some(request_id) = request_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
+            tracing::debug!(
+                conversation_id = %conversation_id.0,
+                "the turn carries no correlation id, so its context plan has \
+                 no key to be recorded under"
+            );
+            return;
+        };
+        let record = Arc::clone(record);
+        let plan = plan.identify(request_id.to_string(), conversation_id.0.clone(), prompt);
+        record_in_background(
+            "context_plan",
+            async move { record(plan).await.map(|()| 1) },
+        );
     }
 
     /// Seed a fresh turn's projection from the eviction decisions earlier turns
@@ -3937,6 +4013,20 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 record_in_background("recall_skills_offered", async move {
                     record(scope, offered).await
                 });
+            }
+            // The context plan (#1327): every candidate the lookup considered
+            // this turn, whether or not it was offered. Same first-round gate
+            // as the offers above, for the same reason - the plan describes
+            // what the block's one lookup saw, and a later round did not run
+            // one. A round that ran no lookup at all (no anchor, or the
+            // feature unwired) still gets a row: `ContextPlan::no_lookup`
+            // records that "no retrieval" is a fact about the turn, not a gap
+            // in the log.
+            if tool_rounds_since_anchor == 0 {
+                let plan = assembled.context_plan.take().unwrap_or_else(|| {
+                    ContextPlan::no_lookup(String::new(), conversation_id.0.clone())
+                });
+                self.persist_context_plan(conversation_id, &prompt, plan);
             }
             let llm_messages = assembled.messages;
             // The request, kept only when something is going to record it. A
@@ -11945,6 +12035,89 @@ mod tests {
         for _ in 0..16 {
             tokio::task::yield_now().await;
         }
+    }
+
+    // --- the context plan (#1327) --------------------------------------------
+
+    /// Every plan the turn recorded, in order.
+    type PlanProbe = Arc<Mutex<Vec<crate::ports::context_plan::ContextPlan>>>;
+
+    fn recording_plan_log() -> (crate::ports::context_plan::ContextPlanRecordFn, PlanProbe) {
+        let seen: PlanProbe = Arc::new(Mutex::new(Vec::new()));
+        let probe = Arc::clone(&seen);
+        let log: crate::ports::context_plan::ContextPlanRecordFn = Arc::new(move |plan| {
+            let probe = Arc::clone(&probe);
+            Box::pin(async move {
+                probe.lock().unwrap().push(plan);
+                Ok(())
+            })
+        });
+        (log, seen)
+    }
+
+    /// Run one turn under a fixed correlation id, so a recorder keyed by it
+    /// has something to key under (#1327) - see `persist_context_plan`.
+    /// Panics if the turn does not complete, which is itself the assertion
+    /// for a test whose only interest is that a failing write did not fail
+    /// the turn.
+    async fn send_prompt_with_request_id<F>(prompt: &str, wire: F)
+    where
+        F: FnOnce(
+            ConversationHandler<MockStore, MockLlm>,
+        ) -> ConversationHandler<MockStore, MockLlm>,
+    {
+        let handler = wire(ConversationHandler::new(
+            MockStore::new(),
+            MockLlm::new(vec!["done"]),
+            id_gen(),
+        ));
+        let conv = handler
+            .create_conversation("Test".into(), vec![])
+            .await
+            .unwrap();
+        crate::ports::turn_telemetry::with_request_id("req-1".to_string(), async {
+            handler
+                .send_prompt(&conv.id, prompt.into(), noop_callback(), noop_status())
+                .await
+                .expect("the turn completes")
+        })
+        .await;
+        settle_recording().await;
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_retrieved_nothing_persists_an_empty_plan_rather_than_no_record() {
+        let (log, plans) = recording_plan_log();
+        // No `with_recall_search` at all: the turn's first round renders no
+        // recall surface, the case this test names.
+        send_prompt_with_request_id("thanks", |h| h.with_context_plan_recorder(log)).await;
+
+        let plans = plans.lock().unwrap().clone();
+        assert_eq!(
+            plans.len(),
+            1,
+            "the row still exists even though nothing was looked up: {plans:?}"
+        );
+        assert!(!plans[0].recall_ran);
+        assert!(plans[0].candidates.is_empty());
+        assert_eq!(plans[0].considered_count, 0);
+        assert!(!plans[0].truncated);
+    }
+
+    #[tokio::test]
+    async fn persisting_the_plan_does_not_fail_the_turn_when_the_write_fails() {
+        let failing: crate::ports::context_plan::ContextPlanRecordFn = Arc::new(move |_plan| {
+            Box::pin(async move { Err(CoreError::Storage("the plan store is down".into())) })
+        });
+
+        // `send_prompt_with_request_id` panics if the turn does not complete,
+        // so reaching the end of this test is the assertion: a failing
+        // recorder must not fail the turn.
+        send_prompt_with_request_id("where does the registry live?", |h| {
+            h.with_recall_search(recall_hit())
+                .with_context_plan_recorder(failing)
+        })
+        .await;
     }
 
     #[tokio::test]
