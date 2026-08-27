@@ -2131,17 +2131,18 @@ impl BuiltinToolService {
             .entries
             .into_iter()
             .map(|entry| {
-                // The hybrid search this tool runs now admits a `refuted` row
-                // (#893) - it must never come back as an unmarked fact. The
-                // marker is prefixed on the content itself, the same shared
-                // helper `KnowledgeEntry::display_line` uses for the
-                // `[Recall]` block, so a caller reading only `content` still
-                // meets it.
-                let marker = entry.disposition.marker();
+                // The hybrid search this tool runs now admits a non-active
+                // row (#893) - it must never come back as an unmarked fact,
+                // on either field a caller might read instead of the other.
+                // `marked_text` marks content and summary from one call, the
+                // same shared helper the `[Recall]` block, the by-id fetch
+                // and the browse list all go through, so a caller reading
+                // either field still meets it.
+                let marked = entry.marked_text(None);
                 serde_json::json!({
                     "id": entry.id,
-                    "content": format!("{marker}{}", entry.content),
-                    "summary": entry.summary,
+                    "content": marked.content,
+                    "summary": marked.summary,
                     "tags": entry.tags,
                     "metadata": entry.metadata,
                     "updated_at": entry.updated_at,
@@ -2631,17 +2632,16 @@ impl BuiltinToolService {
             .entries
             .into_iter()
             .map(|entry| {
-                // `list` filters only on `deleted_at` (#893): a refuted row's
-                // `deleted_at` is NULL by construction, so this browse read
-                // reaches it exactly as it reaches an active one. The marker
-                // is the only thing standing between that and an unmarked
-                // claim, so it goes through the same shared helper the search
-                // tool and the by-id fetch do.
-                let marker = entry.disposition.marker();
+                // `list` filters only on `deleted_at` (#893): a non-active
+                // row's `deleted_at` is NULL by construction, so this browse
+                // read reaches it exactly as it reaches an active one.
+                // `marked_text` marks content and summary from one call, so
+                // neither field can go out unmarked while the other does.
+                let marked = entry.marked_text(None);
                 serde_json::json!({
                     "id": entry.id,
-                    "content": format!("{marker}{}", entry.content),
-                    "summary": entry.summary,
+                    "content": marked.content,
+                    "summary": marked.summary,
                     "tags": entry.tags,
                     "metadata": entry.metadata,
                     "source": entry.source,
@@ -3709,16 +3709,17 @@ fn required_string(args: &serde_json::Value, key: &str) -> Result<String, CoreEr
 /// it holds the whole entry, which is the claim every other read of this store
 /// makes too.
 fn kb_get_row(entry: &KnowledgeEntry, content: &str, content_truncated: bool) -> serde_json::Value {
-    // A fetch by id reaches whatever disposition the row carries (#893) - this
-    // read has never filtered on it - so a refuted entry named by a search
-    // result or a `[Recall]` line still comes back here, and must carry the
-    // same marker those surfaces do. `Disposition::marker` is the one shared
-    // helper every surface routes through.
-    let content = format!("{}{content}", entry.disposition.marker());
+    // A fetch by id reaches whatever disposition the row carries (#893) -
+    // this read has never filtered on it - so a non-active entry named by a
+    // search result or a `[Recall]` line still comes back here, and must
+    // carry the same marker those surfaces do, on `summary` as well as
+    // `content`. `marked_text` marks both from one call, so this cannot mark
+    // one and forget the other the way two independent field reads could.
+    let marked = entry.marked_text(Some(content));
     let mut row = serde_json::json!({
         "id": entry.id,
-        "content": content,
-        "summary": entry.summary,
+        "content": marked.content,
+        "summary": marked.summary,
         "tags": entry.tags,
         "metadata": entry.metadata,
         "source": entry.source,
@@ -8854,6 +8855,53 @@ mod tests {
         );
     }
 
+    /// Acceptance (#893): `summary` is model-writable and is the concise
+    /// canonical rendering of an entry - exactly what a caller reads
+    /// *instead of* `content`. A response that marked `content` and left
+    /// `summary` raw would hand the model an untrue claim, unmarked, sitting
+    /// beside the marked one - the bug this test exists to catch.
+    #[tokio::test]
+    async fn kb_search_marks_the_summary_field_too_not_only_content() {
+        let mut refuted = kb_entry("kb-refuted", &["fact"]);
+        refuted.disposition = desktop_assistant_core::domain::Disposition::Refuted;
+        refuted.summary = Some("the annex parking rule".to_string());
+        let mut active = kb_entry("kb-active", &["fact"]);
+        active.summary = Some("the annex parking rule".to_string());
+
+        let (service, _probe) = kb_service_reporting(KnowledgeSearchPage {
+            entries: vec![refuted, active],
+            scope_size: ScopeSize::Few,
+            available_tags: Vec::new(),
+        });
+
+        let json = kb_search_response(&service, serde_json::json!({"query": "parking"})).await;
+
+        let results = json["results"].as_array().expect("results is an array");
+        let refuted_summary = results
+            .iter()
+            .find(|r| r["id"] == "kb-refuted")
+            .expect("the refuted entry is in the page")["summary"]
+            .as_str()
+            .expect("summary is a string")
+            .to_string();
+        let active_summary = results
+            .iter()
+            .find(|r| r["id"] == "kb-active")
+            .expect("the active entry is in the page")["summary"]
+            .as_str()
+            .expect("summary is a string")
+            .to_string();
+
+        assert!(
+            refuted_summary.starts_with("recorded, later refuted: "),
+            "a refuted result's summary must carry the marker too: {refuted_summary}"
+        );
+        assert_eq!(
+            active_summary, "the annex parking rule",
+            "an active result's summary must carry no marker at all"
+        );
+    }
+
     #[tokio::test]
     async fn kb_list_carries_the_summary() {
         let mut entry = kb_entry("kb-1", &["preference"]);
@@ -8917,6 +8965,53 @@ mod tests {
         assert_eq!(
             active_content, "the annex parking rule",
             "an active entry must carry no marker at all"
+        );
+    }
+
+    /// Acceptance (#893): the browse list marks `summary` too, on the same
+    /// grounds `kb_search_marks_the_summary_field_too_not_only_content`
+    /// states - a caller reading `summary` instead of `content` must meet
+    /// the same claim, marked the same way.
+    #[tokio::test]
+    async fn kb_list_marks_the_summary_field_too_not_only_content() {
+        let mut refuted = kb_entry("kb-refuted", &["fact"]);
+        refuted.disposition = desktop_assistant_core::domain::Disposition::Refuted;
+        refuted.summary = Some("the annex parking rule".to_string());
+        let mut active = kb_entry("kb-active", &["fact"]);
+        active.summary = Some("the annex parking rule".to_string());
+
+        let service = kb_service_listing(vec![refuted, active]);
+
+        let raw = service
+            .execute_tool(TOOL_KB_LIST, serde_json::json!({"limit": 10}))
+            .await
+            .expect("knowledge base list succeeds");
+        let json: serde_json::Value = serde_json::from_str(&raw).expect("list response is JSON");
+
+        let entries = json["entries"].as_array().expect("entries is an array");
+        let refuted_summary = entries
+            .iter()
+            .find(|e| e["id"] == "kb-refuted")
+            .expect("the refuted entry is listed")["summary"]
+            .as_str()
+            .expect("summary is a string")
+            .to_string();
+        let active_summary = entries
+            .iter()
+            .find(|e| e["id"] == "kb-active")
+            .expect("the active entry is listed")["summary"]
+            .as_str()
+            .expect("summary is a string")
+            .to_string();
+
+        assert!(
+            refuted_summary.starts_with("recorded, later refuted: "),
+            "a refuted entry's summary in the browse list must carry the marker: \
+             {refuted_summary}"
+        );
+        assert_eq!(
+            active_summary, "the annex parking rule",
+            "an active entry's summary must carry no marker at all"
         );
     }
 
@@ -9518,6 +9613,50 @@ mod tests {
         assert_eq!(
             active_content, "the durable fact behind kb-active",
             "an active entry must carry no marker at all"
+        );
+    }
+
+    /// Acceptance (#893): the by-id fetch marks `summary` too, on the same
+    /// grounds `kb_search_marks_the_summary_field_too_not_only_content`
+    /// states. `kb_full_entry` already writes a summary for every entry, so
+    /// this needs no fixture of its own.
+    #[tokio::test]
+    async fn kb_get_marks_the_summary_field_too_not_only_content() {
+        let mut refuted = kb_full_entry("kb-refuted");
+        refuted.disposition = desktop_assistant_core::domain::Disposition::Refuted;
+        let active = kb_full_entry("kb-active");
+
+        let (service, _probe) = kb_service_holding(vec![refuted, active]);
+
+        let json = kb_get_response(
+            &service,
+            serde_json::json!({"ids": ["kb-refuted", "kb-active"]}),
+        )
+        .await;
+
+        let entries = json["entries"].as_array().expect("entries is an array");
+        let refuted_summary = entries
+            .iter()
+            .find(|e| e["id"] == "kb-refuted")
+            .expect("the refuted entry resolved")["summary"]
+            .as_str()
+            .expect("summary is a string")
+            .to_string();
+        let active_summary = entries
+            .iter()
+            .find(|e| e["id"] == "kb-active")
+            .expect("the active entry resolved")["summary"]
+            .as_str()
+            .expect("summary is a string")
+            .to_string();
+
+        assert!(
+            refuted_summary.starts_with("recorded, later refuted: "),
+            "a refuted entry's summary fetched by id must carry the marker: {refuted_summary}"
+        );
+        assert_eq!(
+            active_summary, "one line about kb-active",
+            "an active entry's summary must carry no marker at all"
         );
     }
 

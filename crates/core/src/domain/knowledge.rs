@@ -86,29 +86,54 @@ impl Disposition {
     /// What a rendered line must be prefixed with before it shows this
     /// disposition's content, or the empty string where nothing is owed.
     ///
-    /// **The one shared render helper** (#893). A `refuted` entry must never
-    /// be shown as a current fact, and a marker in the text is the only
-    /// enforcement point that reaches every surface: [`KnowledgeEntry::display_line`]
-    /// calls it for the `[Recall]` block and the knowledge browser, and the
-    /// knowledge-base search tool calls it for the same reason on the content
-    /// it returns to the model. One function, so a surface that forgot to
-    /// check the disposition still shows the marker, because the marker is
-    /// already part of the text it renders.
+    /// **The one shared render helper** (#893), and the safety net for every
+    /// path retrieval does not resolve. Search resolves an admitted
+    /// `superseded`/`redundant` id to its successor and excludes `obsolete`
+    /// by default, so those three verbs are rare there - but
+    /// `KnowledgeBaseStore::get`/`list`, the by-id fetch tool, and the
+    /// `[Pinned]` block all read a row's `content` straight off it, with no
+    /// admission or resolution logic at all. A pinned entry a later
+    /// consolidation pass marks `superseded` renders forever afterward
+    /// unless the marker itself says so at the point of rendering, because
+    /// nothing else in that path ever looks again. So every disposition but
+    /// `active` and `trivial` answers a real marker here, not only
+    /// `refuted`: a marker every path can rely on beats a resolution only
+    /// some paths perform.
     ///
-    /// Every other disposition answers the empty string here. `superseded`
-    /// and `redundant` are never shown under their own id - retrieval
-    /// resolves them to their successor before a caller ever sees them - and
-    /// `obsolete` is excluded by default; the two remaining live cases,
-    /// `active` and `trivial`, are both ordinary content that needs no
-    /// warning label.
+    /// `trivial` answers the empty string on purpose - it is a curation
+    /// judgement about worth surfacing, not a claim about whether the
+    /// content is still true, so it carries no warning.
+    ///
+    /// [`KnowledgeEntry::display_line`] calls this for the `[Recall]` block,
+    /// the `[Pinned]` block and the knowledge browser;
+    /// [`KnowledgeEntry::marked_text`] calls it for the knowledge-base tools
+    /// (search, get, list) so `content` and `summary` can never disagree
+    /// about whether they carry it.
     pub const fn marker(self) -> &'static str {
         match self {
             Self::Refuted => "recorded, later refuted: ",
-            Self::Active | Self::Superseded | Self::Redundant | Self::Obsolete | Self::Trivial => {
-                ""
-            }
+            Self::Superseded | Self::Redundant => "superseded, see its successor: ",
+            Self::Obsolete => "no longer applies: ",
+            Self::Active | Self::Trivial => "",
         }
     }
+}
+
+/// [`KnowledgeEntry::content`] and [`KnowledgeEntry::summary`] as a reader
+/// must see them (#893): both carrying the entry's own
+/// [`Disposition::marker`], from the same call, so a caller that reads one
+/// field instead of the other - or both - never meets an unmarked claim
+/// beside a marked one.
+///
+/// A caller with a field to add later - a title, an excerpt - joins it here
+/// rather than reading `entry.content` or `entry.summary` directly at a new
+/// call site, which is the shape that let `summary` go out unmarked while
+/// `content` carried the marker: two call sites agreeing to remember the
+/// same rule, rather than one call site the rule cannot be read around.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkedText {
+    pub content: String,
+    pub summary: Option<String>,
 }
 
 /// A unified knowledge base entry, replacing separate preferences and memory stores.
@@ -216,6 +241,26 @@ impl KnowledgeEntry {
             "{marker}{}",
             desktop_assistant_protocol::one_line(source, budget)
         )
+    }
+
+    /// This entry's content and summary, both carrying this entry's own
+    /// disposition marker (#893) - see [`MarkedText`].
+    ///
+    /// `content_override` replaces the entry's own content in the pair, for
+    /// a caller that has already cut it to fit a response budget (the
+    /// by-id fetch tool does this); the summary is always the entry's own
+    /// whole summary, because it is bounded by [`SUMMARY_MAX_CHARS`] at the
+    /// point it is written and never cut again at render time. `None`
+    /// answers no summary at all - the marker cannot conjure one that was
+    /// never written, and a caller must keep telling that apart from an
+    /// empty string.
+    pub fn marked_text(&self, content_override: Option<&str>) -> MarkedText {
+        let marker = self.disposition.marker();
+        let content = content_override.unwrap_or(&self.content);
+        MarkedText {
+            content: format!("{marker}{content}"),
+            summary: self.summary.as_deref().map(|s| format!("{marker}{s}")),
+        }
     }
 }
 
@@ -433,23 +478,100 @@ mod tests {
         assert!(entry.display_line().starts_with(EXPECTED_REFUTED_MARKER));
     }
 
-    /// Every disposition but `refuted` renders with no marker at all - stated
-    /// exhaustively so a new variant added later has to answer this rather
-    /// than silently inheriting whichever arm the match falls into.
+    /// Acceptance (#893): `marked_text` marks content and summary from one
+    /// call, so a caller that emits both - the knowledge-base tools do -
+    /// cannot mark one and leave the other raw. This is the property the
+    /// summary-bypass finding was about: content and summary must agree on
+    /// whether they carry the marker, and the only way to guarantee that is
+    /// for one function to answer both.
     #[test]
-    fn only_refuted_carries_a_marker() {
-        for disposition in Disposition::ALL {
-            let expected = if disposition == Disposition::Refuted {
-                "recorded, later refuted: "
-            } else {
-                ""
-            };
+    fn marked_text_marks_both_content_and_summary_from_one_call() {
+        let mut entry = KnowledgeEntry::new("kb-1", "the annex parking rule", vec![]);
+        entry.disposition = Disposition::Refuted;
+        entry.summary = Some("annex parking".to_string());
+
+        let marked = entry.marked_text(None);
+
+        assert_eq!(
+            marked.content,
+            "recorded, later refuted: the annex parking rule"
+        );
+        assert_eq!(
+            marked.summary,
+            Some("recorded, later refuted: annex parking".to_string())
+        );
+    }
+
+    /// The negative half: an active entry's marked text carries no marker on
+    /// either field, so the marker means something when it appears on both.
+    #[test]
+    fn marked_text_of_an_active_entry_marks_neither_field() {
+        let mut entry = KnowledgeEntry::new("kb-1", "the annex parking rule", vec![]);
+        entry.summary = Some("annex parking".to_string());
+
+        let marked = entry.marked_text(None);
+
+        assert_eq!(marked.content, "the annex parking rule");
+        assert_eq!(marked.summary, Some("annex parking".to_string()));
+    }
+
+    /// A `content_override` - the by-id fetch tool cuts content to a byte
+    /// budget before this is called - is marked in place of the entry's own
+    /// content; the summary is unaffected, because it is not what was cut.
+    #[test]
+    fn marked_text_marks_a_content_override_not_the_entrys_own_content() {
+        let mut entry = KnowledgeEntry::new("kb-1", "the whole long body", vec![]);
+        entry.disposition = Disposition::Refuted;
+
+        let marked = entry.marked_text(Some("the whole long"));
+
+        assert_eq!(marked.content, "recorded, later refuted: the whole long");
+    }
+
+    /// An entry with no summary answers `None`, marked or not - the marker
+    /// cannot conjure a summary that was never written, and a caller must
+    /// still be able to tell "no summary" from "an empty one".
+    #[test]
+    fn marked_text_of_an_entry_with_no_summary_answers_none() {
+        let mut entry = KnowledgeEntry::new("kb-1", "the annex parking rule", vec![]);
+        entry.disposition = Disposition::Refuted;
+
+        assert_eq!(entry.marked_text(None).summary, None);
+    }
+
+    /// Every disposition's marker, stated exhaustively so a new variant
+    /// added later has to answer this rather than silently inheriting
+    /// whichever arm the match falls into (#893). Only `active` and
+    /// `trivial` carry none - `trivial` is a curation judgement, not a
+    /// claim about truth, so it needs no warning.
+    #[test]
+    fn every_dispositions_marker_matches_its_own_meaning() {
+        for (disposition, expected) in [
+            (Disposition::Active, ""),
+            (Disposition::Refuted, "recorded, later refuted: "),
+            (Disposition::Superseded, "superseded, see its successor: "),
+            (Disposition::Redundant, "superseded, see its successor: "),
+            (Disposition::Obsolete, "no longer applies: "),
+            (Disposition::Trivial, ""),
+        ] {
             assert_eq!(
                 disposition.marker(),
                 expected,
                 "{disposition:?} must answer the marker this test states, or nothing"
             );
         }
+    }
+
+    /// The exhaustive table above covers every variant `Disposition::ALL`
+    /// lists - if a variant were added to the enum and not to the table,
+    /// this would still compile and the new variant would go unchecked.
+    #[test]
+    fn the_marker_table_covers_every_disposition() {
+        assert_eq!(
+            Disposition::ALL.len(),
+            6,
+            "a variant was added; add it to every_dispositions_marker_matches_its_own_meaning too"
+        );
     }
 
     /// The domain type's marker and the wire view's answer identically over
@@ -461,7 +583,7 @@ mod tests {
     /// `KnowledgeEntryView::display_line` calls on the other side of the
     /// wire.
     #[test]
-    fn the_domain_and_wire_refuted_markers_agree() {
+    fn the_domain_and_wire_markers_agree_for_every_disposition() {
         for disposition in Disposition::ALL {
             assert_eq!(
                 disposition.marker(),

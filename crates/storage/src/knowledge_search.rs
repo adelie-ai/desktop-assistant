@@ -338,6 +338,15 @@ pub(crate) fn rank_page(
 /// terminal's own state is what decides visibility, not the state of the id
 /// that led there.
 ///
+/// **A dangling `superseded_by` fails safe.** `superseded_by` carries no
+/// foreign key (the same reason a tombstone's own copy does not, see
+/// migration 038), so a terminal id can name a row that was hard-deleted
+/// after the link was written. The final join is an `INNER JOIN` against
+/// `knowledge_base`, so a terminal id that resolves to nothing simply
+/// matches no row and the candidate that led to it is dropped - silently,
+/// which is the right failure mode for a dangling link, but untested until
+/// `a_dangling_superseded_by_target_is_dropped_not_errored` pinned it.
+///
 /// Every returned row repeats the same three statistics, which is the price of
 /// stating them in the same answer as the candidates.
 ///

@@ -78,30 +78,41 @@ pub fn one_line(text: &str, max_chars: usize) -> String {
     out
 }
 
-/// The stored spelling of the one disposition (#893) a rendered line has to
-/// mark. Every other spelling - `active`, `superseded`, `redundant`,
-/// `obsolete`, `trivial` - answers no marker from [`disposition_marker`].
+/// The stored spellings [`disposition_marker`] answers a real marker for
+/// (#893). `active` and `trivial` are the only two left silent: `trivial` is
+/// a curation judgement, not a claim about truth, so it carries no warning.
 ///
-/// A bare string rather than the closed enum
+/// Bare strings rather than the closed enum
 /// (`desktop_assistant_core::domain::knowledge::Disposition`) for the same
 /// reason [`one_line`] lives here and not beside either type: the wire view
 /// (`desktop-assistant-api-model`) does not depend on `desktop-assistant-core`,
 /// so it cannot hold that enum, and this crate is the one both can depend on.
-/// The domain type's own `Disposition::marker` is pinned against this by
-/// `the_domain_and_wire_refuted_markers_agree` in `desktop-assistant-core`, so
-/// the two cannot drift silently.
+/// The domain type's own `Disposition::marker` is pinned against these by
+/// `the_domain_and_wire_markers_agree_for_every_disposition` in
+/// `desktop-assistant-core`, so the two cannot drift silently.
 pub const REFUTED_DISPOSITION: &str = "refuted";
+pub const SUPERSEDED_DISPOSITION: &str = "superseded";
+pub const REDUNDANT_DISPOSITION: &str = "redundant";
+pub const OBSOLETE_DISPOSITION: &str = "obsolete";
 
 /// What a rendered line must be prefixed with before it shows an entry
 /// carrying `disposition`, or the empty string where nothing is owed.
 ///
 /// **The one shared render helper**, read by both the domain entry's own
-/// `display_line` and the wire view's, so a caller on either side of the
-/// wire renders a refuted entry the same way. See [`REFUTED_DISPOSITION`]
-/// for why this takes the stored spelling rather than a typed enum.
+/// `display_line`/`marked_text` and the wire view's `display_line`, so a
+/// caller on either side of the wire renders a non-active entry the same
+/// way. `superseded` and `redundant` share one marker: an unresolved render
+/// cannot say more than "something replaced this" without following the
+/// link, and both verbs mean exactly that from here. See
+/// [`REFUTED_DISPOSITION`] for why this takes the stored spelling rather
+/// than a typed enum.
 pub fn disposition_marker(disposition: &str) -> &'static str {
     if disposition == REFUTED_DISPOSITION {
         "recorded, later refuted: "
+    } else if disposition == SUPERSEDED_DISPOSITION || disposition == REDUNDANT_DISPOSITION {
+        "superseded, see its successor: "
+    } else if disposition == OBSOLETE_DISPOSITION {
+        "no longer applies: "
     } else {
         ""
     }

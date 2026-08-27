@@ -2015,16 +2015,12 @@ async fn a_query_matching_only_the_old_wording_returns_the_successor() {
     .await;
 }
 
-/// Acceptance (#893): a chain of several links resolves to its terminal
-/// successor, and a cycle in `superseded_by` - which consolidation's own
-/// guards should never write, but which this proves the query survives
-/// regardless - cannot hang the query. The depth-8 bound is what makes that
-/// true: it is what is under test, not any particular id a capped cycle
-/// happens to land on.
+/// Acceptance (#893): a chain of several links resolves all the way to its
+/// terminal successor, not to any intermediate link.
 #[tokio::test]
-async fn a_superseded_chain_resolves_to_the_terminal_successor_and_a_cycle_cannot_hang_it() {
+async fn a_superseded_chain_resolves_to_the_terminal_successor() {
     with_fixture(
-        "a_superseded_chain_resolves_to_the_terminal_successor_and_a_cycle_cannot_hang_it",
+        "a_superseded_chain_resolves_to_the_terminal_successor",
         |fx| async move {
             let store =
                 PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
@@ -2085,6 +2081,34 @@ async fn a_superseded_chain_resolves_to_the_terminal_successor_and_a_cycle_canno
                 "a three-link chain must resolve all the way to its terminal successor, \
                  not stop at the middle link; got {ids:?}"
             );
+            fx
+        },
+    )
+    .await;
+}
+
+/// Acceptance (#893): a cycle in `superseded_by` - which consolidation's own
+/// guards should never write, but which this proves the query survives
+/// regardless - cannot hang the query. The depth-8 bound is what makes that
+/// true: it is what is under test, not any particular id a capped cycle
+/// happens to land on.
+///
+/// **What this accepts, stated rather than left implicit.** The bound caps
+/// the walk at depth 8; the row it lands on is whichever member of the
+/// cycle sits at that depth, and that row's own disposition is still
+/// `superseded` - the cap did not resolve it, it only stopped walking.
+/// Returning that row as ordinary fact would be exactly the bug #893
+/// exists to fix, so the test does not accept an unmarked answer: it
+/// requires the returned row's own disposition to be one
+/// `Disposition::marker` answers a real marker for, so whatever surface
+/// renders it downstream still tells the truth.
+#[tokio::test]
+async fn a_cycle_in_superseded_by_does_not_hang_and_its_capped_terminal_still_renders_marked() {
+    with_fixture(
+        "a_cycle_in_superseded_by_does_not_hang_and_its_capped_terminal_still_renders_marked",
+        |fx| async move {
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
 
             // X <-> Y, a cycle. Nothing in this build's own guards can write
             // one - the applier that dispositions entries has no path to it -
@@ -2135,14 +2159,90 @@ async fn a_superseded_chain_resolves_to_the_terminal_successor_and_a_cycle_canno
                 "a cycle in superseded_by must not hang the query - the depth bound must \
                  still terminate it"
             );
+            let entries = cycle_result
+                .expect("checked above")
+                .expect("the query itself must not error")
+                .entries;
+            let found = entries
+                .iter()
+                .find(|e| e.id == "kb-x" || e.id == "kb-y")
+                .expect("a capped cycle still answers with one of its own members, not nothing");
             assert!(
-                cycle_result
-                    .expect("checked above")
-                    .expect("the query itself must not error")
-                    .entries
-                    .iter()
-                    .any(|e| e.id == "kb-x" || e.id == "kb-y"),
-                "a capped cycle still answers with one of its own members, not nothing"
+                matches!(
+                    found.disposition,
+                    Disposition::Superseded | Disposition::Redundant
+                ),
+                "the capped terminal is still an unresolved link, not the true terminal - \
+                 got disposition {:?}",
+                found.disposition
+            );
+            assert!(
+                !found.disposition.marker().is_empty(),
+                "an unresolved capped terminal must render with a marker, or a cycle would \
+                 silently show a superseded row as a current fact"
+            );
+            fx
+        },
+    )
+    .await;
+}
+
+/// Acceptance (#893, finding 4): `superseded_by` carries no foreign key
+/// (migration 038), so a hard delete of a successor after the link was
+/// written leaves the link dangling. The final join is an `INNER JOIN`, so
+/// a terminal id that resolves to nothing must drop the candidate that led
+/// to it - silently and without error, never surfacing a stale reference as
+/// a hit.
+#[tokio::test]
+async fn a_dangling_superseded_by_target_is_dropped_not_errored() {
+    with_fixture(
+        "a_dangling_superseded_by_target_is_dropped_not_errored",
+        |fx| async move {
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
+
+            with_user_id(UserId::new("alice"), async {
+                store
+                    .write(KnowledgeEntry::new(
+                        "kb-dangling",
+                        "the annex badge office moved to the east wing",
+                        vec![],
+                    ))
+                    .await
+                    .expect("write the dangling link");
+            })
+            .await;
+            set_embedding(&fx.pool, "kb-dangling", vec![vec![1.0, 0.0, 0.0]]).await;
+            // The target id names no row at all - the link is dangling from
+            // the moment it is written, which is the case under test.
+            set_disposition(
+                &fx.pool,
+                "kb-dangling",
+                "superseded",
+                Some("kb-does-not-exist"),
+            )
+            .await;
+
+            let hits = with_user_id(UserId::new("alice"), async {
+                store
+                    .search(
+                        "annex badge office east wing",
+                        vec![1.0, 0.0, 0.0],
+                        MODEL,
+                        None,
+                        None,
+                        10,
+                    )
+                    .await
+            })
+            .await
+            .expect("search must not error on a dangling superseded_by target");
+
+            assert!(
+                !hits.entries.iter().any(|e| e.id == "kb-dangling"),
+                "a superseded entry whose target does not exist must be dropped, not \
+                 returned under its own id; got {:?}",
+                hits.entries.iter().map(|e| &e.id).collect::<Vec<_>>()
             );
             fx
         },

@@ -3210,6 +3210,52 @@ mod tests {
         );
     }
 
+    /// Acceptance (#893, finding 2): the concrete failure a review found -
+    /// pin an entry, a later consolidation pass marks it `superseded_by` a
+    /// successor, and `[Pinned]` has no resolution logic at all (it is not
+    /// a search - it renders exactly the row it was given). Without a
+    /// marker on `superseded` itself, the pin would show the old content as
+    /// a current fact forever, because nothing in this path ever looks
+    /// again. `Redundant` shares the same marker text - see
+    /// `Disposition::marker`'s own reasoning.
+    #[test]
+    fn pinned_reference_marks_a_superseded_entry_forever_not_only_until_it_is_resolved() {
+        let notes = vec![raw_pinned_ref("deploy-target", "settled", "kb-superseded")];
+        let entries = resolved_with_disposition(&[(
+            "kb-superseded",
+            "the old cluster address",
+            crate::domain::Disposition::Superseded,
+        )]);
+
+        let out = render_pinned(&notes, Some(&entries), PINNED_BLOCK_BYTE_BUDGET)
+            .expect("something is pinned");
+
+        assert!(
+            out.contains("superseded, see its successor: the old cluster address"),
+            "a superseded pinned entry must carry its marker, with no resolution step to              rescue it: {out}"
+        );
+    }
+
+    /// The same property for `obsolete`, which search excludes by default but
+    /// `[Pinned]` has no bar to exclude it with at all.
+    #[test]
+    fn pinned_reference_marks_an_obsolete_entry() {
+        let notes = vec![raw_pinned_ref("deploy-target", "settled", "kb-obsolete")];
+        let entries = resolved_with_disposition(&[(
+            "kb-obsolete",
+            "the old cluster address",
+            crate::domain::Disposition::Obsolete,
+        )]);
+
+        let out = render_pinned(&notes, Some(&entries), PINNED_BLOCK_BYTE_BUDGET)
+            .expect("something is pinned");
+
+        assert!(
+            out.contains("no longer applies: the old cluster address"),
+            "an obsolete pinned entry must carry its marker: {out}"
+        );
+    }
+
     #[test]
     fn pinned_references_and_note_pins_share_one_cap() {
         // Not five of each. Both halves of the cap are checked: the count cap
