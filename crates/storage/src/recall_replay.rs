@@ -235,10 +235,15 @@ pub async fn take_snapshot(
 
     let snapshot_id = uuid::Uuid::now_v7().to_string();
 
-    sqlx::query(
+    // `RETURNING taken_at` so the manifest reports the instant Postgres
+    // actually stamped -- the same value replay later reads back -- rather
+    // than a Rust-side `Utc::now()` taken after the transaction commits,
+    // which can read slightly later than what was actually frozen.
+    let taken_at: DateTime<Utc> = sqlx::query_scalar(
         "INSERT INTO recall_snapshots \
              (id, user_id, name, embedding_model, entry_count, use_count, excluded_count) \
-         VALUES ($1, $2, $3, $4, $5, 0, $6)",
+         VALUES ($1, $2, $3, $4, $5, 0, $6) \
+         RETURNING taken_at",
     )
     .bind(&snapshot_id)
     .bind(user_id)
@@ -246,7 +251,7 @@ pub async fn take_snapshot(
     .bind(&majority)
     .bind(included.len() as i32)
     .bind(excluded_count as i32)
-    .execute(&mut *scan)
+    .fetch_one(&mut *scan)
     .await
     .map_err(|e| CoreError::Storage(e.to_string()))?;
 
@@ -356,7 +361,7 @@ pub async fn take_snapshot(
     Ok(SnapshotManifest {
         id: snapshot_id,
         name: name.to_string(),
-        taken_at: Utc::now(),
+        taken_at,
         embedding_model: majority,
         entry_count: included.len() as i32,
         use_count,
@@ -469,13 +474,23 @@ pub async fn add_case(
     user_id: &str,
     input: CaseInput<'_>,
 ) -> Result<String, CoreError> {
-    if input.source_request_id.is_none() && input.note.is_none() {
+    // A present-but-blank value is the same as absent for traceability: a
+    // note of "" or all whitespace states nothing, and a caller that passed
+    // `--note ""` almost certainly meant to pass nothing at all rather than
+    // to satisfy the check with an empty string.
+    let traceable = input
+        .source_request_id
+        .is_some_and(|s| !s.trim().is_empty())
+        || input.note.is_some_and(|n| !n.trim().is_empty());
+    if !traceable {
         return Err(CoreError::InvalidInput {
             code: "recall_case_not_traceable",
-            description: "a case with neither source_request_id nor note was refused".to_string(),
-            message: "a case must carry the turn it came from (--from-turn) or a note stating \
-                      why there is none — an untraceable case is how a regression suite \
-                      becomes a mirror"
+            description: "a case with neither a source_request_id nor a non-blank note was \
+                           refused"
+                .to_string(),
+            message: "a case must carry the turn it came from (--from-turn) or a non-blank \
+                      note stating why there is none — an untraceable case is how a \
+                      regression suite becomes a mirror"
                 .to_string(),
         });
     }
@@ -688,6 +703,29 @@ const SNAPSHOT_NEAREST_SQL: &str = "\
      CROSS JOIN s
      ORDER BY d.distance";
 
+/// Whether the live `[Recall]` block would admit `disposition` to the
+/// candidate set at all, before ranking (#893, #1341).
+///
+/// **Duplicated from `crates/daemon/src/recall.rs::recall_admits`, not
+/// shared.** That function is private to the daemon crate, and storage does
+/// not depend on daemon -- the dependency runs the other way, so nothing
+/// here can call it. Keeping two copies is exactly the drift risk this
+/// module's own doc warns callers about elsewhere; there is no shared
+/// predicate to reach for today, so this one is written down instead of
+/// silently assumed, and the two must be kept in sync by hand until
+/// something is lifted into `core` to hold them together.
+///
+/// This is not optional polish: `ActivationWeights::disposition`
+/// (`crates/core/src/domain/activation.rs`) prices `Obsolete`, `Superseded`
+/// and `Redundant` at a zero penalty *because* the live path is assumed to
+/// have already excluded them here, before a score is ever computed for
+/// them. A ranked scan that skipped this filter would rank a candidate
+/// production would never have shown at all, under a scorer that was never
+/// fitted to weigh it down.
+fn replay_admits(disposition: Disposition) -> bool {
+    matches!(disposition, Disposition::Active | Disposition::Refuted)
+}
+
 #[derive(sqlx::FromRow)]
 struct SnapshotNearestRow {
     id: String,
@@ -789,12 +827,27 @@ pub async fn ranked_snapshot_scan(
         .await
         .map_err(|e| CoreError::Storage(e.to_string()))?;
 
+    // Dispersion is measured over every comparable row, disposition and all --
+    // the same population the live scan's own CTE measures it over. Admission
+    // is what narrows the set afterward, on both paths.
     let dispersion = rows
         .first()
         .and_then(|r| {
             RecallDispersion::measured(r.median?, r.deviation?, r.rows_read.max(0) as usize)
         })
         .unwrap_or(RECALL_ASSUMED_DISPERSION);
+
+    // Admission mirrors the live `[Recall]` block (see `replay_admits`):
+    // applied to the candidate list, after dispersion is measured, before
+    // anything is ranked. A row this filter drops never reaches
+    // `rank_by_activation_traced` and can never appear in a case's rank or
+    // its `top` candidates.
+    let rows: Vec<SnapshotNearestRow> = rows
+        .into_iter()
+        .filter(|row| {
+            replay_admits(Disposition::parse(&row.disposition).unwrap_or(Disposition::Obsolete))
+        })
+        .collect();
 
     let entry_ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
     let use_records = if entry_ids.is_empty() {

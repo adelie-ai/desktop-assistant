@@ -96,6 +96,18 @@ async fn seed_entry(pool: &PgPool, id: &str, chunk: Vec<f32>, model: &str) {
     .expect("stamp embedding");
 }
 
+/// Stamp a knowledge entry's disposition directly, the way consolidation
+/// would after judging it wrong, stale or redundant. `disposition` is the
+/// stored spelling (`"superseded"`, `"obsolete"`, `"trivial"`, ...).
+async fn seed_disposition(pool: &PgPool, id: &str, disposition: &str) {
+    sqlx::query("UPDATE knowledge_base SET disposition = $1 WHERE id = $2")
+        .bind(disposition)
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("stamp disposition");
+}
+
 /// Add a case with a note (always traceable) and cache its query embedding
 /// under `model`, so a test can drive `run_replay` without a live embedder.
 async fn seed_case(
@@ -269,6 +281,52 @@ async fn a_case_whose_expected_entry_no_longer_exists_is_reported_not_skipped() 
     match &report.results[0].outcome {
         CaseOutcome::ExpectedEntryMissing { .. } => {}
         CaseOutcome::Ranked { .. } => panic!("an entry that was never seeded cannot have ranked"),
+    }
+
+    fx.cleanup().await;
+}
+
+/// Acceptance (#893, #1341): the live `[Recall]` block never shows an entry
+/// whose disposition is anything but `active` or `refuted` -- `recall_admits`
+/// in `crates/daemon/src/recall.rs` filters before ranking. Replay must hold
+/// the same admission, because `ActivationWeights::disposition` prices every
+/// other disposition at a zero penalty on the assumption that the caller has
+/// already excluded them; a replay that ranked one anyway would report a
+/// rank production could never produce.
+#[tokio::test]
+async fn replay_never_ranks_a_candidate_the_live_block_would_not_admit() {
+    let Some(fx) = fixture().await else { return };
+
+    // The distractor sits at the query's own angle -- distance 0, the best
+    // any row can score -- so if disposition admission were skipped it would
+    // rank first and bury the expected entry.
+    seed_entry(&fx.pool, "kb-expected", at_angle(0.3), MODEL_A).await;
+    seed_entry(&fx.pool, "kb-distractor", at_angle(0.0), MODEL_A).await;
+    seed_disposition(&fx.pool, "kb-distractor", "obsolete").await;
+
+    let manifest = take_snapshot(&fx.pool, USER, "snap-disposition")
+        .await
+        .expect("take_snapshot succeeds");
+    seed_case(&fx.pool, "kb-expected", at_angle(0.0), MODEL_A).await;
+
+    let report = run_replay(&fx.pool, USER, &manifest)
+        .await
+        .expect("replay succeeds");
+
+    assert_eq!(report.results.len(), 1);
+    match &report.results[0].outcome {
+        CaseOutcome::Ranked { rank, top, .. } => {
+            assert_eq!(
+                *rank, 1,
+                "the obsolete distractor must never outrank the expected entry, however \
+                 close its distance"
+            );
+            assert!(
+                !top.iter().any(|c| c.entry_id == "kb-distractor"),
+                "an obsolete entry must never appear among the ranked candidates at all: {top:?}"
+            );
+        }
+        CaseOutcome::ExpectedEntryMissing { .. } => panic!("kb-expected was seeded and admitted"),
     }
 
     fx.cleanup().await;

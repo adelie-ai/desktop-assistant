@@ -56,10 +56,11 @@ pub const EMBEDDED_TABLES: &[&str] = &[
 ///
 /// Each entry is a `(table, reason)` pair rather than a bare name, so an
 /// exemption cannot be added without writing down why in the same literal;
-/// `an_exemption_reason_is_never_empty` below is the backstop for a reason
-/// nobody bothered to write. Keep this list short and specific -- it is a
-/// point of active review, not a place to park a table that merely has not
-/// been wired up yet.
+/// `an_exemption_reason_is_not_a_placeholder` below is the backstop for a
+/// reason nobody bothered to write -- it checks length, not truth, which is
+/// what its name says and no more. Keep this list short and specific -- it
+/// is a point of active review, not a place to park a table that merely has
+/// not been wired up yet.
 pub const EMBEDDED_TABLE_EXEMPTIONS: &[(&str, &str)] = &[
     (
         "recall_snapshot_entries",
@@ -92,11 +93,16 @@ mod tests {
         );
     }
 
-    /// Acceptance (#1328): an exemption without a reason is exactly the
-    /// dumping ground this list must not become. The tuple shape already
-    /// forces *a* string; this catches one that says nothing.
+    /// Acceptance (#1328): an exemption with an empty or trivially short
+    /// reason is exactly the dumping ground this list must not become. The
+    /// tuple shape already forces *a* string; this catches one that is too
+    /// short to say anything. It cannot and does not check that the reason
+    /// is true -- a wordy false justification still passes, and nothing here
+    /// carries runtime authority (the sweep iterates the fixed
+    /// `EMBEDDED_TABLES` array, never this list) -- so the name says
+    /// "not a placeholder", not "never empty" or "correct".
     #[test]
-    fn an_exemption_reason_is_never_empty() {
+    fn an_exemption_reason_is_not_a_placeholder() {
         for (table, reason) in EMBEDDED_TABLE_EXEMPTIONS {
             assert!(
                 reason.trim().len() >= 20,
