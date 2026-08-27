@@ -243,12 +243,13 @@ async fn a_live_row_is_left_untouched() {
         return;
     };
     insert_row(&fx.pool, "kb-live", "active", None, None).await;
-    // A row that is already `superseded` and already live -- the shape a
-    // resolved link takes once the new consolidation engine writes one
-    // directly, rather than through a tombstone. This is the case that
-    // actually exercises the `deleted_at IS NOT NULL` guard: the plain
-    // active row above never reaches that guard at all, because it fails
-    // the disposition filter first.
+    // A row that is already `superseded` and already live. No writer in
+    // this codebase produces that combination today -- the only place that
+    // sets `disposition = 'superseded'` always pairs it with
+    // `deleted_at = NOW()` in the same statement. The fixture is synthetic,
+    // built to isolate one guard: it is the only shape that reaches the
+    // `deleted_at IS NOT NULL` filter at all, because the plain active row
+    // above fails the disposition filter first and never gets that far.
     insert_row(&fx.pool, "kb-canonical", "active", None, None).await;
     insert_row(
         &fx.pool,
@@ -390,6 +391,82 @@ async fn migration_058_is_idempotent() {
         after_first, after_second,
         "replaying migration 058 against rows it already revived must \
          change nothing"
+    );
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_multi_hop_merge_chain_revives_every_member_in_one_pass() {
+    let Some(fx) = support::DbFixture::try_new("mig058_chain").await else {
+        eprintln!("skip: TEST_DATABASE_URL not set");
+        return;
+    };
+    // C was merged into B, and B was itself later merged into A: a
+    // two-hop chain, A the only row that was ever live. Arm 1's `EXISTS`
+    // checks only that a row with the named id is present in the table --
+    // not that it is already live -- so B's own (still-tombstoned) row
+    // satisfies C's check, and both revive together in this one pass
+    // regardless of the order the two `UPDATE` statements touch them in.
+    insert_row(&fx.pool, "kb-root", "active", None, None).await;
+    insert_row(&fx.pool, "kb-mid", "superseded", Some(1), Some("kb-root")).await;
+    insert_row(&fx.pool, "kb-leaf", "superseded", Some(1), Some("kb-mid")).await;
+    rewind_058(&fx.pool).await;
+
+    run_migrations(&fx.pool)
+        .await
+        .expect("migration 058 replays");
+
+    assert!(
+        deleted_at(&fx.pool, "kb-mid").await.is_none(),
+        "the middle link of the chain must revive"
+    );
+    assert_eq!(disposition(&fx.pool, "kb-mid").await, "superseded");
+    assert_eq!(
+        superseded_by(&fx.pool, "kb-mid").await.as_deref(),
+        Some("kb-root")
+    );
+    assert!(
+        deleted_at(&fx.pool, "kb-leaf").await.is_none(),
+        "the far end of the chain must revive in the same pass as the \
+         middle link, not require a second migration run"
+    );
+    assert_eq!(disposition(&fx.pool, "kb-leaf").await, "superseded");
+    assert_eq!(
+        superseded_by(&fx.pool, "kb-leaf").await.as_deref(),
+        Some("kb-mid")
+    );
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_self_superseding_tombstone_is_left_untouched() {
+    let Some(fx) = support::DbFixture::try_new("mig058_selfref").await else {
+        eprintln!("skip: TEST_DATABASE_URL not set");
+        return;
+    };
+    // superseded_by naming the row's own id. No known write path produces
+    // this, but nothing on disk says what it would mean, so the migration
+    // must not guess -- reviving it would produce a superseded row pointing
+    // at itself, a link with nothing else to resolve to.
+    insert_row(&fx.pool, "kb-self", "superseded", Some(1), Some("kb-self")).await;
+    rewind_058(&fx.pool).await;
+
+    run_migrations(&fx.pool)
+        .await
+        .expect("migration 058 replays");
+
+    assert!(
+        deleted_at(&fx.pool, "kb-self").await.is_some(),
+        "a row that names itself as its own successor is a shape this \
+         migration cannot positively identify, so it must stay deleted"
+    );
+    assert_eq!(disposition(&fx.pool, "kb-self").await, "superseded");
+    assert_eq!(
+        superseded_by(&fx.pool, "kb-self").await.as_deref(),
+        Some("kb-self"),
+        "the link must be left exactly as it was, not guessed at"
     );
 
     fx.cleanup().await;
