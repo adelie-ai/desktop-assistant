@@ -1,5 +1,5 @@
-//! Knowledge-base trash: retention, reaping, and the explicit empty-trash
-//! control (issue #657).
+//! Knowledge-base trash: retention, reaping, restore, and the explicit
+//! empty-trash control (issues #657, #710).
 //!
 //! Consolidation retires an entry by stamping `deleted_at` rather than deleting
 //! the row, so a bad run can be inspected and the entry is merely invisible to
@@ -15,6 +15,12 @@
 //! - [`empty_trash`] and [`trash_count`] back the explicit user-facing
 //!   controls: what is in the trash, and empty it now instead of waiting out
 //!   the window.
+//! - [`search_trash`] finds a tombstone by full text, for a person who knows
+//!   roughly what they lost but not its id, and [`restore_entry`] brings one
+//!   back. Both back `builtin_knowledge_base_restore` (#710): until this pair
+//!   existed, nothing in the daemon, a client, or a tool could ever clear
+//!   `deleted_at`, and 30 days after a bad consolidation run every one of its
+//!   tombstones was gone for good.
 //!
 //! Every operation is scoped to a single user's partition. The one cross-user
 //! query is the sweep's "which users have tombstones" scan, which immediately
@@ -27,6 +33,7 @@
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::auth::{UserId, current_user_id, with_user_id};
+use desktop_assistant_core::ports::knowledge::{RestoreOutcome, TrashEntry};
 use sqlx::{PgExecutor, PgPool};
 
 use super::common::is_total_failure;
@@ -167,4 +174,28 @@ async fn load_user_ids_with_trash(pool: &PgPool) -> Result<Vec<String>, CoreErro
     .await
     .map_err(|e| CoreError::Storage(format!("knowledge trash: load user ids failed: {e}")))?;
     Ok(rows.into_iter().map(|(u,)| u).collect())
+}
+
+/// Bring a tombstoned entry back: live again, judged nothing, as if it had
+/// never been retired (#710).
+///
+/// The specification is pinned by `crates/storage/tests/knowledge_restore.rs`.
+/// This is a deliberately wrong placeholder - it claims success without
+/// touching a row - so those tests fail on behaviour rather than on a
+/// missing symbol. The real implementation lands in the next commit.
+pub async fn restore_entry(_pool: &PgPool, _id: &str) -> Result<RestoreOutcome, CoreError> {
+    Ok(RestoreOutcome::Restored)
+}
+
+/// Find tombstones by full text, for a person who knows roughly what they
+/// lost but not its id (#710).
+///
+/// Specification pinned by `crates/storage/tests/knowledge_restore.rs`.
+/// Deliberately wrong: implemented in the next commit.
+pub async fn search_trash(
+    _pool: &PgPool,
+    _query: &str,
+    _limit: usize,
+) -> Result<Vec<TrashEntry>, CoreError> {
+    Ok(vec![])
 }

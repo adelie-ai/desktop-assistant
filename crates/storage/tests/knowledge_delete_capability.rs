@@ -322,15 +322,28 @@ async fn zero_prune_fraction_merges_and_edits_but_deletes_nothing() {
 }
 
 // ---------------------------------------------------------------------------
-// The safety flag: who asked for the delete
+// Who asked for the delete: a person erases, nobody else destroys anything
 // ---------------------------------------------------------------------------
+//
+// #710 changed what a machine-initiated `delete`/`delete_many` call does.
+// Before a restore path existed, `model_initiated_hard_delete_is_refused_
+// while_the_safety_flag_is_set` pinned the old behaviour: under
+// `require_person_for_hard_delete`, the model's own delete tool was refused
+// outright and the row survived untouched, not even tombstoned. That was the
+// only guard available with no way to undo a wrong hard delete. Now that a
+// tombstone can be restored, a delete by id from anyone but a person always
+// lands in the trash instead - never refused, never a hard delete, whatever
+// the safety flag says. The flag still governs the retention reap and
+// emptying the trash, which really do destroy rows.
 
 #[tokio::test]
-async fn model_initiated_hard_delete_is_refused_while_the_safety_flag_is_set() {
+async fn a_non_person_delete_lands_in_the_trash_not_in_oblivion() {
     let Some(fx) = support::DbFixture::try_new("kb1122").await else {
         return;
     };
     let pool = &fx.pool;
+    // The safety flag on, deliberately: the point of this test is that the
+    // flag no longer has anything to say about a delete by id.
     let store = PgKnowledgeBaseStore::new(pool.clone(), person_only_policy());
 
     seed_kb(pool, ALICE, "model-kill-1", "a fact").await;
@@ -338,24 +351,60 @@ async fn model_initiated_hard_delete_is_refused_while_the_safety_flag_is_set() {
 
     // `builtin_knowledge_base_delete` reaches this method with no person
     // scope installed, which is what the unset task-local stands for.
-    let err = with_user_id(UserId::new(ALICE), async {
+    let removed = with_user_id(UserId::new(ALICE), async {
         store
             .delete_many(&["model-kill-1".to_string(), "model-kill-2".to_string()])
             .await
     })
     .await
-    .expect_err("a machine-initiated hard delete must be refused");
+    .expect("a machine-initiated delete is never refused; it is trashed");
 
-    let text = err.to_string();
+    assert_eq!(removed, 2, "both rows are reported as removed from view");
     assert!(
-        text.contains("model-kill-1"),
-        "the refusal must name what it declined to destroy: {text}"
+        kb_exists(pool, "model-kill-1").await,
+        "the row must physically survive, in the trash"
     );
-    assert!(kb_exists(pool, "model-kill-1").await, "row must survive");
-    assert!(kb_exists(pool, "model-kill-2").await, "row must survive");
     assert!(
-        !kb_is_deleted(pool, "model-kill-1").await,
-        "a refusal must not answer with a tombstone either"
+        kb_is_deleted(pool, "model-kill-1").await,
+        "a non-person delete must tombstone the row, not erase it"
+    );
+    assert!(kb_is_deleted(pool, "model-kill-2").await);
+    assert_eq!(
+        kb_content(pool, "model-kill-1").await.as_deref(),
+        Some("a fact"),
+        "content is untouched, so a restore brings back exactly what was there"
+    );
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_person_delete_still_erases_immediately() {
+    let Some(fx) = support::DbFixture::try_new("kb1122").await else {
+        return;
+    };
+    let pool = &fx.pool;
+    let store = PgKnowledgeBaseStore::new(pool.clone(), default_policy());
+
+    seed_kb(pool, ALICE, "person-kill-1", "a fact the person wants gone").await;
+
+    // "Forget that" arrives as a command from a client control, so the person
+    // scope is installed at the handler, exactly as it is for the single-id
+    // delete path.
+    with_user_id(UserId::new(ALICE), async {
+        with_delete_initiator(DeleteInitiator::Person, async {
+            store
+                .delete_many(&["person-kill-1".to_string()])
+                .await
+                .expect("a person's delete is never refused")
+        })
+        .await
+    })
+    .await;
+
+    assert!(
+        !kb_exists(pool, "person-kill-1").await,
+        "a person's delete must erase the row outright, not tombstone it"
     );
 
     fx.cleanup().await;
@@ -680,7 +729,14 @@ fn a_refused_background_reap_writes_the_entry_id_and_path_to_the_log() {
 }
 
 #[test]
-fn a_refused_caller_delete_writes_the_entry_id_and_path_to_the_log() {
+fn a_non_person_caller_delete_is_never_logged_as_a_refusal() {
+    // Before #710, `PgKnowledgeBaseStore::delete_many` under the safety flag
+    // was refused and logged as such - that scenario no longer exists: a
+    // delete by id from anyone but a person is routed to the trash before the
+    // policy is even read, so the refusal path this test used to exercise
+    // cannot fire here any more. Pinning the absence is the point: a policy
+    // that still somehow reached its refusal branch for this call would be a
+    // silent regression back to unrecoverable deletes.
     let rt = capture_runtime();
     let Some(fx) = rt.block_on(support::DbFixture::try_new("kb1122")) else {
         return;
@@ -689,8 +745,6 @@ fn a_refused_caller_delete_writes_the_entry_id_and_path_to_the_log() {
 
     rt.block_on(seed_kb(&fx.pool, ALICE, "logged-tool-delete", "a fact"));
 
-    // A caller receives the refusal as a value. It must be recorded even so: a
-    // caller that swallows the error must not erase the evidence.
     let (result, log) = run_capturing_logs(
         &rt,
         with_user_id(UserId::new(ALICE), async {
@@ -698,12 +752,15 @@ fn a_refused_caller_delete_writes_the_entry_id_and_path_to_the_log() {
         }),
     );
 
-    assert!(result.is_err(), "the delete is refused");
-    assert!(log.contains("logged-tool-delete"), "log names it: {log}");
     assert!(
-        log.contains("knowledge::PgKnowledgeBaseStore::delete_many"),
-        "log names the calling path: {log}"
+        result.is_ok(),
+        "a non-person delete by id is trashed, never refused: {result:?}"
     );
+    assert!(
+        !log.to_lowercase().contains("refused"),
+        "nothing here is a refusal any more: {log}"
+    );
+    assert!(rt.block_on(kb_is_deleted(&fx.pool, "logged-tool-delete")));
 
     rt.block_on(fx.cleanup());
 }
