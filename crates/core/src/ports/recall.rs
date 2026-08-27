@@ -1013,7 +1013,10 @@ mod tests {
 
     /// Acceptance (#1327): [`rank_by_activation`] is a thin wrapper over
     /// [`rank_by_activation_traced`] that drops the terms, so the two cannot
-    /// disagree on order - they are the same sort.
+    /// disagree on order - they are the same sort. This is a regression pin
+    /// against someone re-splitting the two implementations, not evidence
+    /// that two independent computations agree: there is only ever one
+    /// computation here.
     #[test]
     fn traced_and_untraced_ranking_agree_on_order() {
         let source = a_source();

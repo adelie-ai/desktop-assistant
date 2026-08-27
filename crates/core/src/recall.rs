@@ -88,7 +88,7 @@ use crate::ports::context_plan::{
 };
 use crate::ports::recall::{
     Activatable, MixedSet, RecallCandidates, RecallDispersion, RecallEntry, RecallNote,
-    RecallSkill, rank_by_activation, rank_by_activation_traced,
+    RecallSkill, rank_by_activation_traced,
 };
 use crate::ports::scratchpad::NOTE_KEY_MAX_CHARS;
 
@@ -710,10 +710,11 @@ fn render_recall_with_width(surface: &RecallSurface<'_>, max_entries: usize) -> 
                 .clears_bar(admission_dispersion(entry_dispersion), RECALL_BAR)
         })
         .collect();
-    // #1327: every admitted entry's activation terms, in ranked order. Reads
-    // the same inputs and the same function `showable` is ranked by below, so
-    // this cannot disagree with the render - see `traced_and_untraced_ranking_agree_on_order`
-    // and the module note on `rank_by_activation_traced`.
+    // #1327: every admitted entry's activation terms, in ranked order.
+    // `showable` below filters this same vector rather than re-ranking a
+    // fresh copy, so the plan's rank and the block's render order come from
+    // one sort, not two that merely happen to agree - see the module note on
+    // `rank_by_activation_traced`.
     let ranked_entries: Vec<(&RecallEntry, ActivationTerms)> = rank_by_activation_traced(
         above_bar.clone(),
         |hit| *hit,
@@ -771,26 +772,23 @@ fn render_recall_with_width(surface: &RecallSurface<'_>, max_entries: usize) -> 
     //
     // All three drop rather than count, because "also matched" promises
     // the reader something it has not already been given.
-    let showable: Vec<(&RecallEntry, String)> = above_bar
+    //
+    // Filtered from `ranked_entries`, not re-ranked from `above_bar` (#1327):
+    // filtering can turn a mixed set that `rank_by_activation_traced` refused
+    // to sort into a pure one, and a second, independent sort of that pure
+    // set could then order it differently from the unsorted plan - the record
+    // would show one order and the block another. Filtering the already-
+    // ranked vector keeps the render and the plan reading the same order
+    // whatever that order turned out to be.
+    let showable: Vec<(&RecallEntry, String)> = ranked_entries
         .iter()
-        .filter(|hit| !contains(surface.pinned_entry_ids, &hit.entry.id))
-        .filter(|hit| bounded(&hit.entry.id, RECALL_ID_MAX_CHARS) == hit.entry.id)
-        .filter_map(|hit| {
+        .filter(|(hit, _)| !contains(surface.pinned_entry_ids, &hit.entry.id))
+        .filter(|(hit, _)| bounded(&hit.entry.id, RECALL_ID_MAX_CHARS) == hit.entry.id)
+        .filter_map(|(hit, _)| {
             let line = hit.entry.display_line();
             (!line.is_empty()).then_some((*hit, line))
         })
         .collect();
-    // A recall lookup uses one mode at a time, so a mixed set here means an
-    // adapter fused two - `MixedSet::Refuse` is the guard, and
-    // `rank_by_activation` states why each caller's policy is what it is.
-    let showable = rank_by_activation(
-        showable,
-        |(hit, _)| *hit,
-        entry_dispersion,
-        candidates.situation_cue.as_ref(),
-        surface.now,
-        MixedSet::Refuse,
-    );
 
     // The pad is its own source and carries its own spread. A note embeds
     // `"<key> <content>"`, which is terser and more telegraphic than an entry's
@@ -825,7 +823,13 @@ fn render_recall_with_width(surface: &RecallSurface<'_>, max_entries: usize) -> 
     // near the prompt would degrade the conversation permanently. The parent
     // still reaches that answer through `get_subagent_status`, which taints
     // correctly.
-    let showable_notes: Vec<String> = notes_above_bar
+    //
+    // Kept as `(note, line)` pairs rather than lines alone (#1327): the plan
+    // needs each note's key to record it by, and reading the key off a
+    // second, separately-filtered pass below would be the same defect the
+    // entry and skill arms were just fixed for - two filters that can drift
+    // apart instead of one filter two readers share.
+    let showable_notes_pairs: Vec<(&RecallNote, String)> = notes_above_bar
         .iter()
         .filter(|note| {
             !note.pinned
@@ -842,7 +846,11 @@ fn render_recall_with_width(surface: &RecallSurface<'_>, max_entries: usize) -> 
                 // side of it.
                 && !(surface.withhold_written_text && note.after_outside_read)
         })
-        .filter_map(|note| note_line(note))
+        .filter_map(|note| note_line(note).map(|line| (*note, line)))
+        .collect();
+    let showable_notes: Vec<String> = showable_notes_pairs
+        .iter()
+        .map(|(_, line)| line.clone())
         .collect();
 
     // The skill catalog is its own source and carries its own spread (#1154).
@@ -866,7 +874,8 @@ fn render_recall_with_width(surface: &RecallSurface<'_>, max_entries: usize) -> 
     let skills_capped = candidates.skills.len() >= surface.skill_scan_limit
         && skills_above_bar.len() == candidates.skills.len();
     // #1327: the skill arm's own traced ranking, on the same terms as
-    // `ranked_entries` above.
+    // `ranked_entries` above - and `showable_skills` below filters this same
+    // vector for the same reason `showable` does.
     let ranked_skills: Vec<(&RecallSkill, ActivationTerms)> = rank_by_activation_traced(
         skills_above_bar.clone(),
         |skill| *skill,
@@ -892,45 +901,26 @@ fn render_recall_with_width(surface: &RecallSurface<'_>, max_entries: usize) -> 
     // An unapproved skill is not filtered here, because it never arrives: the
     // adapter excludes it from the scan, so it is absent from the spread as
     // well as from the candidates. See `ports::recall::RecallSkill`.
-    let showable_skills: Vec<(&RecallSkill, String)> = skills_above_bar
+    //
+    // Filtered from `ranked_skills`, not re-ranked from `skills_above_bar`,
+    // for the same reason the entry arm's `showable` is (#1327).
+    let showable_skills: Vec<(&RecallSkill, String)> = ranked_skills
         .iter()
-        .filter(|skill| bounded(&skill.name, RECALL_ID_MAX_CHARS) == skill.name)
-        .filter_map(|skill| {
+        .filter(|(skill, _)| bounded(&skill.name, RECALL_ID_MAX_CHARS) == skill.name)
+        .filter_map(|(skill, _)| {
             let line = bounded(&skill.description, RECALL_SKILL_DESCRIPTION_MAX_CHARS);
             (!line.is_empty()).then_some((*skill, line))
         })
         .collect();
-    // The catalog's own cue, never the knowledge store's (#1175). How much a
-    // situation value separates one row from another is a property of the
-    // source that holds the rows, the same way a dispersion is: the two stores
-    // have neither the same population nor the same coverage, so a weight
-    // measured over facts says nothing about procedures.
-    let showable_skills = rank_by_activation(
-        showable_skills,
-        |(skill, _)| *skill,
-        skill_dispersion,
-        candidates.skill_situation_cue.as_ref(),
-        surface.now,
-        MixedSet::Refuse,
-    );
 
-    // #1327: the notes that will actually render, re-derived over
-    // `notes_above_bar` rather than read off `showable_notes` - the strings in
-    // `showable_notes` no longer carry a key to record against. The same
-    // predicates, in the same order, so the set agrees with `showable_notes`
-    // by construction.
-    let offered_notes: Vec<&RecallNote> = notes_above_bar
+    // #1327: the notes that will actually render, read off
+    // `showable_notes_pairs` - the same filtered set `showable_notes` reads,
+    // not a second filter chain over `notes_above_bar` that could drift from
+    // it.
+    let offered_notes: Vec<&RecallNote> = showable_notes_pairs
         .iter()
-        .filter(|note| {
-            !note.pinned
-                && !contains(surface.indexed_keys, &note.key)
-                && !contains(surface.planned_keys, &note.key)
-                && !crate::tool_provenance::carries_external_marker(&note.content)
-                && !(surface.withhold_written_text && note.after_outside_read)
-        })
-        .filter(|note| note_line(note).is_some())
         .take(MAX_RECALL_NOTES)
-        .copied()
+        .map(|(note, _)| *note)
         .collect();
 
     let shown: Vec<&(&RecallEntry, String)> = showable.iter().take(max_entries).collect();
@@ -5804,6 +5794,169 @@ mod tests {
         )
     }
 
+    /// The entries a plan's own record says rendered, in the order it says
+    /// they rendered - what a reader reconstructs from the stored plan alone,
+    /// with no access to the block text (#1327).
+    fn plan_rendered_order(plan: &ContextPlan) -> Vec<&str> {
+        let mut offered: Vec<&PlannedCandidate> =
+            plan.candidates.iter().filter(|c| c.offered).collect();
+        offered.sort_by_key(|c| c.rank);
+        offered.iter().map(|c| c.id.as_str()).collect()
+    }
+
+    #[test]
+    fn a_candidate_that_clears_the_bar_but_does_not_fit_the_width_is_recorded_as_not_offered() {
+        let candidates = RecallCandidates {
+            entries: vec![
+                hit(
+                    "kb-first",
+                    "the leading fact",
+                    &["topic"],
+                    at(RECALL_BAR + 8.0),
+                ),
+                hit(
+                    "kb-second",
+                    "the second fact",
+                    &["topic"],
+                    at(RECALL_BAR + 4.0),
+                ),
+            ],
+            ..RecallCandidates::default()
+        };
+        let surface = RecallSurface::new(
+            &candidates,
+            RECALL_ENTRY_SCAN_LIMIT,
+            RECALL_NOTE_SCAN_LIMIT,
+            RECALL_SKILL_SCAN_LIMIT,
+            test_now(),
+        );
+        // A width of one line: both candidates clear the bar, but only the
+        // higher-ranked one fits - the only case that distinguishes
+        // "offered" from "cleared the bar".
+        let outcome = render_recall_with_width(&surface, 1);
+        let block = outcome.block.as_ref().expect("kb-first cleared the bar");
+        assert_eq!(
+            block.entry_ids,
+            vec!["kb-first".to_string()],
+            "only the top candidate fits at this width"
+        );
+
+        let first = outcome
+            .plan
+            .candidates
+            .iter()
+            .find(|c| c.id == "kb-first")
+            .expect("kb-first is in the plan");
+        assert!(first.cleared_bar);
+        assert!(first.offered, "kb-first rendered, so it was offered");
+
+        let second = outcome
+            .plan
+            .candidates
+            .iter()
+            .find(|c| c.id == "kb-second")
+            .expect("kb-second is in the plan");
+        assert!(second.cleared_bar, "kb-second cleared the bar too");
+        assert!(
+            !second.offered,
+            "kb-second cleared the bar but the width cap dropped it before it rendered"
+        );
+    }
+
+    #[test]
+    fn a_scratchpad_note_that_clears_the_bar_is_recorded_offered_with_no_rank() {
+        let candidates = RecallCandidates {
+            notes: vec![note(
+                "finding-1",
+                "a note the pad holds",
+                at(RECALL_BAR + 4.0),
+            )],
+            ..RecallCandidates::default()
+        };
+        let outcome = render_full(&candidates);
+        let block = outcome.block.as_ref().expect("the note cleared the bar");
+        assert!(
+            block.text.contains("finding-1"),
+            "the note's key must render: {}",
+            block.text
+        );
+
+        let planned = outcome
+            .plan
+            .candidates
+            .iter()
+            .find(|c| c.id == "finding-1")
+            .expect("the note is in the plan");
+        assert_eq!(planned.arm, RecallArm::Note);
+        assert!(planned.cleared_bar);
+        assert!(planned.offered, "the note rendered, so it was offered");
+        assert_eq!(
+            planned.rank, None,
+            "the pad arm is never reordered by activation, so no note ever carries a rank"
+        );
+    }
+
+    /// #1327, high-severity finding: a mixed relevance set makes
+    /// `rank_by_activation_traced` refuse to sort and return raw scan order
+    /// (see its `MixedSet::Refuse` branch). Filtering that set can remove the
+    /// mix - here, dropping a pinned lexical-match candidate leaves a pure
+    /// distance set behind. If the render re-ranked that filtered set with a
+    /// second, independent sort, the block could show the filtered set in
+    /// total order while the plan - built from the still-unsorted traced
+    /// pass - recorded the raw scan order: the record would say one order
+    /// happened and the prompt would have seen another. Filtering the
+    /// already-traced vector instead of re-ranking a fresh copy closes that
+    /// gap; this pins it.
+    #[test]
+    fn a_mixed_relevance_set_records_the_same_order_it_rendered() {
+        let candidates = RecallCandidates {
+            entries: vec![
+                // Lexical, so it clears the bar unconditionally and carries
+                // no semantic term - this is what makes the set mixed.
+                // Pinned, so it drops out of `showable` and leaves a pure
+                // distance set behind it.
+                lexical("kb-pinned-lexical", "already shown under [Pinned]"),
+                // Arrives before the higher-scoring candidate, so raw scan
+                // order and total order disagree once the lexical row is
+                // filtered out.
+                hit(
+                    "kb-second-by-total",
+                    "ranks second",
+                    &["topic"],
+                    at(RECALL_BAR + 2.0),
+                ),
+                hit(
+                    "kb-first-by-total",
+                    "ranks first",
+                    &["topic"],
+                    at(RECALL_BAR + 6.0),
+                ),
+            ],
+            ..RecallCandidates::default()
+        };
+        let pinned = owned(&["kb-pinned-lexical"]);
+        let surface = RecallSurface::new(
+            &candidates,
+            RECALL_ENTRY_SCAN_LIMIT,
+            RECALL_NOTE_SCAN_LIMIT,
+            RECALL_SKILL_SCAN_LIMIT,
+            test_now(),
+        )
+        .already_in_view(&[], &[], &pinned);
+        let outcome = render_recall_with_width(&surface, DEFAULT_MAX_RECALL_ENTRIES);
+        let block = outcome
+            .block
+            .as_ref()
+            .expect("the distance candidates cleared the bar");
+
+        assert_eq!(
+            plan_rendered_order(&outcome.plan),
+            block.entry_ids,
+            "the plan's rank order must match the order the block actually rendered, even when \
+             that order is the raw scan order a mixed set left unsorted"
+        );
+    }
+
     #[test]
     fn a_turn_persists_every_candidate_retrieval_considered_not_only_those_offered() {
         let candidates = RecallCandidates {
@@ -5850,8 +6003,17 @@ mod tests {
         );
     }
 
+    /// `PlannedCandidate::terms` is an [`ActivationTerms`] copied whole from
+    /// the trace pass, so `total == sum of parts` here is
+    /// `activation_terms`'s own invariant surviving the copy, not a property
+    /// the plan-building code could break by miscomputing a score - see
+    /// [`crate::domain::activation`] for that. What this checks is narrower
+    /// and is what the plan-building code can get wrong: that the copy is
+    /// intact (no field dropped or left at a default) and that a
+    /// distance-relevance candidate carries a semantic term rather than
+    /// `None`.
     #[test]
-    fn each_persisted_candidate_carries_its_score_broken_down_by_activation_term() {
+    fn each_persisted_candidates_terms_are_copied_intact_and_finite() {
         let candidates = RecallCandidates {
             entries: vec![hit(
                 "kb-near",
@@ -5930,11 +6092,26 @@ mod tests {
 
     #[test]
     fn reading_a_turn_back_reproduces_the_ranking_the_turn_saw() {
-        // Two candidates tied on distance (so their semantic terms tie), one
-        // ahead on reinforcement, one clearly ahead on distance, and one the
-        // bar refuses outright - ties and a refusal in one fixture.
-        let tied_a = hit("kb-tied-a", "tied a", &["topic"], at(RECALL_BAR + 3.0));
-        let tied_b = hit("kb-tied-b", "tied b", &["topic"], at(RECALL_BAR + 3.0));
+        // Two candidates close on distance, arriving in the *opposite* order
+        // from how they score - so getting the order right takes an actual
+        // comparison of the terms, not just preserving arrival order. An
+        // exact tie would not do this: a stable sort never reorders truly
+        // tied elements, so a tie holds under arrival order and under any
+        // correct comparison alike and proves nothing about which one ran.
+        // Plus one candidate ahead on reinforcement, one clearly ahead on
+        // distance, and one the bar refuses outright.
+        let close_second = hit(
+            "kb-close-second",
+            "close second",
+            &["topic"],
+            at(RECALL_BAR + 3.0),
+        );
+        let close_first = hit(
+            "kb-close-first",
+            "close first",
+            &["topic"],
+            at(RECALL_BAR + 3.01),
+        );
         let reinforced = opened(
             hit(
                 "kb-reinforced",
@@ -5949,27 +6126,23 @@ mod tests {
         let refused = hit("kb-refused", "refused", &["topic"], far());
 
         let candidates = RecallCandidates {
-            entries: vec![tied_a, tied_b, reinforced, leader, refused],
+            // `close_second` arrives first despite scoring lower, so a bug
+            // that fell back to arrival order for a near-tie moves it ahead
+            // of `close_first` and the test catches it.
+            entries: vec![close_second, close_first, reinforced, leader, refused],
             ..RecallCandidates::default()
         };
         let outcome = render_full(&candidates);
-
-        let mut by_rank: Vec<_> = outcome
-            .plan
-            .candidates
-            .iter()
-            .filter(|c| c.rank.is_some())
-            .collect();
-        by_rank.sort_by_key(|c| c.rank);
-        let stored_order: Vec<&str> = by_rank.iter().map(|c| c.id.as_str()).collect();
-
-        let mut by_total = by_rank.clone();
-        by_total.sort_by(|a, b| b.terms.total.total_cmp(&a.terms.total));
-        let recomputed_order: Vec<&str> = by_total.iter().map(|c| c.id.as_str()).collect();
+        let block = outcome
+            .block
+            .as_ref()
+            .expect("the admitted candidates cleared the bar");
 
         assert_eq!(
-            stored_order, recomputed_order,
-            "re-sorting the stored terms by total must reproduce the stored rank order"
+            plan_rendered_order(&outcome.plan),
+            block.entry_ids,
+            "the plan's rank order must match the order the entries actually rendered in the \
+             recall block - that is the ranking the turn saw"
         );
         assert!(
             outcome

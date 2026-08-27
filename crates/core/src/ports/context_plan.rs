@@ -50,10 +50,16 @@ use crate::ports::recall::{RecallDispersion, RecallRelevance};
 ///
 /// A turn's scan limits cap what today's arms can return well below this -
 /// [`MAX_PLANNED_CANDIDATES`] is the plan's own ceiling, not theirs, so a
-/// future scan limit can grow without the plan silently growing unbounded
-/// alongside it. [`ContextPlan::considered_count`] keeps the true count
-/// whether or not the array itself was cut, so a cut plan never reads as a
-/// small turn.
+/// future scan limit can grow without the stored array silently growing
+/// unbounded alongside it. [`ContextPlan::considered_count`] keeps the true
+/// count whether or not the array itself was cut, so a cut plan never reads
+/// as a small turn.
+///
+/// **This bounds what is kept, not what is scored.** The plan builder scores
+/// every candidate the scan returned before this cap runs; the cap only
+/// truncates the finished [`Vec`] afterward. A future scan limit large enough
+/// to matter would still pay to score the full set - this constant protects
+/// the size of the record, not the cost of building it.
 pub const MAX_PLANNED_CANDIDATES: usize = 512;
 
 /// The most bytes of the prompt's own query text a plan keeps.
@@ -400,44 +406,11 @@ mod tests {
         assert!(plan.query_text.is_none());
     }
 
-    #[test]
-    fn the_record_distinguishes_offered_from_opened() {
-        let mut plan = ContextPlan::no_lookup("r1", "c1");
-        plan.recall_ran = true;
-        plan.candidates.push(PlannedCandidate {
-            arm: RecallArm::Entry,
-            id: "kb-offered".to_string(),
-            relevance: RecallRelevance::Distance(0.1),
-            terms: ActivationTerms {
-                semantic: Some(5.0),
-                lexical: 0.0,
-                reinforcement: 0.0,
-                situation: 0.0,
-                salience: 0.0,
-                total: 5.0,
-            },
-            use_counts: None,
-            cleared_bar: true,
-            rank: Some(1),
-            offered: true,
-            drop_reason: None,
-        });
-
-        // Offered and opened are recorded on different axes: a candidate can
-        // be offered with nothing opened yet.
-        assert!(plan.candidates[0].offered);
-        assert!(
-            plan.opened.is_empty(),
-            "nothing has been fetched yet, so the opened array stays empty"
-        );
-
-        // An id can be opened without ever having been offered - the model
-        // already knew it and fetched it directly - so `opened` names ids the
-        // candidate list may not contain at all.
-        plan.opened.push("kb-already-known".to_string());
-        assert!(
-            !plan.candidates.iter().any(|c| c.id == plan.opened[0]),
-            "an opened id need not be one this turn's lookup ever offered"
-        );
-    }
+    // The distinction between "offered" and "opened" is covered where it can
+    // actually be driven: `offered` through `render_recall_with_width` in
+    // `crate::recall`'s test module (a candidate that clears the bar but
+    // does not fit the render width, versus one that does), and `opened`
+    // by the unit that wires the writer - nothing in this crate populates
+    // `ContextPlan::opened` yet, so a test of it here would assert a
+    // distinction the code cannot make.
 }
