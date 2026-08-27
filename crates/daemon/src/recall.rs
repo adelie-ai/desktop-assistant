@@ -203,6 +203,14 @@ type NoteArm = (Vec<RecallNote>, Option<RecallDispersion>);
 /// can report a correction instead of silently forgetting it -
 /// [`KnowledgeEntry::display_line`] is what keeps a `refuted` row from ever
 /// reading as a current fact once it is offered.
+///
+/// **Duplicated in `desktop_assistant_storage::recall_replay::replay_admits`
+/// (#1328), pinned to agree by
+/// `the_two_disposition_admission_rules_agree_for_every_disposition` below.**
+/// Storage cannot depend on daemon to call this directly, so the replay
+/// instrument that measures this block's own ranking carries its own copy;
+/// the test in this file is what stops the two from silently drifting apart.
+/// Edit both functions and that test in the same change.
 fn recall_admits(disposition: Disposition) -> bool {
     matches!(disposition, Disposition::Active | Disposition::Refuted)
 }
@@ -801,6 +809,29 @@ mod tests {
                 expected,
                 "{disposition:?} must {} the recall block's admission bar",
                 if expected { "clear" } else { "not clear" }
+            );
+        }
+    }
+
+    /// Acceptance (#1328): `recall_admits` here and
+    /// `desktop_assistant_storage::recall_replay::replay_admits` are two
+    /// copies of one rule - storage cannot depend on daemon to share it, so
+    /// daemon (which depends on storage) is the one side that can hold them
+    /// to the same answer. Enumerated from `Disposition::ALL` rather than a
+    /// hand-written list, so a disposition added to the enum later and
+    /// wired into only one copy fails this test instead of silently
+    /// ranking wrong in whichever copy was missed.
+    #[test]
+    fn the_two_disposition_admission_rules_agree_for_every_disposition() {
+        use desktop_assistant_core::domain::knowledge::Disposition;
+        use desktop_assistant_storage::recall_replay::replay_admits;
+
+        for disposition in Disposition::ALL {
+            assert_eq!(
+                recall_admits(disposition),
+                replay_admits(disposition),
+                "{disposition:?}: the live block's admission rule and replay's copy of it \
+                 must agree, or replay can rank a candidate production would never show"
             );
         }
     }

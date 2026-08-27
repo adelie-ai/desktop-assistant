@@ -707,13 +707,21 @@ const SNAPSHOT_NEAREST_SQL: &str = "\
 /// candidate set at all, before ranking (#893, #1341).
 ///
 /// **Duplicated from `crates/daemon/src/recall.rs::recall_admits`, not
-/// shared.** That function is private to the daemon crate, and storage does
-/// not depend on daemon -- the dependency runs the other way, so nothing
-/// here can call it. Keeping two copies is exactly the drift risk this
-/// module's own doc warns callers about elsewhere; there is no shared
-/// predicate to reach for today, so this one is written down instead of
-/// silently assumed, and the two must be kept in sync by hand until
-/// something is lifted into `core` to hold them together.
+/// shared, by design decision rather than oversight.** That function is
+/// private to the daemon crate, and storage does not depend on daemon -- the
+/// dependency runs the other way, so nothing here can call it. Lifting a
+/// shared predicate into `core` was considered and deliberately deferred: it
+/// is a wider change than this module should carry on its own, touching a
+/// crate boundary while other work lands around it.
+///
+/// **`pub` so `crates/daemon/src/recall.rs`'s own test suite can reach it.**
+/// A doc comment asserting agreement is a stated property with no enforcer -
+/// exactly the shape this codebase keeps finding and fixing elsewhere.
+/// `the_two_disposition_admission_rules_agree_for_every_disposition` in that
+/// file iterates every [`Disposition`] variant and asserts this function and
+/// `recall_admits` answer identically; daemon can see both sides because it
+/// depends on storage, and that is the one direction this pin can run in.
+/// Edit this function and that test in the same change.
 ///
 /// This is not optional polish: `ActivationWeights::disposition`
 /// (`crates/core/src/domain/activation.rs`) prices `Obsolete`, `Superseded`
@@ -722,7 +730,7 @@ const SNAPSHOT_NEAREST_SQL: &str = "\
 /// them. A ranked scan that skipped this filter would rank a candidate
 /// production would never have shown at all, under a scorer that was never
 /// fitted to weigh it down.
-fn replay_admits(disposition: Disposition) -> bool {
+pub fn replay_admits(disposition: Disposition) -> bool {
     matches!(disposition, Disposition::Active | Disposition::Refuted)
 }
 
