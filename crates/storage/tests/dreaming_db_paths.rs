@@ -251,20 +251,20 @@ async fn kb_exists(pool: &PgPool, id: &str) -> bool {
     count > 0
 }
 
-async fn kb_deleted_kind(pool: &PgPool, id: &str) -> Option<String> {
-    sqlx::query_scalar("SELECT deleted_kind FROM knowledge_base WHERE id = $1")
+async fn kb_disposition(pool: &PgPool, id: &str) -> Option<String> {
+    sqlx::query_scalar("SELECT disposition FROM knowledge_base WHERE id = $1")
         .bind(id)
         .fetch_one(pool)
         .await
-        .expect("read deleted_kind")
+        .expect("read disposition")
 }
 
-async fn kb_deleted_reason(pool: &PgPool, id: &str) -> Option<String> {
-    sqlx::query_scalar("SELECT deleted_reason FROM knowledge_base WHERE id = $1")
+async fn kb_disposition_reason(pool: &PgPool, id: &str) -> Option<String> {
+    sqlx::query_scalar("SELECT disposition_reason FROM knowledge_base WHERE id = $1")
         .bind(id)
         .fetch_one(pool)
         .await
-        .expect("read deleted_reason")
+        .expect("read disposition_reason")
 }
 
 async fn kb_superseded_by(pool: &PgPool, id: &str) -> Option<String> {
@@ -275,18 +275,18 @@ async fn kb_superseded_by(pool: &PgPool, id: &str) -> Option<String> {
         .expect("read superseded_by")
 }
 
-/// Tombstone counts per `deleted_kind`, as an auditor would ask for them:
-/// `(kind, count)` sorted by kind, NULL kinds excluded.
-async fn tombstones_by_kind(pool: &PgPool, user_id: &str) -> Vec<(String, i64)> {
+/// Tombstone counts per `disposition`, as an auditor would ask for them:
+/// `(disposition, count)` sorted by disposition.
+async fn tombstones_by_disposition(pool: &PgPool, user_id: &str) -> Vec<(String, i64)> {
     sqlx::query_as(
-        "SELECT deleted_kind, COUNT(*) FROM knowledge_base \
-         WHERE user_id = $1 AND deleted_at IS NOT NULL AND deleted_kind IS NOT NULL \
-         GROUP BY deleted_kind ORDER BY deleted_kind",
+        "SELECT disposition, COUNT(*) FROM knowledge_base \
+         WHERE user_id = $1 AND deleted_at IS NOT NULL \
+         GROUP BY disposition ORDER BY disposition",
     )
     .bind(user_id)
     .fetch_all(pool)
     .await
-    .expect("group tombstones by deleted_kind")
+    .expect("group tombstones by disposition")
 }
 
 async fn kb_review_generation(pool: &PgPool, id: &str) -> i16 {
@@ -546,9 +546,9 @@ async fn explicit_entry_proposed_for_deletion_is_not_pruned_and_is_counted() {
         "a source = 'explicit' entry must survive a proposed prune"
     );
     assert_eq!(
-        kb_deleted_kind(pool, "kb-a").await,
-        None,
-        "the protected entry carries no tombstone provenance"
+        kb_disposition(pool, "kb-a").await.as_deref(),
+        Some("active"),
+        "the protected entry keeps its default disposition, not a tombstone one"
     );
     assert_eq!(
         stats.protected_from_delete, 1,
@@ -701,9 +701,9 @@ async fn merge_records_superseding_id_on_every_soft_deleted_member() {
     for member in ["kb-b", "kb-c"] {
         assert!(kb_is_deleted(pool, member).await, "{member} is retired");
         assert_eq!(
-            kb_deleted_kind(pool, member).await.as_deref(),
-            Some("merge"),
-            "{member} is recorded as a merge, not a prune"
+            kb_disposition(pool, member).await.as_deref(),
+            Some("superseded"),
+            "{member} is recorded as superseded by a merge, not a prune"
         );
         assert_eq!(
             kb_superseded_by(pool, member).await.as_deref(),
@@ -711,7 +711,7 @@ async fn merge_records_superseding_id_on_every_soft_deleted_member() {
             "{member} names the canonical row that absorbed it"
         );
         assert_eq!(
-            kb_deleted_reason(pool, member).await,
+            kb_disposition_reason(pool, member).await,
             None,
             "a merge member has no stated reason; superseded_by is the reason"
         );
@@ -721,7 +721,7 @@ async fn merge_records_superseding_id_on_every_soft_deleted_member() {
 }
 
 #[tokio::test]
-async fn standalone_prune_records_prune_kind_and_the_models_reason() {
+async fn standalone_prune_records_trivial_disposition_and_the_models_reason() {
     let Some(fx) = support::DbFixture::try_new("dream695").await else {
         return;
     };
@@ -745,18 +745,18 @@ async fn standalone_prune_records_prune_kind_and_the_models_reason() {
 
     assert!(kb_is_deleted(pool, "kb-b").await);
     assert_eq!(
-        kb_deleted_kind(pool, "kb-b").await.as_deref(),
-        Some("prune")
+        kb_disposition(pool, "kb-b").await.as_deref(),
+        Some("trivial")
     );
     assert_eq!(
-        kb_deleted_reason(pool, "kb-b").await.as_deref(),
+        kb_disposition_reason(pool, "kb-b").await.as_deref(),
         Some("mattered only in the moment"),
         "the model's stated reason is persisted, not discarded"
     );
     assert_eq!(
         kb_superseded_by(pool, "kb-b").await,
         None,
-        "nothing supersedes a prune"
+        "nothing supersedes a standalone retirement"
     );
 
     fx.cleanup().await;
@@ -792,9 +792,9 @@ async fn merge_and_prune_tombstones_are_distinguishable_by_sql() {
     // The audit the epic could not run: split tombstones into relocated vs
     // destroyed, from SQL alone.
     assert_eq!(
-        tombstones_by_kind(pool, "u1").await,
-        vec![("merge".to_string(), 1), ("prune".to_string(), 1)],
-        "merge and prune tombstones are separable without reading logs"
+        tombstones_by_disposition(pool, "u1").await,
+        vec![("superseded".to_string(), 1), ("trivial".to_string(), 1)],
+        "a merge's and a standalone retirement's tombstones are separable without reading logs"
     );
 
     fx.cleanup().await;
@@ -823,12 +823,12 @@ async fn prune_with_no_stated_reason_records_null_not_an_empty_string() {
     .expect("consolidation scan succeeds");
 
     assert_eq!(
-        kb_deleted_kind(pool, "kb-b").await.as_deref(),
-        Some("prune"),
-        "an unstated reason still records that this was a prune"
+        kb_disposition(pool, "kb-b").await.as_deref(),
+        Some("trivial"),
+        "an unstated reason still records the standalone-retirement disposition"
     );
     assert_eq!(
-        kb_deleted_reason(pool, "kb-b").await,
+        kb_disposition_reason(pool, "kb-b").await,
         None,
         "an absent reason is NULL, not an empty string"
     );
@@ -861,7 +861,7 @@ async fn delete_reason_from_the_model_is_bounded_before_storage() {
     .await
     .expect("consolidation scan succeeds");
 
-    let stored = kb_deleted_reason(pool, "kb-b")
+    let stored = kb_disposition_reason(pool, "kb-b")
         .await
         .expect("a reason was stored");
     assert_eq!(
@@ -898,17 +898,17 @@ async fn delete_provenance_is_never_written_to_another_tenants_rows() {
     .expect("consolidation scan succeeds");
 
     assert_eq!(
-        kb_deleted_kind(pool, "kb-u1").await.as_deref(),
-        Some("prune")
+        kb_disposition(pool, "kb-u1").await.as_deref(),
+        Some("trivial")
     );
     assert!(!kb_is_deleted(pool, "kb-u2").await, "user2's row is active");
     assert_eq!(
-        kb_deleted_kind(pool, "kb-u2").await,
-        None,
-        "user2's row carries no provenance from user1's run"
+        kb_disposition(pool, "kb-u2").await.as_deref(),
+        Some("active"),
+        "user2's row carries no disposition from user1's run"
     );
     assert_eq!(kb_superseded_by(pool, "kb-u2").await, None);
-    assert_eq!(kb_deleted_reason(pool, "kb-u2").await, None);
+    assert_eq!(kb_disposition_reason(pool, "kb-u2").await, None);
 
     fx.cleanup().await;
 }
@@ -940,9 +940,9 @@ async fn empty_knowledge_base_consolidates_to_a_clean_no_op() {
     assert_eq!(stats.protected_from_delete, 0);
     assert_eq!(stats.settled_unchanged, 0);
     assert_eq!(
-        kb_deleted_kind(pool, "kb-gone").await,
-        None,
-        "an existing tombstone is not restamped by a no-op run"
+        kb_disposition(pool, "kb-gone").await.as_deref(),
+        Some("active"),
+        "an existing tombstone's disposition is not restamped by a no-op run"
     );
 
     fx.cleanup().await;
@@ -1244,8 +1244,8 @@ async fn settled_entry_can_still_be_pruned() {
         "a settled entry is still prunable"
     );
     assert_eq!(
-        kb_deleted_kind(pool, "kb-a").await.as_deref(),
-        Some("prune")
+        kb_disposition(pool, "kb-a").await.as_deref(),
+        Some("trivial")
     );
 
     fx.cleanup().await;

@@ -7,7 +7,7 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::clock::NowSnapshot;
 use desktop_assistant_core::domain::knowledge_use::{MarkPolarity, MarkSource};
 use desktop_assistant_core::domain::{
-    KnowledgeEntry, Role, SUMMARY_MAX_CHARS, ToolDefinition, ToolRunner,
+    Disposition, KnowledgeEntry, Role, SUMMARY_MAX_CHARS, ToolDefinition, ToolRunner,
 };
 use desktop_assistant_core::ports::client_tools::current_client_tools;
 use desktop_assistant_core::ports::conversation_ctx::current_conversation_id;
@@ -1818,6 +1818,7 @@ impl BuiltinToolService {
             created_at: String::new(),
             updated_at: String::new(),
             source: Some("explicit".to_string()),
+            disposition: Disposition::Active,
             summary,
         })
     }
@@ -6849,6 +6850,7 @@ mod tests {
             created_at: "2026-01-01".to_string(),
             updated_at: "2026-01-01".to_string(),
             source: Some("explicit".to_string()),
+            disposition: Disposition::Active,
             summary: None,
         });
     }

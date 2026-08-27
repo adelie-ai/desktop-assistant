@@ -154,32 +154,16 @@ pub const MAX_DROPPED_OP_EXCERPT_CHARS: usize = 160;
 /// would show only as a signal that never fires.
 pub const SOURCE_EXPLICIT: &str = desktop_assistant_core::domain::salience::SOURCE_EXPLICIT;
 
-/// Why consolidation soft-deleted a row, recorded on the row itself.
+/// What consolidation, or a person, has judged a row to be. The domain reads
+/// the same value the applier writes, so there is one definition and this is
+/// the name storage knows it by - the same rule [`SOURCE_EXPLICIT`] follows.
 ///
-/// Merge and prune are very different outcomes: one relocates the content
-/// into a canonical row, the other destroys it. They used to write an
-/// identical row change, so no query could tell them apart. Stored in
-/// `knowledge_base.deleted_kind`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KbDeleteKind {
-    /// The content was carried forward into a canonical row, named by
-    /// `knowledge_base.superseded_by`.
-    Merge,
-    /// The model judged the entry not worth keeping. Nothing supersedes it; the
-    /// stated reason is in `knowledge_base.deleted_reason`.
-    Prune,
-}
-
-impl KbDeleteKind {
-    /// Stable on-disk spelling. Must match the `knowledge_base_deleted_kind_chk`
-    /// CHECK constraint in migration 038.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Merge => "merge",
-            Self::Prune => "prune",
-        }
-    }
-}
+/// Migration 056 widened `knowledge_base.deleted_kind` (merge-or-prune,
+/// meaningful only on a tombstone) into `knowledge_base.disposition`
+/// (meaningful on any row, whether or not it is also soft-deleted). A merge
+/// writes [`Disposition::Superseded`]; a standalone retirement with no
+/// successor writes [`Disposition::Trivial`].
+pub use desktop_assistant_core::domain::knowledge::Disposition;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ConsolidationStats {
@@ -225,5 +209,44 @@ mod tests {
     #[test]
     fn explicit_provenance_is_the_value_the_schema_writes() {
         assert_eq!(SOURCE_EXPLICIT, "explicit");
+    }
+
+    /// [`Disposition::ALL`] and migration 056's `knowledge_base_disposition_chk`
+    /// CHECK constraint have to name exactly the same six values, or a variant
+    /// this binary writes could be rejected by the database, or a value the
+    /// database accepts could fail to parse back into a variant. Reads the
+    /// migration file itself rather than repeating its list, so the two cannot
+    /// drift the way [`SOURCE_EXPLICIT`] cannot.
+    #[test]
+    fn disposition_enum_spellings_match_the_schema_check() {
+        let migration = include_str!("../../migrations/056_kb_disposition.sql");
+
+        let check_at = migration
+            .find("CHECK (disposition IN")
+            .expect("migration 056 must define the disposition CHECK constraint");
+        let outer_open = migration[check_at..]
+            .find('(')
+            .map(|i| check_at + i)
+            .expect("the CHECK constraint opens a parenthesis");
+        let list_open = migration[outer_open + 1..]
+            .find('(')
+            .map(|i| outer_open + 1 + i)
+            .expect("the IN clause opens its own value-list parenthesis");
+        let list_close = migration[list_open + 1..]
+            .find(')')
+            .map(|i| list_open + 1 + i)
+            .expect("the value list closes");
+
+        let schema_values: std::collections::BTreeSet<&str> = migration[list_open + 1..list_close]
+            .split(',')
+            .map(|value| value.trim().trim_matches('\''))
+            .collect();
+        let enum_values: std::collections::BTreeSet<&str> =
+            Disposition::ALL.iter().map(|d| d.as_str()).collect();
+
+        assert_eq!(
+            schema_values, enum_values,
+            "the migration's CHECK list and Disposition::ALL must name the same values"
+        );
     }
 }

@@ -17,7 +17,7 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::ports::auth::current_user_id;
 use sqlx::PgPool;
 
-use super::types::{ConsolidationStats, KbDeleteKind, MAX_REVIEW_GENERATION, SOURCE_EXPLICIT};
+use super::types::{ConsolidationStats, Disposition, MAX_REVIEW_GENERATION, SOURCE_EXPLICIT};
 use crate::kb_metadata::{KbMetadata, KbScope};
 use crate::knowledge_delete::KnowledgeDeletePolicy;
 
@@ -285,12 +285,12 @@ pub async fn apply_ops(
             let result = sqlx::query(
                 "UPDATE knowledge_base \
                  SET deleted_at = NOW(), reviewed_at = NOW(), \
-                     deleted_kind = $3, superseded_by = $4 \
+                     disposition = $3, superseded_by = $4 \
                  WHERE user_id = $2 AND id = ANY($1) AND deleted_at IS NULL",
             )
             .bind(&to_delete)
             .bind(user_id.as_str())
-            .bind(KbDeleteKind::Merge.as_str())
+            .bind(Disposition::Superseded.as_str())
             .bind(&merge.canonical_id)
             .execute(&mut *tx)
             .await
@@ -369,14 +369,14 @@ pub async fn apply_ops(
         let result = sqlx::query(
             "UPDATE knowledge_base \
              SET deleted_at = NOW(), reviewed_at = NOW(), \
-                 deleted_kind = $3, deleted_reason = $4 \
+                 disposition = $3, disposition_reason = $4 \
              WHERE user_id = $2 AND id = $1 \
                AND deleted_at IS NULL \
                AND source IS DISTINCT FROM 'explicit'",
         )
         .bind(&id)
         .bind(user_id.as_str())
-        .bind(KbDeleteKind::Prune.as_str())
+        .bind(Disposition::Trivial.as_str())
         .bind(reason.as_deref())
         .execute(&mut *tx)
         .await

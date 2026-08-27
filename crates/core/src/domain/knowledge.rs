@@ -2,6 +2,88 @@ use serde::{Deserialize, Serialize};
 
 pub use desktop_assistant_protocol::SUMMARY_MAX_CHARS;
 
+/// What consolidation, or a person, has judged a stored claim to be.
+///
+/// A closed enum rather than a bare string, so an invalid disposition is hard
+/// to represent. The database enforces the same six spellings with a CHECK
+/// constraint (`knowledge_base_disposition_chk`, migration 056); the storage
+/// layer maps [`Self::as_str`] to and from the column, and
+/// `disposition_enum_spellings_match_the_schema_check`
+/// (`crates/storage/tests`) pins the two vocabularies together so they cannot
+/// drift apart silently.
+///
+/// Disposition is decoupled from deletion: a dispositioned entry is normally
+/// still live. Only `deleted_at` says whether a row is in the trash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Disposition {
+    /// A live claim, judged nothing else. The default for a new entry, and
+    /// what restore sets.
+    #[default]
+    Active,
+    /// Established untrue. `KnowledgeEntry`'s storage-layer counterpart
+    /// carries the stated reason in `disposition_reason`. Must never be
+    /// rendered as a current fact, but must stay findable when the query is
+    /// about its subject - that asymmetry is the point of the value.
+    Refuted,
+    /// Replaced by a newer statement. The successor's id is recorded
+    /// alongside the entry (`superseded_by` in storage); a query that matches
+    /// this entry should resolve through the link.
+    Superseded,
+    /// A duplicate of another entry, which is recorded the same way
+    /// `Superseded` records its successor.
+    Redundant,
+    /// Was true, no longer applies. Excluded from results unless the caller
+    /// asks for it.
+    Obsolete,
+    /// Harmless, not worth surfacing. Ranks below a comparable active entry
+    /// rather than being excluded outright.
+    Trivial,
+}
+
+impl Disposition {
+    /// Every value, in the order the database's CHECK constraint lists them.
+    pub const ALL: [Disposition; 6] = [
+        Self::Active,
+        Self::Refuted,
+        Self::Superseded,
+        Self::Redundant,
+        Self::Obsolete,
+        Self::Trivial,
+    ];
+
+    /// The spelling stored in `knowledge_base.disposition`.
+    ///
+    /// Stable: it is a value in a database column, so a variant that changed
+    /// its spelling here would orphan every row already written under the old
+    /// one.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Refuted => "refuted",
+            Self::Superseded => "superseded",
+            Self::Redundant => "redundant",
+            Self::Obsolete => "obsolete",
+            Self::Trivial => "trivial",
+        }
+    }
+
+    /// The disposition a stored spelling names, or `None` for a spelling no
+    /// variant claims.
+    ///
+    /// The database CHECK constraint means a row read back from
+    /// `knowledge_base` can never actually carry an unrecognized spelling;
+    /// `None` exists for the same reason [`SituationField::parse`]'s does -
+    /// so a caller reading a value from somewhere the CHECK does not reach
+    /// (a hand-edited row, an older binary's write) degrades to a decision
+    /// rather than a panic.
+    ///
+    /// [`SituationField::parse`]: crate::domain::situation::SituationField::parse
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|d| d.as_str() == value)
+    }
+}
+
 /// A unified knowledge base entry, replacing separate preferences and memory stores.
 /// Each entry is prose content with tags and optional metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,6 +100,12 @@ pub struct KnowledgeEntry {
     /// it.
     #[serde(default)]
     pub source: Option<String>,
+    /// What consolidation, or a person, has judged this entry to be.
+    /// Defaults to [`Disposition::Active`] - an entry stored before this
+    /// field existed, or a read path that does not select it, reads as an
+    /// ordinary live claim, which is what it always was.
+    #[serde(default)]
+    pub disposition: Disposition,
     /// A one-line condensation of what this entry says, for a reader that
     /// shows many entries at once and cannot spend the whole body on each.
     ///
@@ -52,6 +140,7 @@ impl KnowledgeEntry {
             created_at: String::new(),
             updated_at: String::new(),
             source: None,
+            disposition: Disposition::Active,
             summary: None,
         }
     }

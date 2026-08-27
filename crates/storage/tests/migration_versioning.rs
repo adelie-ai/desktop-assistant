@@ -248,27 +248,31 @@ async fn legacy_transition_applies_migrations_that_never_ran() {
     };
 
     // Roll `knowledge_base` back to its pre-038 shape — the state of a
-    // database whose last daemon predated that migration.
+    // database whose last daemon predated that migration and migration 056,
+    // which renames 038's columns. `disposition`/`disposition_reason` are
+    // migration 056's names for what 038 originally called `deleted_kind`/
+    // `deleted_reason`; dropping the current names simulates neither
+    // migration ever having run.
     sqlx::query(
         "ALTER TABLE knowledge_base \
-             DROP COLUMN IF EXISTS deleted_kind, \
-             DROP COLUMN IF EXISTS deleted_reason, \
+             DROP COLUMN IF EXISTS disposition, \
+             DROP COLUMN IF EXISTS disposition_reason, \
              DROP COLUMN IF EXISTS superseded_by",
     )
     .execute(&fx.pool)
     .await
-    .expect("roll back migration 038");
+    .expect("roll back migrations 038 and 056");
     simulate_pre_ledger_database(&fx.pool).await;
 
     run_migrations(&fx.pool)
         .await
         .expect("transition boot migrates a behind-head database");
 
-    for column in ["deleted_kind", "deleted_reason", "superseded_by"] {
+    for column in ["disposition", "disposition_reason", "superseded_by"] {
         assert!(
             has_column(&fx.pool, fx.schema(), "knowledge_base", column).await,
-            "migration 038 never ran on this database, so the transition must \
-             apply it — `knowledge_base.{column}` is missing"
+            "migrations 038 and 056 never ran on this database, so the transition must \
+             apply both in order — `knowledge_base.{column}` is missing"
         );
     }
 
