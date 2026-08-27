@@ -173,7 +173,7 @@ pub const MAX_REINFORCEMENT_DEVIATIONS: f64 = 3.0;
 /// **Decisive against a near-tie, not against a real semantic lead.** The two
 /// cheap signals ([`ActivationWeights::situation`],
 /// [`ActivationWeights::salience`]) are bounded by
-/// [`Self::reference_use_lift`] - about a third of a deviation - and adjacent
+/// [`ActivationWeights::reference_use_lift`] - about a third of a deviation - and adjacent
 /// candidates over a real store sit a few tenths of a deviation apart (see
 /// [`DEFAULT_USE_LIFT`]'s own measurement). A one-deviation penalty clears
 /// both: a `trivial` entry cannot lead an `active` one of comparable
