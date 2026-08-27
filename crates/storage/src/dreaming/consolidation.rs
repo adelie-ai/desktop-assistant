@@ -1,32 +1,40 @@
-//! Phase 2: holistic knowledge-base consolidation (issue #394).
+//! Phase 2: holistic knowledge-base consolidation (issue #394, verbs widened
+//! by #893).
 //!
 //! Rather than reviewing entries one-by-one against a handful of neighbours,
 //! this loads the user's entire active knowledge base and asks a strong model
-//! to recompute what it should look like — pruning trivia, merging duplicates,
-//! tightening verbose entries — emitting explicit operations against existing
-//! ids. The operations are applied transactionally with soft-delete via
-//! [`reconcile::apply_ops`].
+//! to recompute what it should look like - dispositioning stale or duplicate
+//! entries, merging near-duplicates into a new unified entry, tightening
+//! verbose ones - emitting explicit operations against existing ids. The
+//! operations are applied transactionally via [`reconcile::apply_ops`].
+//! Nothing this pass does deletes a row: an entry it judges wrong, stale or
+//! redundant is dispositioned - marked with what it is and why - and stays
+//! live and findable.
 //!
 //! The plan is not applied verbatim. Four rules bound what one run's judgment
 //! can do, because that judgment is formed from prose alone with no signal
 //! about whether an entry was ever retrieved or cited:
 //!
-//! 1. A deliberately promoted entry ([`SOURCE_EXPLICIT`]) is never pruned. It
-//!    may be rewritten or merged, and the provenance follows it, so the
-//!    protection cannot be laundered away over successive runs.
+//! 1. A deliberately promoted entry ([`SOURCE_EXPLICIT`]) may never be
+//!    dispositioned `trivial` or `redundant` - the model's own judgment is not
+//!    enough to make a fact the user entered on purpose disappear from view.
+//!    It may still be edited, merged, or dispositioned `refuted`,
+//!    `superseded`, or `obsolete`, and the protection follows a merge's new
+//!    row, so it cannot be laundered away over successive runs.
 //! 2. An entry already rewritten [`MAX_REVIEW_GENERATION`] times is settled:
 //!    consolidation re-reads its own output every pass, so without a stop the
-//!    store drifts from what was observed toward paraphrase of paraphrase. A
-//!    settled entry stays prunable - the cap settles its prose, not the store.
-//! 3. Outright prunes are capped at the configured share of the active set per
-//!    run ([`KnowledgeDeletePolicy::prune_cap`]). Merges do not count: their
-//!    content survives in a canonical row. A configured share of zero applies
-//!    the merges and the edits and retires nothing.
+//!    store drifts from what was observed toward paraphrase of paraphrase.
+//!    Only `edit` is refused - a settled entry may still be merged (into a new
+//!    row, so its own prose is never rewritten) or dispositioned.
+//! 3. The disposition budget is capped at the configured share of the active
+//!    set per run ([`KnowledgeDeletePolicy::prune_cap`]), computed after
+//!    clustering: an id a merge already absorbs does not spend it. A merge's
+//!    new row does not count either - the content survives, unified, in a row
+//!    of its own.
 //! 4. Rewrites are capped the same way
 //!    ([`KnowledgeDeletePolicy::rewrite_cap`]). An edit and a merge both
-//!    overwrite content with no prior version kept, so one degraded answer
-//!    must not reach the whole store. A merge costs one whatever its cluster
-//!    size, because only the canonical row's content is replaced.
+//!    write content with no prior version kept, so one degraded answer must
+//!    not reach the whole store. A merge costs one whatever its cluster size.
 //!
 //! Both caps defer rather than discard: the entries are still there for the
 //! next run, and the counts are reported.
@@ -80,7 +88,7 @@ use crate::knowledge_use::all_use_records;
 use super::common::{extract_json_payload, is_total_failure};
 use super::reconcile::{OpBuffer, ProposedOp, SynthesizedMerge, apply_ops};
 use super::types::{
-    ConsolidationStats, DreamingLlmFn, KnowledgeChangeFn, MAX_DELETE_REASON_CHARS,
+    ConsolidationStats, Disposition, DreamingLlmFn, KnowledgeChangeFn, MAX_DELETE_REASON_CHARS,
     MAX_DROPPED_OP_EXCERPT_CHARS, MAX_HOLISTIC_PROMPT_CHARS, MAX_REVIEW_GENERATION,
     MAX_SLICE_SPLIT_DEPTH, SOURCE_EXPLICIT,
 };
@@ -188,6 +196,8 @@ pub async fn run_consolidation_phase(
                 total.prunes_over_cap += stats.prunes_over_cap;
                 total.rewrites_over_cap += stats.rewrites_over_cap;
                 total.dropped_operations += stats.dropped_operations;
+                total.scope_guard_refusals += stats.scope_guard_refusals;
+                total.backstop_firings += stats.backstop_firings;
                 // Live refresh: if this user's KB actually changed, let connected
                 // panels refetch as the scan progresses.
                 if (stats.merged_clusters > 0
@@ -275,7 +285,8 @@ async fn consolidate_user(
     let mut merge_ops: Vec<MergeOp> = Vec::new();
     let mut update_ops: Vec<(String, String)> = Vec::new();
     let mut scope_ops: Vec<(String, KbScope)> = Vec::new();
-    let mut delete_ops: Vec<(String, Option<String>)> = Vec::new();
+    let mut disposition_ops: Vec<(String, Disposition, Option<String>, Option<String>)> =
+        Vec::new();
     // Refusals, reported so an operator can see what the model keeps asking
     // for and the guards keep declining.
     let mut protected_from_delete = 0usize;
@@ -321,26 +332,68 @@ async fn consolidate_user(
 
         for op in answer.ops {
             match op {
-                RawOp::Delete { ids, id, reason } => {
-                    for did in ids.into_iter().chain(id) {
-                        if !valid.contains(did.as_str()) {
-                            tracing::debug!("dreaming: ignoring delete of unknown id {did}");
-                            continue;
-                        }
-                        // A fact someone entered on purpose is not the model's
-                        // to remove. It may still be rewritten or merged, so
-                        // this refuses the prune, not the entry.
-                        if protected.contains(did.as_str()) {
-                            protected_from_delete += 1;
-                            tracing::debug!(
-                                "dreaming: refusing to prune deliberately-entered entry {did}"
-                            );
-                            continue;
-                        }
-                        delete_ops.push((did, clamp_delete_reason(&reason)));
+                RawOp::Disposition {
+                    id,
+                    target,
+                    reason,
+                    superseded_by,
+                } => {
+                    if !valid.contains(id.as_str()) {
+                        tracing::debug!("dreaming: ignoring disposition of unknown id {id}");
+                        continue;
                     }
+                    let Some(disposition) = Disposition::parse(&target) else {
+                        tracing::debug!(
+                            "dreaming: dropping disposition of {id} naming an unreadable \
+                             target {target:?}"
+                        );
+                        dropped_operations += 1;
+                        continue;
+                    };
+                    if matches!(disposition, Disposition::Active) {
+                        // "active" is what an entry already is; there is
+                        // nothing to disposition it to.
+                        tracing::debug!("dreaming: ignoring a disposition of {id} naming 'active'");
+                        continue;
+                    }
+                    if matches!(
+                        disposition,
+                        Disposition::Superseded | Disposition::Redundant
+                    ) && superseded_by.is_none()
+                    {
+                        // The schema requires a successor for these two. A
+                        // proposal with none cannot be stored, so it is
+                        // treated the same as any other unreadable element
+                        // rather than silently discarded.
+                        tracing::debug!(
+                            "dreaming: dropping {target} disposition of {id} with no \
+                             superseded_by"
+                        );
+                        dropped_operations += 1;
+                        continue;
+                    }
+                    // A fact someone entered on purpose is not the model's to
+                    // make trivial or redundant. It may still be edited,
+                    // merged, or dispositioned refuted/superseded/obsolete, so
+                    // this refuses the one disposition, not the entry.
+                    if matches!(disposition, Disposition::Trivial | Disposition::Redundant)
+                        && protected.contains(id.as_str())
+                    {
+                        protected_from_delete += 1;
+                        tracing::debug!(
+                            "dreaming: refusing to disposition deliberately-entered entry \
+                             {id} {target}"
+                        );
+                        continue;
+                    }
+                    disposition_ops.push((
+                        id,
+                        disposition,
+                        clamp_delete_reason(&reason),
+                        superseded_by,
+                    ));
                 }
-                RawOp::Merge {
+                RawOp::MergeNew {
                     ids,
                     content,
                     scope,
@@ -350,18 +403,13 @@ async fn consolidate_user(
                         .filter(|i| valid.contains(i.as_str()))
                         .collect();
                     if members.len() < 2 {
-                        tracing::debug!("dreaming: skipping merge with <2 valid members");
+                        tracing::debug!("dreaming: skipping merge_new with <2 valid members");
                         continue;
                     }
-                    // The whole merge is dropped, not just the settled member:
-                    // the synthesized content was written to stand for every
-                    // member, so applying it while one of them stays live would
-                    // duplicate that entry rather than unify it.
-                    if let Some(id) = members.iter().find(|i| settled.contains(i.as_str())) {
-                        tracing::debug!("dreaming: skipping merge touching settled entry {id}");
-                        settled_unchanged += 1;
-                        continue;
-                    }
+                    // A settled member no longer blocks the merge: merge_new
+                    // writes a new row and leaves every member's own prose
+                    // untouched, so there is nothing left for the settled rule
+                    // to guard here - it still guards `edit`.
                     merge_ops.push(MergeOp {
                         members,
                         content,
@@ -385,6 +433,15 @@ async fn consolidate_user(
                     // advance the review generation and cannot drift the prose,
                     // so a settled entry can still be filed more precisely.
                     if let Some(scope) = scope.filter(|s| !s.is_empty()) {
+                        scope_ops.push((id, scope));
+                    }
+                }
+                RawOp::SetScope { id, scope } => {
+                    if !valid.contains(id.as_str()) {
+                        tracing::debug!("dreaming: ignoring set_scope of unknown id {id}");
+                        continue;
+                    }
+                    if !scope.is_empty() {
                         scope_ops.push((id, scope));
                     }
                 }
@@ -458,64 +515,75 @@ async fn consolidate_user(
     // synthesized merges, pulling the recorded content for each group.
     let mut synthesized: Vec<SynthesizedMerge> = Vec::new();
     for cluster in buffer.merge_clusters() {
-        let Some((_, (new_content, new_scope))) = cluster
-            .iter()
-            .find_map(|id| merge_content.get(id).map(|c| (id, c)))
-        else {
+        // The cluster's lowest id is always the "canonical" (own-lowest) key
+        // some original merge_new op was recorded under: the globally lowest
+        // id in a chained cluster belongs to one op, and it is that op's own
+        // lowest member too, since nothing in the cluster is smaller.
+        let canonical = OpBuffer::canonical_of(&cluster)
+            .expect("a cluster returned by merge_clusters is never empty");
+        let Some((new_content, new_scope)) = merge_content.get(canonical) else {
             tracing::warn!("dreaming: merge cluster without synthesized content; skipping");
             continue;
         };
-        let canonical_id = OpBuffer::canonical_of(&cluster)
-            .cloned()
-            .expect("non-empty cluster has a canonical id");
         synthesized.push(SynthesizedMerge {
-            canonical_id,
             member_ids: cluster.iter().cloned().collect(),
             new_content: new_content.clone(),
             new_scope: new_scope.clone(),
         });
     }
 
-    // Prune cap over the whole KB. Protected ids never reach `delete_ops`, so
-    // refusing them does not consume the budget. A configured fraction of zero
+    // Disposition budget over the whole KB, computed AFTER clustering (#712
+    // item 3): an id a merge already absorbs is dropped from consideration
+    // first, so a plan whose dispositions are all subsumed by merges leaves
+    // the full budget for everything else. A configured fraction of zero
     // yields a cap of zero, which is how a deployment keeps consolidation's
-    // merges and declines its deletes.
-    let prune_cap = policy.prune_cap(total_entries);
-    let prunes_over_cap = delete_ops.len().saturating_sub(prune_cap);
-    if prunes_over_cap > 0 {
+    // merges and declines its dispositions.
+    let subsumed = buffer.clustered_ids();
+    let mut disposition_ops: Vec<(String, Disposition, Option<String>, Option<String>)> =
+        disposition_ops
+            .into_iter()
+            .filter(|(id, ..)| !subsumed.contains(id))
+            .collect();
+    let disposition_cap = policy.prune_cap(total_entries);
+    let dispositions_over_cap = disposition_ops.len().saturating_sub(disposition_cap);
+    if dispositions_over_cap > 0 {
         tracing::warn!(
-            "dreaming: holistic consolidation proposed {} prune(s) for {total_entries} entries; \
-             capping at {prune_cap} ({prunes_over_cap} deferred to a later run)",
-            delete_ops.len()
+            "dreaming: holistic consolidation proposed {} disposition(s) for {total_entries} \
+             entries; capping at {disposition_cap} ({dispositions_over_cap} deferred to a later \
+             run)",
+            disposition_ops.len()
         );
-        delete_ops.truncate(prune_cap);
+        disposition_ops.truncate(disposition_cap);
     }
-    for (id, reason) in &delete_ops {
+    for (id, disposition, reason, superseded_by) in disposition_ops.iter().cloned() {
         tracing::debug!(
-            "dreaming: consolidation prune {id}: {}",
+            "dreaming: consolidation disposition {id} -> {}: {}",
+            disposition.as_str(),
             reason.as_deref().unwrap_or("(no reason given)")
         );
-        buffer.absorb(ProposedOp::Delete {
-            id: id.clone(),
-            reason: reason.clone(),
+        buffer.absorb(ProposedOp::Disposition {
+            id,
+            disposition,
+            reason,
+            superseded_by,
         });
     }
 
     tracing::info!(
         "dreaming: holistic consolidation plan for {total_entries} entries — \
-         {} merge(s), {} edit(s)/scope-add(s), {} prune(s); \
+         {} merge(s), {} edit(s)/scope-add(s), {} disposition(s); \
          {protected_from_delete} protected, {settled_unchanged} settled, \
-         {rewrites_over_cap} rewrite(s) and {prunes_over_cap} prune(s) over the configured share, \
-         {dropped_operations} operation(s) unreadable and dropped",
+         {rewrites_over_cap} rewrite(s) and {dispositions_over_cap} disposition(s) over the \
+         configured share, {dropped_operations} operation(s) unreadable and dropped",
         synthesized.len(),
         buffer.standalone_updates().len() + buffer.standalone_scope_adds().len(),
-        delete_ops.len(),
+        disposition_ops.len(),
     );
 
     let mut stats = apply_ops(pool, &buffer, &synthesized, policy).await?;
     stats.protected_from_delete = protected_from_delete;
     stats.settled_unchanged = settled_unchanged;
-    stats.prunes_over_cap = prunes_over_cap;
+    stats.prunes_over_cap = dispositions_over_cap;
     stats.rewrites_over_cap = rewrites_over_cap;
     stats.dropped_operations = dropped_operations;
     Ok(stats)
@@ -549,8 +617,8 @@ fn take_within_rewrite_cap(
     (kept_merges, kept_updates)
 }
 
-/// The model's stated delete reason, normalized for storage: trimmed, bounded,
-/// and `None` when it amounts to nothing.
+/// The model's stated disposition reason, normalized for storage: trimmed,
+/// bounded, and `None` when it amounts to nothing.
 ///
 /// Why: the reason is free text from the model that lands in a TEXT column and
 /// a log line, neither of which limits it. Truncation is by characters, not
@@ -575,8 +643,13 @@ async fn load_user_ids_with_active_entries(pool: &PgPool) -> Result<Vec<String>,
     Ok(rows.into_iter().map(|(u,)| u).collect())
 }
 
-/// All active entries for the current user, ordered by tags so that slicing
-/// (when needed) groups likely-related entries together.
+/// Active entries for the current user, ordered by tags so that slicing (when
+/// needed) groups likely-related entries together.
+///
+/// `disposition = 'active'` excludes every entry a previous run (or a person)
+/// has already judged: it has been reviewed, and re-showing it every pass is
+/// spend with no product (design section 3.3, "dispositioned entries are
+/// excluded from re-judging").
 async fn load_active_entries(pool: &PgPool) -> Result<Vec<KbEntry>, CoreError> {
     let user_id = current_user_id();
     type Row = (
@@ -591,10 +664,11 @@ async fn load_active_entries(pool: &PgPool) -> Result<Vec<KbEntry>, CoreError> {
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT id, content, tags, metadata, source, review_generation, summary \
          FROM knowledge_base \
-         WHERE user_id = $1 AND deleted_at IS NULL \
+         WHERE user_id = $1 AND deleted_at IS NULL AND disposition = $2 \
          ORDER BY tags, created_at ASC",
     )
     .bind(user_id.as_str())
+    .bind(Disposition::Active.as_str())
     .fetch_all(pool)
     .await
     .map_err(|e| CoreError::Storage(format!("dreaming: load active entries failed: {e}")))?;
@@ -710,30 +784,55 @@ fn build_system_prompt() -> String {
          of entries (or a self-contained slice of it). Recompute what this set SHOULD look like \
          and return the operations that get it there.\n\
          \n\
+         You have no delete verb. An entry you judge wrong, stale, or redundant is \
+         DISPOSITIONED - marked with what it is and why - and stays on record. Deletion is not \
+         yours to propose.\n\
+         \n\
          Bias toward a lean, high-signal store:\n\
-         - DELETE entries that are trivial, transient, or circumstantial — facts that mattered \
-           only in the moment, are no longer useful going forward, or are obvious/generic.\n\
+         - DISPOSITION an entry that is established untrue (refuted, state what established it), \
+           replaced by a newer statement (superseded, name the successor's id in superseded_by), \
+           a duplicate you are not merging (redundant, name the canonical id in superseded_by), no \
+           longer applicable (obsolete), or harmless but not worth surfacing (trivial).\n\
          - MERGE entries that are duplicates, near-duplicates, or that together describe one \
-           thing, into a single clear entry. Only merge entries about the SAME subject and scope.\n\
-         - EDIT entries that are correct but verbose, vague, or missing their scope: tighten the \
-           prose and/or attach a scope.\n\
+           thing, into a single new entry (merge_new). Only merge entries about the SAME subject \
+           and scope. The members stay on record, dispositioned redundant with a link to the new \
+           entry - you are not asked to choose which one survives.\n\
+         - EDIT entries that are correct but verbose or vague: tighten the prose.\n\
+         - Attach a scope with set_scope for an entry that is missing one.\n\
          - KEEP (do nothing) for entries that are already good, durable, and distinct.\n\
          \n\
          Preserve genuinely useful durable knowledge — preferences, decisions, project facts, \
          recurring solutions. When in doubt about a unique, useful fact, keep it. When in doubt \
-         about a near-duplicate or a trivial note, prune it.\n\
+         about a near-duplicate or a trivial note, disposition it.\n\
          \n\
-         Each entry shows its id, tags, scope, and content. Refer to entries ONLY by the ids \
-         shown. Do not invent ids.\n\
+         Each entry shows its id, source, review_generation, tags, scope, and content. Refer to \
+         entries ONLY by the ids shown. Do not invent ids.\n\
+         \n\
+         ## Rules the store enforces\n\
+         \n\
+         A proposal that breaks one of these is refused, and the call spent proposing it is \
+         wasted:\n\
+         - An entry whose source is \"explicit\" was entered on purpose, not observed. It may be \
+           edited, merged, or dispositioned refuted, superseded, or obsolete - never trivial or \
+           redundant.\n\
+         - An entry whose review_generation has already reached its cap is settled: its prose \
+           stands. It may still be merged or dispositioned, but never edited.\n\
+         - A refuted, superseded, or redundant disposition names a superseded_by entry. When both \
+           entries carry a scope and the scopes share nothing, the disposition is refused - two \
+           facts about different scopes cannot contradict each other.\n\
+         - The disposition budget for one run is limited. Spend it on the entries that matter \
+           most; what does not fit waits for the next run.\n\
          \n\
          ## Output format\n\
          \n\
          Return a JSON object holding exactly one `operations` array. Put every operation in \
          that one array; do not give the `operations` key more than once. Each operation is \
          one of:\n\
-         - {\"op\":\"delete\",\"ids\":[\"<id>\",...],\"reason\":\"<why, short>\"}\n\
-         - {\"op\":\"merge\",\"ids\":[\"<id>\",\"<id>\",...],\"content\":\"<unified self-contained prose>\",\"scope\":{<dim>:<value>}|null}\n\
-         - {\"op\":\"edit\",\"id\":\"<id>\",\"content\":\"<rewritten prose, optional>\",\"scope\":{<dim>:<value>}|null}\n\
+         - {\"op\":\"keep\"}\n\
+         - {\"op\":\"edit\",\"id\":\"<id>\",\"content\":\"<rewritten prose, optional>\"}\n\
+         - {\"op\":\"set_scope\",\"id\":\"<id>\",\"scope\":{<dim>:<value>}}\n\
+         - {\"op\":\"merge_new\",\"ids\":[\"<id>\",\"<id>\",...],\"content\":\"<unified self-contained prose>\",\"scope\":{<dim>:<value>}|null}\n\
+         - {\"op\":\"disposition\",\"id\":\"<id>\",\"as\":\"refuted|superseded|redundant|obsolete|trivial\",\"reason\":\"<why, short>\",\"superseded_by\":\"<id, for refuted/superseded/redundant>\"}\n\
          \n\
          Only emit operations for entries that should change; omit anything you would keep \
          as-is. `scope` is an object of string dimensions (e.g. {\"project\":\"adelie-ai\"}) or \
@@ -747,7 +846,7 @@ fn build_system_prompt() -> String {
         "\n\
          \n\
          KEEP such an entry as it stands - do not merge it, do not rewrite it, \
-         and do not delete it. A separate pass proposes it as a skill, and it \
+         and do not disposition it. A separate pass proposes it as a skill, and it \
          has to still say what it says when that happens.",
     );
     prompt
@@ -759,6 +858,16 @@ fn build_user_prompt(entries: &[KbEntry]) -> String {
     for e in entries {
         prompt.push_str("## ");
         prompt.push_str(&e.id);
+        prompt.push('\n');
+
+        // #711's surviving criterion: the model is shown exactly what its own
+        // guards enforce, so it stops proposing what will be refused.
+        prompt.push_str("source: ");
+        prompt.push_str(e.source.as_deref().unwrap_or("(unknown)"));
+        prompt.push('\n');
+
+        prompt.push_str("review_generation: ");
+        prompt.push_str(&e.review_generation.to_string());
         prompt.push('\n');
 
         prompt.push_str("tags: ");
@@ -783,38 +892,47 @@ fn build_user_prompt(entries: &[KbEntry]) -> String {
         prompt.push_str("\n\n");
     }
     prompt.push_str(
-        "Return the operations (delete / merge / edit) that improve this set. \
-         Omit entries you would keep unchanged.",
+        "Return the operations (edit / set_scope / merge_new / disposition) that improve this \
+         set. Omit entries you would keep unchanged.",
     );
     prompt
 }
 
 /// One operation in the model's recompute plan. `keep` (and any unrecognized
-/// op) is a no-op via `#[serde(other)]`.
+/// op - including the "delete" verb this schema no longer offers) is a no-op
+/// via `#[serde(other)]`.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum RawOp {
-    Delete {
-        #[serde(default)]
-        ids: Vec<String>,
-        #[serde(default)]
-        id: Option<String>,
-        #[serde(default)]
-        reason: String,
-    },
-    Merge {
-        #[serde(default)]
-        ids: Vec<String>,
-        content: String,
-        #[serde(default)]
-        scope: Option<KbScope>,
-    },
     Edit {
         id: String,
         #[serde(default)]
         content: Option<String>,
         #[serde(default)]
         scope: Option<KbScope>,
+    },
+    SetScope {
+        id: String,
+        scope: KbScope,
+    },
+    MergeNew {
+        #[serde(default)]
+        ids: Vec<String>,
+        content: String,
+        #[serde(default)]
+        scope: Option<KbScope>,
+    },
+    Disposition {
+        id: String,
+        /// The disposition to move the entry to, read against
+        /// [`Disposition::parse`] downstream - an unrecognized spelling is
+        /// treated as an unreadable operation, not silently ignored.
+        #[serde(rename = "as")]
+        target: String,
+        #[serde(default)]
+        reason: String,
+        #[serde(default)]
+        superseded_by: Option<String>,
     },
     #[serde(other)]
     Keep,
@@ -1379,6 +1497,70 @@ mod tests {
              one: {prompt}"
         );
     }
+
+    /// #711's surviving criterion, carried by this unit: the system prompt
+    /// states every rule the applier enforces, so the model stops proposing
+    /// what will always be refused.
+    #[test]
+    fn the_system_prompt_states_each_applier_rule() {
+        let prompt = build_system_prompt();
+        assert!(
+            prompt.contains("explicit") && prompt.contains("never trivial or redundant"),
+            "the explicit-entry guard must be stated: {prompt}"
+        );
+        assert!(
+            prompt.contains("settled") && prompt.contains("never edited"),
+            "the settled-entry guard must be stated: {prompt}"
+        );
+        assert!(
+            prompt.contains("scopes share nothing") || prompt.contains("different scopes"),
+            "the scope guard must be stated: {prompt}"
+        );
+        assert!(
+            prompt.contains("disposition budget") && prompt.contains("limited"),
+            "the disposition budget must be stated: {prompt}"
+        );
+        assert!(
+            !prompt.contains("\"op\":\"delete\""),
+            "the prompt must not teach a verb the schema no longer has: {prompt}"
+        );
+    }
+
+    /// #711's other surviving criterion: each entry line carries what the
+    /// applier's guards read - `source` gates the explicit-entry guard,
+    /// `review_generation` gates the settled-entry guard - so the model can
+    /// see which of its own proposals a guard will refuse before it makes
+    /// one.
+    #[test]
+    fn the_user_prompt_carries_source_and_review_generation_per_entry() {
+        let mut e = entry("kb-a", "a fact", &["topic"]);
+        e.source = Some("explicit".to_string());
+        e.review_generation = 2;
+
+        let prompt = build_user_prompt(&[e]);
+
+        assert!(
+            prompt.contains("source: explicit"),
+            "the entry's source must be shown: {prompt}"
+        );
+        assert!(
+            prompt.contains("review_generation: 2"),
+            "the entry's review_generation must be shown: {prompt}"
+        );
+    }
+
+    /// An entry with no recorded source (a legacy row, or a read path that
+    /// never selected it) must still render a line the model can read,
+    /// rather than an empty or missing field.
+    #[test]
+    fn the_user_prompt_names_an_unknown_source_rather_than_leaving_it_blank() {
+        let prompt = build_user_prompt(&[entry("kb-a", "a fact", &[])]);
+        assert!(
+            prompt.contains("source: (unknown)"),
+            "an absent source must still read as a value, not a blank: {prompt}"
+        );
+    }
+
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex, Once};
 
@@ -1467,30 +1649,55 @@ mod tests {
     fn parses_all_op_kinds_and_ignores_keep() {
         let resp = r#"```json
         {"operations": [
-            {"op": "delete", "ids": ["a", "b"], "reason": "trivial"},
-            {"op": "merge", "ids": ["c", "d"], "content": "unified", "scope": {"project": "x"}},
+            {"op": "disposition", "id": "a", "as": "trivial", "reason": "trivial"},
+            {"op": "merge_new", "ids": ["c", "d"], "content": "unified", "scope": {"project": "x"}},
             {"op": "edit", "id": "e", "content": "tighter"},
-            {"op": "keep", "ids": ["f"]},
+            {"op": "set_scope", "id": "s", "scope": {"project": "y"}},
+            {"op": "keep", "id": "f"},
             {"op": "something_new", "id": "g"}
         ]}
         ```"#;
         let ops = parse_operations(resp).unwrap().ops;
-        assert_eq!(ops.len(), 5);
-        assert!(matches!(&ops[0], RawOp::Delete { ids, reason, .. }
-            if ids == &["a", "b"] && reason == "trivial"));
-        assert!(matches!(&ops[1], RawOp::Merge { ids, content, scope }
+        assert_eq!(ops.len(), 6);
+        assert!(
+            matches!(&ops[0], RawOp::Disposition { id, target, reason, .. }
+            if id == "a" && target == "trivial" && reason == "trivial")
+        );
+        assert!(matches!(&ops[1], RawOp::MergeNew { ids, content, scope }
             if ids == &["c", "d"] && content == "unified" && scope.is_some()));
         assert!(matches!(&ops[2], RawOp::Edit { id, content, .. }
             if id == "e" && content.as_deref() == Some("tighter")));
+        assert!(matches!(&ops[3], RawOp::SetScope { id, scope }
+            if id == "s" && !scope.is_empty()));
         // "keep" and unknown ops both fold into the Keep no-op variant.
-        assert!(matches!(ops[3], RawOp::Keep));
         assert!(matches!(ops[4], RawOp::Keep));
+        assert!(matches!(ops[5], RawOp::Keep));
     }
 
     #[test]
     fn missing_operations_key_is_empty() {
         let ops = parse_operations("{}").unwrap().ops;
         assert!(ops.is_empty());
+    }
+
+    /// Acceptance (#893): the op schema this pass reads has no delete verb at
+    /// all. A model that still writes the old "delete" tag (the prompt no
+    /// longer teaches it, but nothing stops a model from trying its old
+    /// habit) reads as an unrecognized op, the same as any other stray tag,
+    /// and falls through to `Keep`. It is never destructive.
+    #[test]
+    fn consolidation_has_no_delete_verb_and_the_applier_has_no_delete_branch() {
+        let parsed = parse_operations(
+            r#"{"operations":[{"op":"delete","ids":["kb-a"],"reason":"trivial"}]}"#,
+        )
+        .expect("a delete-tagged element still reads as JSON; it is unread as an operation");
+
+        assert!(
+            matches!(parsed.ops.as_slice(), [RawOp::Keep]),
+            "the op schema has no delete verb, so a \"delete\" tag reads as an unrecognized \
+             no-op rather than as a destructive instruction: {:?}",
+            parsed.ops
+        );
     }
 
     // --- Replay: what the pass looks at first (#1127) ------------------------
@@ -1766,7 +1973,9 @@ mod tests {
     fn ops_response(ids: &[&str]) -> String {
         let ops: Vec<String> = ids
             .iter()
-            .map(|id| format!(r#"{{"op":"delete","ids":["{id}"],"reason":"trivial"}}"#))
+            .map(|id| {
+                format!(r#"{{"op":"disposition","id":"{id}","as":"trivial","reason":"trivial"}}"#)
+            })
             .collect();
         format!(r#"{{"operations": [{}]}}"#, ops.join(","))
     }
@@ -1873,7 +2082,11 @@ mod tests {
             })
             .collect();
         let second: Vec<String> = (0..3)
-            .map(|i| format!(r#"{{"op":"delete","ids":["kb-9{i:02}"],"reason":"transient"}}"#))
+            .map(|i| {
+                format!(
+                    r#"{{"op":"disposition","id":"kb-9{i:02}","as":"trivial","reason":"transient"}}"#
+                )
+            })
             .collect();
         format!(
             r#"{{"operations":[{}],"operations":[{}]}}"#,
@@ -1913,33 +2126,38 @@ mod tests {
                 _ => None,
             })
             .collect();
-        let deletes: Vec<&str> = parsed
+        let dispositions: Vec<&str> = parsed
             .ops
             .iter()
             .filter_map(|o| match o {
-                RawOp::Delete { ids, .. } => ids.first().map(String::as_str),
+                RawOp::Disposition { id, .. } => Some(id.as_str()),
                 _ => None,
             })
             .collect();
         assert_eq!(edits.len(), 14, "the first array must survive in full");
-        assert_eq!(deletes.len(), 3, "the second array must survive in full");
+        assert_eq!(
+            dispositions.len(),
+            3,
+            "the second array must survive in full"
+        );
         assert_eq!(
             parsed.ops.len(),
             17,
             "the union of both arrays, and nothing else"
         );
-        // Order matters: the prune cap keeps the operations it sees first.
+        // Order matters: the disposition cap keeps the operations it sees first.
         assert_eq!(edits.first(), Some(&"kb-000"));
-        assert_eq!(deletes.last(), Some(&"kb-902"));
+        assert_eq!(dispositions.last(), Some(&"kb-902"));
     }
 
     #[test]
     fn one_unreadable_operation_is_dropped_and_the_rest_apply() {
-        // A merge with no `content` is a well-formed JSON object that is not a
-        // well-formed operation: the two beside it are untouched by its fault.
+        // A merge_new with no `content` is a well-formed JSON object that is
+        // not a well-formed operation: the two beside it are untouched by its
+        // fault.
         let answer = r#"{"operations":[
-            {"op":"delete","ids":["kb-001"],"reason":"circumstantial"},
-            {"op":"merge","ids":["kb-002","kb-003"]},
+            {"op":"disposition","id":"kb-001","as":"trivial","reason":"circumstantial"},
+            {"op":"merge_new","ids":["kb-002","kb-003"]},
             {"op":"edit","id":"kb-004","content":"tightened"}
         ]}"#;
 
@@ -1959,7 +2177,7 @@ mod tests {
             "the report must name the field that was missing: {report}"
         );
         assert!(
-            report.contains("op=merge"),
+            report.contains("op=merge_new"),
             "the report must name what the model was attempting: {report}"
         );
         assert!(
@@ -1973,7 +2191,8 @@ mod tests {
         // Salvage keeps what it can. When it can keep nothing, the answer is a
         // fault, not an empty success: reporting it as "no changes" is the very
         // thing that made the original loss invisible.
-        let answer = r#"{"operations":[{"op":"merge","ids":["kb-001","kb-002"]},{"id":"kb-003"}]}"#;
+        let answer =
+            r#"{"operations":[{"op":"merge_new","ids":["kb-001","kb-002"]},{"id":"kb-003"}]}"#;
         let err =
             parse_operations(answer).expect_err("an answer with no usable operation is a failure");
         assert!(
@@ -2036,7 +2255,7 @@ mod tests {
         let answer = format!(
             r#"{{"operations":[
                 {{"op":"edit","id":"kb-001","content":"tightened"}},
-                {{"op":"merge","ids":"{private}","content":"unified"}}
+                {{"op":"merge_new","ids":"{private}","content":"unified"}}
             ]}}"#
         );
 
@@ -2053,7 +2272,7 @@ mod tests {
             "the diagnosis must still say what was wrong: {diagnosis}"
         );
         assert!(
-            diagnosis.contains("op=merge"),
+            diagnosis.contains("op=merge_new"),
             "and what the model was attempting: {diagnosis}"
         );
         assert!(
@@ -2148,7 +2367,7 @@ mod tests {
         // field names serde can report are this code's own, not the model's.
         let answer = r#"{"operations":[
             {"op":"edit","id":"kb-001","content":"tightened"},
-            {"op":"merge","ids":["kb-002","kb-003"]}
+            {"op":"merge_new","ids":["kb-002","kb-003"]}
         ]}"#;
         let parsed = parse_operations(answer).expect("the readable operation survives");
         assert!(
@@ -2178,7 +2397,7 @@ mod tests {
         let answer = format!(
             r#"{{"operations":[
                 {{"op":"edit","id":"kb-001","content":"tightened"}},
-                {{"op":"merge","body":"{huge}"}}
+                {{"op":"merge_new","body":"{huge}"}}
             ]}}"#
         );
         let parsed = parse_operations(&answer).expect("the readable operation survives");
@@ -2193,7 +2412,7 @@ mod tests {
         // precedes `op` and a bounded quote alone would cut the one field that
         // says what the model was attempting.
         assert!(
-            quoted.contains("op=merge"),
+            quoted.contains("op=merge_new"),
             "a bounded report must still name what the operation was: {quoted}"
         );
         // The default log stream gets the diagnosis without the element, so a
@@ -2211,7 +2430,7 @@ mod tests {
         let mut ops: Vec<String> = (0..good)
             .map(|i| format!(r#"{{"op":"delete","ids":["kb-{i:03}"],"reason":"trivial"}}"#))
             .collect();
-        ops.push(r#"{"op":"merge","ids":["kb-900","kb-901"]}"#.to_string());
+        ops.push(r#"{"op":"merge_new","ids":["kb-900","kb-901"]}"#.to_string());
         format!(r#"{{"operations":[{}]}}"#, ops.join(","))
     }
 
@@ -2243,7 +2462,7 @@ mod tests {
 
     /// An answer that proposes two operations and neither can be read.
     const ALL_UNREADABLE: &str =
-        r#"{"operations":[{"op":"merge","ids":["kb-1","kb-2"]},{"id":"kb-3"}]}"#;
+        r#"{"operations":[{"op":"merge_new","ids":["kb-1","kb-2"]},{"id":"kb-3"}]}"#;
 
     #[tokio::test]
     async fn operations_dropped_by_an_unreadable_answer_are_still_counted() {
@@ -2362,18 +2581,18 @@ mod tests {
             .expect("splitting recovers the slice")
             .ops;
 
-        let deletes = ops
+        let dispositions = ops
             .iter()
-            .filter(|o| matches!(o, RawOp::Delete { .. }))
+            .filter(|o| matches!(o, RawOp::Disposition { .. }))
             .count();
-        assert_eq!(deletes, 2, "both halves' operations must be kept");
+        assert_eq!(dispositions, 2, "both halves' operations must be kept");
     }
 
     #[tokio::test]
     async fn split_retry_keeps_the_slice_in_entry_order() {
-        // The deletion cap truncates the collected operations, so the order the
-        // parts come back in decides which deletes survive the cap. Halves must
-        // stay in entry order.
+        // The disposition cap truncates the collected operations, so the order
+        // the parts come back in decides which dispositions survive the cap.
+        // Halves must stay in entry order.
         let llm: DreamingLlmFn = Box::new(|_system, user: String| {
             let seen = entries_in_prompt(&user);
             let first = user
@@ -2394,15 +2613,15 @@ mod tests {
             .expect("splitting recovers the slice")
             .ops;
 
-        let deleted: Vec<String> = ops
+        let dispositioned: Vec<String> = ops
             .iter()
             .filter_map(|o| match o {
-                RawOp::Delete { ids, .. } => ids.first().cloned(),
+                RawOp::Disposition { id, .. } => Some(id.clone()),
                 _ => None,
             })
             .collect();
         assert_eq!(
-            deleted,
+            dispositioned,
             vec!["id0".to_string(), "id2".to_string()],
             "the first half must be recomputed before the second"
         );

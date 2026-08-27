@@ -35,7 +35,7 @@ tokio.workspace = true
 # Cooperative cancellation for long maintenance passes (dreaming / consolidation
 # / embedding recompute) so an on-demand run can be stopped via the task registry.
 tokio-util.workspace = true
-uuid = { version = "1", features = ["v7"] }
+uuid = { version = "1", features = ["v7", "v5"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

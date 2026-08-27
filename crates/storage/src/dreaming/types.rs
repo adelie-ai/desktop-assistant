@@ -169,19 +169,28 @@ pub use desktop_assistant_core::domain::knowledge::Disposition;
 pub struct ConsolidationStats {
     pub reviewed: usize,
     pub updated: usize,
+    /// Merge clusters applied as a [`Disposition::Redundant`]-linked new row
+    /// (`merge_new`).
     pub merged_clusters: usize,
+    /// Entries dispositioned this run: a standalone `disposition` op, plus
+    /// every merge member dispositioned [`Disposition::Redundant`]. None of
+    /// these rows are deleted - disposition is orthogonal to `deleted_at`.
     pub soft_deleted: usize,
     pub scope_added: usize,
-    /// Entries whose proposed prune was refused because they carry
-    /// [`SOURCE_EXPLICIT`]. Reported so an operator can see that the model keeps
-    /// asking, even though the answer is always no.
+    /// Entries whose proposed disposition was refused because they carry
+    /// [`SOURCE_EXPLICIT`] and the disposition was [`Disposition::Trivial`] or
+    /// [`Disposition::Redundant`] - the two an explicit entry may not receive.
+    /// Reported so an operator can see that the model keeps asking, even
+    /// though the answer is always no.
     pub protected_from_delete: usize,
-    /// Proposed operations (one per refused edit or merge) declined because the
-    /// entry has already been rewritten [`MAX_REVIEW_GENERATION`] times, so its
-    /// prose is settled.
+    /// Proposed edits declined because the entry has already been rewritten
+    /// [`MAX_REVIEW_GENERATION`] times, so its prose is settled. A settled
+    /// entry may still be merged or dispositioned; only `edit` is refused.
     pub settled_unchanged: usize,
-    /// Proposed prunes dropped because the run had spent its share of the
-    /// store. The work is not lost - the next run sees the same entries.
+    /// Proposed dispositions dropped because the run had spent its share of
+    /// the active set, computed after clustering and subsumption so an id a
+    /// merge already absorbed does not spend the budget. The work is not
+    /// lost - the next run sees the same entries.
     pub prunes_over_cap: usize,
     /// Proposed edits and merges dropped because the run had spent its rewrite
     /// share. Reported for the same reason.
@@ -192,6 +201,16 @@ pub struct ConsolidationStats {
     /// answer, not a deliberate refusal: it is reported so a repaired answer is
     /// never quietly smaller than the one the model sent.
     pub dropped_operations: usize,
+    /// A `refuted`/`superseded`/`redundant` disposition refused because the
+    /// entry it names and the entry it would disposition carry disjoint,
+    /// non-empty scopes - two facts about different scopes cannot contradict
+    /// each other.
+    pub scope_guard_refusals: usize,
+    /// A guard predicate in the applier's own SQL refused a write that the
+    /// application-level guard above it should already have excluded. This
+    /// should stay at zero: a nonzero count means the guard above has a hole,
+    /// not that the store is safer for having caught it.
+    pub backstop_firings: usize,
 }
 
 #[cfg(test)]
