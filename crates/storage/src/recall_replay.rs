@@ -749,6 +749,14 @@ impl Activatable for SnapshotCandidate {
     fn lexical(&self) -> LexicalMatch {
         LexicalMatch::NONE
     }
+
+    /// The entry's own frozen disposition (#893), read off the snapshot copy
+    /// exactly as the live path reads it off the live row — a `trivial` entry
+    /// costs the same penalty here as it does in production, so a replay
+    /// cannot show a rank the live block would not have produced.
+    fn disposition(&self) -> Disposition {
+        self.entry.disposition
+    }
 }
 
 /// Rank every entry in `snapshot_id` against `query_embedding`, nearest
@@ -952,6 +960,29 @@ pub struct CaseReplayResult {
 pub struct ReplayReport {
     pub snapshot_id: String,
     pub case_count: usize,
+    /// [`desktop_assistant_core::domain::activation::ACTIVATION_SCORER_VERSION`]
+    /// at the moment this run computed its ranks (#893, #1327) — the same
+    /// role the snapshot's `embedding_model` plays for the corpus, applied
+    /// to the ranking function instead of the data.
+    ///
+    /// **Recorded on the result, not the manifest, and never refused.** The
+    /// embedding model is part of what is *stored*: a vector from a
+    /// different model is a different geometry, and comparing across models
+    /// is not merely invalid, it is meaningless, so [`run_replay`] refuses
+    /// outright. The scorer is part of what *reads* the store: it is the
+    /// code running this call, not a property of `snapshot`, so pinning it
+    /// to the manifest would conflate "which corpus" with "which build
+    /// ranked it" and would make a snapshot stale the moment the scorer
+    /// gained a term, which is not a data problem, it is business as usual.
+    /// A single run under any scorer version is a fully honest computation
+    /// of that version's ranks — refusing it would block a legitimate use
+    /// (checking today's ranking against a frozen corpus). What *is* invalid
+    /// is reading two reports as the same experiment when their scorer
+    /// versions differ, so this field exists to make that visible rather
+    /// than to make it impossible: the daemon's rendered report prints it
+    /// beside `case_count`, on the same first line, so nobody compares two
+    /// runs without seeing that the scorer moved.
+    pub scorer_version: String,
     /// Set below [`SMALL_SET_CASE_THRESHOLD`] cases — see [`SMALL_SET_NOTICE`]
     /// for the sentence a caller should print alongside it.
     pub too_small_to_generalize: bool,
@@ -1051,6 +1082,8 @@ pub async fn run_replay(
     Ok(ReplayReport {
         snapshot_id: snapshot.id.clone(),
         case_count: results.len(),
+        scorer_version: desktop_assistant_core::domain::activation::ACTIVATION_SCORER_VERSION
+            .to_string(),
         too_small_to_generalize: results.len() < SMALL_SET_CASE_THRESHOLD,
         results,
     })

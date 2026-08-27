@@ -298,6 +298,12 @@ async fn the_replay_report_states_the_case_count_and_never_truncates_silently() 
         report.case_count,
         "the report must never truncate the case list"
     );
+    assert_eq!(
+        report.scorer_version,
+        desktop_assistant_core::domain::activation::ACTIVATION_SCORER_VERSION,
+        "the report carries the scorer version it actually ranked under, so two reports \
+         ranked by different builds are never mistaken for the same experiment"
+    );
     assert!(
         report.too_small_to_generalize,
         "three cases is well under the small-set threshold"

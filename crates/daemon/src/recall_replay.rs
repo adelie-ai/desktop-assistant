@@ -189,12 +189,13 @@ fn render_manifest(manifest: &SnapshotManifest) -> String {
 fn render_report(snapshot: &SnapshotManifest, report: &ReplayReport) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "{} case(s) replayed against snapshot {} (\"{}\", model {}, taken {})\n",
+        "{} case(s) replayed against snapshot {} (\"{}\", model {}, taken {}), scorer {}\n",
         report.case_count,
         snapshot.id,
         snapshot.name,
         snapshot.embedding_model,
         snapshot.taken_at.to_rfc3339(),
+        report.scorer_version,
     ));
     if report.too_small_to_generalize {
         out.push_str(SMALL_SET_NOTICE);
@@ -235,7 +236,8 @@ fn render_report(snapshot: &SnapshotManifest, report: &ReplayReport) -> String {
                 for (position, entry) in top.iter().enumerate() {
                     out.push_str(&format!(
                         "    {}. {} — distance {:.4}, total {:.3} \
-                         (semantic {:.3?}, lexical {:.3}, reinforcement {:.3}, situation {:.3}, salience {:.3})\n",
+                         (semantic {:.3?}, lexical {:.3}, reinforcement {:.3}, situation {:.3}, \
+                         salience {:.3}, disposition {:.3})\n",
                         position + 1,
                         entry.entry_id,
                         entry.distance,
@@ -245,6 +247,7 @@ fn render_report(snapshot: &SnapshotManifest, report: &ReplayReport) -> String {
                         entry.terms.reinforcement,
                         entry.terms.situation,
                         entry.terms.salience,
+                        entry.terms.disposition,
                     ));
                 }
             }
