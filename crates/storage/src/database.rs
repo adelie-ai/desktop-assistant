@@ -154,6 +154,15 @@ const PERSONAL_DATA_TABLES: &[&str] = &[
     // that was looked up. As personal as the conversation it describes,
     // before any of the conversation itself is read.
     "context_plans",
+    // 060 - a frozen corpus for measuring recall, and the labelled set that
+    // supplies ground truth. A snapshot copies one person's knowledge base
+    // and use history whole; a case is a real query someone asked and a real
+    // failure someone hit. Both are as personal as the data they measure.
+    "recall_snapshots",
+    "recall_snapshot_entries",
+    "recall_snapshot_uses",
+    "recall_cases",
+    "recall_case_embeddings",
 ];
 
 /// The canonical set of personal-data tables (see `PERSONAL_DATA_TABLES`).
