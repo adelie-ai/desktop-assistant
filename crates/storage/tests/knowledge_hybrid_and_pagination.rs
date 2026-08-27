@@ -28,10 +28,10 @@ use desktop_assistant_storage::knowledge_delete::KnowledgeDeletePolicy;
 use std::sync::Arc;
 
 use desktop_assistant_core::CoreError;
-use desktop_assistant_core::domain::KnowledgeEntry;
 use desktop_assistant_core::domain::situation::{
     FieldFan, Situation, SituationCue, SituationField,
 };
+use desktop_assistant_core::domain::{Disposition, KnowledgeEntry};
 use desktop_assistant_core::ports::knowledge::{
     KnowledgeBaseStore, KnowledgeListQuery, ListOrder, ListOrderOpt,
 };
@@ -147,6 +147,22 @@ async fn set_embedding(pool: &PgPool, id: &str, chunks: Vec<Vec<f32>>) {
     .execute(pool)
     .await
     .expect("stamp embedding");
+}
+
+/// Stamp a row's disposition (and, for `superseded`/`redundant`, its
+/// successor) directly, the same way `set_embedding` stamps a vector: no
+/// store method sets a disposition yet (that lands with a later unit), so
+/// tests reach the column the way the schema itself requires it be written -
+/// `superseded_by` set exactly when the disposition needs one, per
+/// `knowledge_base_superseded_by_chk`.
+async fn set_disposition(pool: &PgPool, id: &str, disposition: &str, superseded_by: Option<&str>) {
+    sqlx::query("UPDATE knowledge_base SET disposition = $1, superseded_by = $2 WHERE id = $3")
+        .bind(disposition)
+        .bind(superseded_by)
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("stamp disposition");
 }
 
 /// Force a row's `created_at` so keyset ordering is deterministic (writes stamp
@@ -1466,6 +1482,7 @@ async fn measured_spread(pool: &PgPool, user: &str) -> MeasuredSpread {
             .bind(user)
             .bind(None::<Vec<String>>)
             .bind(MODEL)
+            .bind(false)
             .fetch_one(pool)
             .await
             .expect("the scan answers")
@@ -1854,6 +1871,351 @@ async fn knowledge_hybrid_search_leaves_a_row_the_query_never_names_where_its_di
                 ids,
                 vec!["filler00", "filler01", "filler02", "filler03", "filler04"],
                 "and the page is the five nearest, in order; got {ids:?}"
+            );
+            fx
+        },
+    )
+    .await;
+}
+
+// -- disposition admission and resolution (#893) -----------------------------
+
+/// Acceptance (#893): the asymmetry the whole vocabulary rests on. A refuted
+/// entry must never be returned as a current fact, but it must stay
+/// findable when the query is about its subject - the assistant needs it to
+/// report the correction rather than re-deriving the error.
+///
+/// This test proves the "findable" half; the "never a fact" half is proven
+/// by the render-side tests in `desktop_assistant_core::domain::knowledge`
+/// (`a_refuted_entry_is_never_rendered_without_the_refuted_marker`) and in
+/// `desktop-assistant-mcp-client`
+/// (`kb_search_marks_a_refuted_result_and_leaves_an_active_one_unmarked`) -
+/// the entry this test proves is findable is the one those prove is never
+/// shown unmarked.
+#[tokio::test]
+async fn a_refuted_entry_is_findable_when_the_query_is_about_its_subject() {
+    with_fixture(
+        "a_refuted_entry_is_findable_when_the_query_is_about_its_subject",
+        |fx| async move {
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
+
+            with_user_id(UserId::new("alice"), async {
+                store
+                    .write(KnowledgeEntry::new(
+                        "kb-refuted",
+                        "the annex parking permit expires every March",
+                        vec![],
+                    ))
+                    .await
+                    .expect("write the refuted candidate");
+            })
+            .await;
+            set_embedding(&fx.pool, "kb-refuted", vec![vec![1.0, 0.0, 0.0]]).await;
+            set_disposition(&fx.pool, "kb-refuted", "refuted", None).await;
+
+            let hits = with_user_id(UserId::new("alice"), async {
+                store
+                    .search(
+                        "annex parking permit March",
+                        vec![1.0, 0.0, 0.0],
+                        MODEL,
+                        None,
+                        None,
+                        10,
+                    )
+                    .await
+            })
+            .await
+            .expect("search")
+            .entries;
+
+            let found = hits.iter().find(|e| e.id == "kb-refuted");
+            assert!(
+                found.is_some(),
+                "a refuted entry must be findable when the query is about its subject; \
+                 got {:?}",
+                hits.iter().map(|e| &e.id).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                found.expect("checked above").disposition,
+                Disposition::Refuted,
+                "the returned row must carry its real disposition, not a hardcoded one"
+            );
+            fx
+        },
+    )
+    .await;
+}
+
+/// Acceptance (#893): a query that matches only a superseded entry's old
+/// wording resolves to its successor. The successor's own content shares no
+/// word with the query, so it can reach the page only through
+/// `superseded_by` resolution - never by matching on its own.
+#[tokio::test]
+async fn a_query_matching_only_the_old_wording_returns_the_successor() {
+    with_fixture(
+        "a_query_matching_only_the_old_wording_returns_the_successor",
+        |fx| async move {
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
+
+            with_user_id(UserId::new("alice"), async {
+                store
+                    .write(KnowledgeEntry::new(
+                        "kb-old",
+                        "the office parking permit renews every March",
+                        vec![],
+                    ))
+                    .await
+                    .expect("write the old wording");
+                store
+                    .write(KnowledgeEntry::new(
+                        "kb-new",
+                        "badge access changes each autumn cycle",
+                        vec![],
+                    ))
+                    .await
+                    .expect("write the successor");
+            })
+            .await;
+            set_embedding(&fx.pool, "kb-old", vec![vec![1.0, 0.0, 0.0]]).await;
+            set_embedding(&fx.pool, "kb-new", vec![vec![0.0, 1.0, 0.0]]).await;
+            set_disposition(&fx.pool, "kb-old", "superseded", Some("kb-new")).await;
+
+            let hits = with_user_id(UserId::new("alice"), async {
+                store
+                    .search(
+                        "office parking permit March",
+                        vec![1.0, 0.0, 0.0],
+                        MODEL,
+                        None,
+                        None,
+                        10,
+                    )
+                    .await
+            })
+            .await
+            .expect("search")
+            .entries;
+
+            let ids: Vec<&str> = hits.iter().map(|e| e.id.as_str()).collect();
+            assert!(
+                ids.contains(&"kb-new"),
+                "a query matching only the old wording must resolve to the successor; \
+                 got {ids:?}"
+            );
+            assert!(
+                !ids.contains(&"kb-old"),
+                "a superseded id must never be returned under its own id; got {ids:?}"
+            );
+            fx
+        },
+    )
+    .await;
+}
+
+/// Acceptance (#893): a chain of several links resolves to its terminal
+/// successor, and a cycle in `superseded_by` - which consolidation's own
+/// guards should never write, but which this proves the query survives
+/// regardless - cannot hang the query. The depth-8 bound is what makes that
+/// true: it is what is under test, not any particular id a capped cycle
+/// happens to land on.
+#[tokio::test]
+async fn a_superseded_chain_resolves_to_the_terminal_successor_and_a_cycle_cannot_hang_it() {
+    with_fixture(
+        "a_superseded_chain_resolves_to_the_terminal_successor_and_a_cycle_cannot_hang_it",
+        |fx| async move {
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
+
+            // A -> B -> C, three links, well under the depth-8 bound.
+            with_user_id(UserId::new("alice"), async {
+                store
+                    .write(KnowledgeEntry::new(
+                        "kb-a",
+                        "the garage badge reader sits on level one",
+                        vec![],
+                    ))
+                    .await
+                    .expect("write A");
+                store
+                    .write(KnowledgeEntry::new(
+                        "kb-b",
+                        "an intermediate link nobody should ever see",
+                        vec![],
+                    ))
+                    .await
+                    .expect("write B");
+                store
+                    .write(KnowledgeEntry::new(
+                        "kb-c",
+                        "visitor badges are issued at the level three desk",
+                        vec![],
+                    ))
+                    .await
+                    .expect("write C, the terminal");
+            })
+            .await;
+            set_embedding(&fx.pool, "kb-a", vec![vec![1.0, 0.0, 0.0]]).await;
+            set_embedding(&fx.pool, "kb-b", vec![vec![0.0, 1.0, 0.0]]).await;
+            set_embedding(&fx.pool, "kb-c", vec![vec![0.0, 0.0, 1.0]]).await;
+            set_disposition(&fx.pool, "kb-a", "superseded", Some("kb-b")).await;
+            set_disposition(&fx.pool, "kb-b", "superseded", Some("kb-c")).await;
+
+            let hits = with_user_id(UserId::new("alice"), async {
+                store
+                    .search(
+                        "garage badge reader level one",
+                        vec![1.0, 0.0, 0.0],
+                        MODEL,
+                        None,
+                        None,
+                        10,
+                    )
+                    .await
+            })
+            .await
+            .expect("search")
+            .entries;
+            let ids: Vec<&str> = hits.iter().map(|e| e.id.as_str()).collect();
+            assert_eq!(
+                ids,
+                vec!["kb-c"],
+                "a three-link chain must resolve all the way to its terminal successor, \
+                 not stop at the middle link; got {ids:?}"
+            );
+
+            // X <-> Y, a cycle. Nothing in this build's own guards can write
+            // one - the applier that dispositions entries has no path to it -
+            // but the query must survive it regardless of how it got there.
+            with_user_id(UserId::new("alice"), async {
+                store
+                    .write(KnowledgeEntry::new(
+                        "kb-x",
+                        "the shuttle stop moved outside the north lobby",
+                        vec![],
+                    ))
+                    .await
+                    .expect("write X");
+                store
+                    .write(KnowledgeEntry::new(
+                        "kb-y",
+                        "an unrelated body nothing here queries for",
+                        vec![],
+                    ))
+                    .await
+                    .expect("write Y");
+            })
+            .await;
+            set_embedding(&fx.pool, "kb-x", vec![vec![1.0, 0.0, 0.0]]).await;
+            set_embedding(&fx.pool, "kb-y", vec![vec![0.0, 1.0, 0.0]]).await;
+            set_disposition(&fx.pool, "kb-x", "superseded", Some("kb-y")).await;
+            set_disposition(&fx.pool, "kb-y", "superseded", Some("kb-x")).await;
+
+            let cycle_result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                with_user_id(UserId::new("alice"), async {
+                    store
+                        .search(
+                            "shuttle stop north lobby",
+                            vec![1.0, 0.0, 0.0],
+                            MODEL,
+                            None,
+                            None,
+                            10,
+                        )
+                        .await
+                }),
+            )
+            .await;
+
+            assert!(
+                cycle_result.is_ok(),
+                "a cycle in superseded_by must not hang the query - the depth bound must \
+                 still terminate it"
+            );
+            assert!(
+                cycle_result
+                    .expect("checked above")
+                    .expect("the query itself must not error")
+                    .entries
+                    .iter()
+                    .any(|e| e.id == "kb-x" || e.id == "kb-y"),
+                "a capped cycle still answers with one of its own members, not nothing"
+            );
+            fx
+        },
+    )
+    .await;
+}
+
+/// Acceptance (#893): `obsolete` is excluded by default and included only
+/// when the caller explicitly asks - the one disposition that is neither
+/// admitted for ranking nor resolved through a link, so it needs its own
+/// caller-facing seam rather than the resolution the other four dispositions
+/// share.
+#[tokio::test]
+async fn an_obsolete_entry_is_excluded_by_default_and_included_on_request() {
+    with_fixture(
+        "an_obsolete_entry_is_excluded_by_default_and_included_on_request",
+        |fx| async move {
+            let store =
+                PgKnowledgeBaseStore::new(fx.pool.clone(), KnowledgeDeletePolicy::default());
+
+            with_user_id(UserId::new("alice"), async {
+                store
+                    .write(KnowledgeEntry::new(
+                        "kb-obsolete",
+                        "the vpn used to route through the old gateway address",
+                        vec![],
+                    ))
+                    .await
+                    .expect("write the obsolete candidate");
+            })
+            .await;
+            set_embedding(&fx.pool, "kb-obsolete", vec![vec![1.0, 0.0, 0.0]]).await;
+            set_disposition(&fx.pool, "kb-obsolete", "obsolete", None).await;
+
+            let default_hits = with_user_id(UserId::new("alice"), async {
+                store
+                    .search(
+                        "vpn old gateway address",
+                        vec![1.0, 0.0, 0.0],
+                        MODEL,
+                        None,
+                        None,
+                        10,
+                    )
+                    .await
+            })
+            .await
+            .expect("default search")
+            .entries;
+            assert!(
+                !default_hits.iter().any(|e| e.id == "kb-obsolete"),
+                "an obsolete entry must be excluded by default; got {:?}",
+                default_hits.iter().map(|e| &e.id).collect::<Vec<_>>()
+            );
+
+            let requested_hits = with_user_id(UserId::new("alice"), async {
+                store
+                    .search_hybrid_including_dispositioned(
+                        "vpn old gateway address",
+                        vec![1.0, 0.0, 0.0],
+                        MODEL,
+                        None,
+                        None,
+                        10,
+                    )
+                    .await
+            })
+            .await
+            .expect("search including dispositioned");
+            assert!(
+                requested_hits.iter().any(|e| e.id == "kb-obsolete"),
+                "an obsolete entry must be included when the caller explicitly asks; got {:?}",
+                requested_hits.iter().map(|e| &e.id).collect::<Vec<_>>()
             );
             fx
         },

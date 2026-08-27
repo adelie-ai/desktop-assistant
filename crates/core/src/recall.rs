@@ -1171,6 +1171,7 @@ fn plan_entries(pass: &RecallPass<'_>) -> Vec<PlannedCandidate> {
                 hit.situation_coverage(pass.candidates.situation_cue.as_ref()),
                 hit.salience_share(),
                 hit.lexical(),
+                hit.disposition(),
                 pass.surface.now,
                 &weights,
             ),
@@ -1227,6 +1228,7 @@ fn plan_notes(pass: &RecallPass<'_>) -> Vec<PlannedCandidate> {
                     crate::domain::activation::NO_SITUATION,
                     crate::domain::activation::NO_SALIENCE,
                     LexicalMatch::NONE,
+                    crate::domain::Disposition::Active,
                     pass.surface.now,
                     &weights,
                 ),
@@ -1292,6 +1294,7 @@ fn plan_skills(pass: &RecallPass<'_>) -> Vec<PlannedCandidate> {
                 skill.situation_coverage(pass.candidates.skill_situation_cue.as_ref()),
                 skill.salience_share(),
                 skill.lexical(),
+                skill.disposition(),
                 pass.surface.now,
                 &weights,
             ),
@@ -2146,6 +2149,52 @@ mod tests {
                 .contains(&format!("kb-{DEFAULT_MAX_RECALL_ENTRIES}")),
             "the last entry moved into the budget and must be reported: {:?}",
             rendered.entry_ids
+        );
+    }
+
+    /// Acceptance (#893): a refuted entry admitted into the `[Recall]` block
+    /// carries the marker on its own line, and a comparable active entry
+    /// carries none - the second surface `Disposition::marker`'s single
+    /// definition has to hold, alongside the search tool's in
+    /// `desktop-assistant-mcp-client`. This block never reads an entry's
+    /// content or disposition directly: `entry_line` writes whatever
+    /// `RecallEntry::entry::display_line` already rendered, and that is the
+    /// one call site under test here.
+    #[test]
+    fn a_refuted_entry_in_the_recall_block_carries_the_marker_and_an_active_one_does_not() {
+        let mut refuted = hit(
+            "kb-refuted",
+            "the annex parking rule",
+            &["facilities"],
+            0.05,
+        );
+        refuted.entry.disposition = crate::domain::Disposition::Refuted;
+        let active = hit("kb-active", "the annex parking rule", &["facilities"], 0.05);
+
+        let candidates = RecallCandidates {
+            entries: vec![refuted, active],
+            ..Default::default()
+        };
+
+        let block = render(&candidates).expect("the block renders");
+        let lines: Vec<&str> = entry_lines(&block);
+
+        let refuted_line = lines
+            .iter()
+            .find(|l| l.contains("kb-refuted"))
+            .expect("the refuted entry has a line");
+        let active_line = lines
+            .iter()
+            .find(|l| l.contains("kb-active"))
+            .expect("the active entry has a line");
+
+        assert!(
+            refuted_line.contains("recorded, later refuted: "),
+            "a refuted entry's [Recall] line must carry the marker: {refuted_line}"
+        );
+        assert!(
+            !active_line.contains("recorded, later refuted: "),
+            "an active entry's [Recall] line must carry no marker: {active_line}"
         );
     }
 

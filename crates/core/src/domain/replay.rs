@@ -222,6 +222,7 @@ mod tests {
     #[test]
     fn a_contradiction_raises_replay_priority_where_it_lowers_the_retrieval_score() {
         use crate::domain::activation::{LexicalMatch, NO_SITUATION, activation};
+        use crate::domain::knowledge::Disposition;
 
         let now = now();
         let weights = ActivationWeights::default();
@@ -240,6 +241,7 @@ mod tests {
                 NO_SITUATION,
                 0.0,
                 LexicalMatch::NONE,
+                Disposition::Active,
                 now,
                 &weights
             ) < activation(
@@ -248,6 +250,7 @@ mod tests {
                 NO_SITUATION,
                 0.0,
                 LexicalMatch::NONE,
+                Disposition::Active,
                 now,
                 &weights
             ),

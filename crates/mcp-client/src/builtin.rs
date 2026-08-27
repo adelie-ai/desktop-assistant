@@ -2131,9 +2131,18 @@ impl BuiltinToolService {
             .entries
             .into_iter()
             .map(|entry| {
+                // The hybrid search this tool runs now admits a `refuted` row
+                // (#893) - it must never come back as an unmarked fact. The
+                // marker is prefixed on the content itself, the same shared
+                // helper `KnowledgeEntry::display_line` uses for the
+                // `[Recall]` block, so a caller reading only `content` still
+                // meets it.
+                // STUB (red commit): wiring lands in the implementation commit.
+                let marker = "";
+                let _ = &entry.disposition;
                 serde_json::json!({
                     "id": entry.id,
-                    "content": entry.content,
+                    "content": format!("{marker}{}", entry.content),
                     "summary": entry.summary,
                     "tags": entry.tags,
                     "metadata": entry.metadata,
@@ -2624,9 +2633,18 @@ impl BuiltinToolService {
             .entries
             .into_iter()
             .map(|entry| {
+                // `list` filters only on `deleted_at` (#893): a refuted row's
+                // `deleted_at` is NULL by construction, so this browse read
+                // reaches it exactly as it reaches an active one. The marker
+                // is the only thing standing between that and an unmarked
+                // claim, so it goes through the same shared helper the search
+                // tool and the by-id fetch do.
+                // STUB (red commit): wiring lands in the implementation commit.
+                let marker = "";
+                let _ = &entry.disposition;
                 serde_json::json!({
                     "id": entry.id,
-                    "content": entry.content,
+                    "content": format!("{marker}{}", entry.content),
                     "summary": entry.summary,
                     "tags": entry.tags,
                     "metadata": entry.metadata,
@@ -3695,6 +3713,9 @@ fn required_string(args: &serde_json::Value, key: &str) -> Result<String, CoreEr
 /// it holds the whole entry, which is the claim every other read of this store
 /// makes too.
 fn kb_get_row(entry: &KnowledgeEntry, content: &str, content_truncated: bool) -> serde_json::Value {
+    // STUB (red commit): wiring lands in the implementation commit.
+    let _ = &entry.disposition;
+    let content = content.to_string();
     let mut row = serde_json::json!({
         "id": entry.id,
         "content": content,
@@ -8783,6 +8804,57 @@ mod tests {
         assert_eq!(json["results"][0]["summary"], serde_json::Value::Null);
     }
 
+    /// Acceptance (#893): the hybrid search now admits a `refuted` row, so the
+    /// tool's own content must never come back as an unmarked fact - a
+    /// second surface `a_refuted_entry_is_never_rendered_without_the_refuted_marker`
+    /// covers, alongside the `[Recall]` block's coverage in
+    /// `desktop_assistant_core::domain::knowledge`.
+    ///
+    /// Both a refused entry and a permitted one travel through the same page,
+    /// so the marker is proven to discriminate rather than to apply to
+    /// everything.
+    #[tokio::test]
+    async fn kb_search_marks_a_refuted_result_and_leaves_an_active_one_unmarked() {
+        let mut refuted = kb_entry("kb-refuted", &["fact"]);
+        refuted.content = "the office moves to the annex in March".to_string();
+        refuted.disposition = desktop_assistant_core::domain::Disposition::Refuted;
+        let mut active = kb_entry("kb-active", &["fact"]);
+        active.content = "the office moves to the annex in March".to_string();
+
+        let (service, _probe) = kb_service_reporting(KnowledgeSearchPage {
+            entries: vec![refuted, active],
+            scope_size: ScopeSize::Few,
+            available_tags: Vec::new(),
+        });
+
+        let json = kb_search_response(&service, serde_json::json!({"query": "office move"})).await;
+
+        let results = json["results"].as_array().expect("results is an array");
+        let refuted_content = results
+            .iter()
+            .find(|r| r["id"] == "kb-refuted")
+            .expect("the refuted entry is in the page")["content"]
+            .as_str()
+            .expect("content is a string")
+            .to_string();
+        let active_content = results
+            .iter()
+            .find(|r| r["id"] == "kb-active")
+            .expect("the active entry is in the page")["content"]
+            .as_str()
+            .expect("content is a string")
+            .to_string();
+
+        assert!(
+            refuted_content.starts_with("recorded, later refuted: "),
+            "a refuted result must carry the marker: {refuted_content}"
+        );
+        assert_eq!(
+            active_content, "the office moves to the annex in March",
+            "an active result must carry no marker at all"
+        );
+    }
+
     #[tokio::test]
     async fn kb_list_carries_the_summary() {
         let mut entry = kb_entry("kb-1", &["preference"]);
@@ -8799,6 +8871,53 @@ mod tests {
         assert_eq!(
             json["entries"][0]["summary"], "Prefers dark mode in every editor",
             "the list row carries the entry's one-line summary"
+        );
+    }
+
+    /// Acceptance (#893): `list` filters only on `deleted_at`, and a refuted
+    /// entry's `deleted_at` is NULL by construction - decoupling disposition
+    /// from deletion is the whole point of the vocabulary - so the browse
+    /// tool reaches a refuted row exactly as it reaches an active one. It
+    /// must carry the same marker every other surface does.
+    #[tokio::test]
+    async fn kb_list_marks_a_refuted_entry_and_leaves_an_active_one_unmarked() {
+        let mut refuted = kb_entry("kb-refuted", &["fact"]);
+        refuted.content = "the annex parking rule".to_string();
+        refuted.disposition = desktop_assistant_core::domain::Disposition::Refuted;
+        let mut active = kb_entry("kb-active", &["fact"]);
+        active.content = "the annex parking rule".to_string();
+
+        let service = kb_service_listing(vec![refuted, active]);
+
+        let raw = service
+            .execute_tool(TOOL_KB_LIST, serde_json::json!({"limit": 10}))
+            .await
+            .expect("knowledge base list succeeds");
+        let json: serde_json::Value = serde_json::from_str(&raw).expect("list response is JSON");
+
+        let entries = json["entries"].as_array().expect("entries is an array");
+        let refuted_content = entries
+            .iter()
+            .find(|e| e["id"] == "kb-refuted")
+            .expect("the refuted entry is listed")["content"]
+            .as_str()
+            .expect("content is a string")
+            .to_string();
+        let active_content = entries
+            .iter()
+            .find(|e| e["id"] == "kb-active")
+            .expect("the active entry is listed")["content"]
+            .as_str()
+            .expect("content is a string")
+            .to_string();
+
+        assert!(
+            refuted_content.starts_with("recorded, later refuted: "),
+            "a refuted entry in the browse list must carry the marker: {refuted_content}"
+        );
+        assert_eq!(
+            active_content, "the annex parking rule",
+            "an active entry must carry no marker at all"
         );
     }
 
@@ -9354,6 +9473,52 @@ mod tests {
             json["not_found"],
             serde_json::json!([]),
             "an id that resolved must not also be reported as missing"
+        );
+    }
+
+    /// Acceptance (#893): `builtin_knowledge_base_get` has never filtered on
+    /// disposition, so an id a search result or a `[Recall]` line named
+    /// reaches this read whatever it carries - a refuted entry included. It
+    /// must carry the same marker those two surfaces do, through the same
+    /// shared helper, or a fetch-by-id is the one door the vocabulary left
+    /// unlocked.
+    #[tokio::test]
+    async fn kb_get_marks_a_refuted_entry_and_leaves_an_active_one_unmarked() {
+        let mut refuted = kb_full_entry("kb-refuted");
+        refuted.disposition = desktop_assistant_core::domain::Disposition::Refuted;
+        let active = kb_full_entry("kb-active");
+
+        let (service, _probe) = kb_service_holding(vec![refuted, active]);
+
+        let json = kb_get_response(
+            &service,
+            serde_json::json!({"ids": ["kb-refuted", "kb-active"]}),
+        )
+        .await;
+
+        let entries = json["entries"].as_array().expect("entries is an array");
+        let refuted_content = entries
+            .iter()
+            .find(|e| e["id"] == "kb-refuted")
+            .expect("the refuted entry resolved")["content"]
+            .as_str()
+            .expect("content is a string")
+            .to_string();
+        let active_content = entries
+            .iter()
+            .find(|e| e["id"] == "kb-active")
+            .expect("the active entry resolved")["content"]
+            .as_str()
+            .expect("content is a string")
+            .to_string();
+
+        assert!(
+            refuted_content.starts_with("recorded, later refuted: "),
+            "a refuted entry fetched by id must carry the marker: {refuted_content}"
+        );
+        assert_eq!(
+            active_content, "the durable fact behind kb-active",
+            "an active entry must carry no marker at all"
         );
     }
 

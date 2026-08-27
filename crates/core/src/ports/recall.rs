@@ -65,6 +65,7 @@ use crate::domain::KnowledgeEntry;
 use crate::domain::activation::{
     ActivationTerms, ActivationWeights, LexicalMatch, NO_SALIENCE, NO_SITUATION, activation_terms,
 };
+use crate::domain::knowledge::Disposition;
 use crate::domain::knowledge_use::KnowledgeUseRecord;
 use crate::domain::salience::{SalienceReading, SalienceSource};
 use crate::domain::situation::{SituationCue, SituationRecord};
@@ -352,6 +353,13 @@ impl Activatable for RecallEntry {
     fn lexical(&self) -> LexicalMatch {
         LexicalMatch::NONE
     }
+
+    /// The entry's own stored disposition (#893), read straight off it: this
+    /// candidate wraps a [`KnowledgeEntry`], and the entry is the one place
+    /// the disposition is recorded.
+    fn disposition(&self) -> Disposition {
+        self.entry.disposition
+    }
 }
 
 /// One skill offered as a recall candidate (#1154): procedural memory, cued by
@@ -505,6 +513,17 @@ impl Activatable for RecallSkill {
     fn lexical(&self) -> LexicalMatch {
         LexicalMatch::NONE
     }
+
+    /// A skill is not a [`KnowledgeEntry`] and is never dispositioned (#893) -
+    /// the vocabulary is consolidation's judgement about a stored claim, and a
+    /// skill is a procedure, not a claim. [`Disposition::Active`] is the
+    /// honest answer for "nothing here to judge", the same way
+    /// [`NO_SALIENCE`] answers a term with nothing to read: the disposition
+    /// term costs a skill exactly nothing, which is how every skill scored
+    /// before this term existed.
+    fn disposition(&self) -> Disposition {
+        Disposition::Active
+    }
 }
 
 /// What a candidate contributes to its activation score
@@ -554,6 +573,15 @@ pub trait Activatable {
     /// one mode at a time, so its candidates carry a distance or a full-text
     /// match and never both.
     fn lexical(&self) -> LexicalMatch;
+    /// What consolidation, or a person, has judged this candidate to be
+    /// (#893), or [`Disposition::Active`] where the source has no such
+    /// judgement to carry - see [`RecallSkill::disposition`].
+    ///
+    /// [`ActivationWeights::disposition`] turns this into the one term that
+    /// only ever subtracts.
+    ///
+    /// [`ActivationWeights::disposition`]: crate::domain::activation::ActivationWeights::disposition
+    fn disposition(&self) -> Disposition;
 }
 
 /// What a ranker does with a set where some candidates carry a semantic signal
@@ -694,6 +722,7 @@ where
                 hit.situation_coverage(situation),
                 hit.salience_share(),
                 hit.lexical(),
+                hit.disposition(),
                 now,
                 &weights,
             )

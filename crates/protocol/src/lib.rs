@@ -78,6 +78,33 @@ pub fn one_line(text: &str, max_chars: usize) -> String {
     out
 }
 
+/// The stored spelling of the one disposition (#893) a rendered line has to
+/// mark. Every other spelling - `active`, `superseded`, `redundant`,
+/// `obsolete`, `trivial` - answers no marker from [`disposition_marker`].
+///
+/// A bare string rather than the closed enum
+/// (`desktop_assistant_core::domain::knowledge::Disposition`) for the same
+/// reason [`one_line`] lives here and not beside either type: the wire view
+/// (`desktop-assistant-api-model`) does not depend on `desktop-assistant-core`,
+/// so it cannot hold that enum, and this crate is the one both can depend on.
+/// The domain type's own `Disposition::marker` is pinned against this by
+/// `the_domain_and_wire_refuted_markers_agree` in `desktop-assistant-core`, so
+/// the two cannot drift silently.
+pub const REFUTED_DISPOSITION: &str = "refuted";
+
+/// What a rendered line must be prefixed with before it shows an entry
+/// carrying `disposition`, or the empty string where nothing is owed.
+///
+/// **The one shared render helper**, read by both the domain entry's own
+/// `display_line` and the wire view's, so a caller on either side of the
+/// wire renders a refuted entry the same way. See [`REFUTED_DISPOSITION`]
+/// for why this takes the stored spelling rather than a typed enum.
+pub fn disposition_marker(disposition: &str) -> &'static str {
+    // STUB (red commit): the real mapping lands in the implementation commit.
+    let _ = disposition;
+    ""
+}
+
 // ---------------------------------------------------------------------------
 // Effort
 // ---------------------------------------------------------------------------

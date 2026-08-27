@@ -292,6 +292,7 @@ mod tests {
             created_at: "2026-06-14T00:00:00Z".to_string(),
             updated_at: "2026-06-14T00:00:00Z".to_string(),
             summary: Some("a one-line summary".to_string()),
+            disposition: "active".to_string(),
         }
     }
 

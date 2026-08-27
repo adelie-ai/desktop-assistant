@@ -82,6 +82,31 @@ impl Disposition {
     pub fn parse(value: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|d| d.as_str() == value)
     }
+
+    /// What a rendered line must be prefixed with before it shows this
+    /// disposition's content, or the empty string where nothing is owed.
+    ///
+    /// **The one shared render helper** (#893). A `refuted` entry must never
+    /// be shown as a current fact, and a marker in the text is the only
+    /// enforcement point that reaches every surface: [`KnowledgeEntry::display_line`]
+    /// calls it for the `[Recall]` block and the knowledge browser, and the
+    /// knowledge-base search tool calls it for the same reason on the content
+    /// it returns to the model. One function, so a surface that forgot to
+    /// check the disposition still shows the marker, because the marker is
+    /// already part of the text it renders.
+    ///
+    /// Every other disposition answers the empty string here. `superseded`
+    /// and `redundant` are never shown under their own id - retrieval
+    /// resolves them to their successor before a caller ever sees them - and
+    /// `obsolete` is excluded by default; the two remaining live cases,
+    /// `active` and `trivial`, are both ordinary content that needs no
+    /// warning label.
+    pub const fn marker(self) -> &'static str {
+        // STUB (red commit): the real mapping lands in the implementation
+        // commit. Until then every disposition answers no marker at all.
+        let _ = self;
+        ""
+    }
 }
 
 /// A unified knowledge base entry, replacing separate preferences and memory stores.
@@ -173,9 +198,22 @@ impl KnowledgeEntry {
     /// The cap covers a stored summary as well as a fallback body. Nothing in
     /// the schema bounds either, and the budget this protects counts what is
     /// rendered, not where it came from.
+    ///
+    /// **Carries the disposition marker inside the cap, not appended after
+    /// it.** [`Disposition::marker`] is reserved out of the budget before
+    /// [`desktop_assistant_protocol::one_line`] cuts the body, so a refuted
+    /// entry's line still fits in [`SUMMARY_MAX_CHARS`] rather than running
+    /// over it - a marked line that broke the cap would be the one line most
+    /// likely to get cut off by a caller enforcing it downstream, which is
+    /// exactly the line that must not lose its warning.
     pub fn display_line(&self) -> String {
+        let marker = self.disposition.marker();
         let source = self.summary.as_deref().unwrap_or(&self.content);
-        desktop_assistant_protocol::one_line(source, SUMMARY_MAX_CHARS)
+        let budget = SUMMARY_MAX_CHARS.saturating_sub(marker.chars().count());
+        format!(
+            "{marker}{}",
+            desktop_assistant_protocol::one_line(source, budget)
+        )
     }
 }
 
@@ -333,5 +371,101 @@ mod tests {
         assert_eq!(deserialized.content, entry.content);
         assert_eq!(deserialized.tags, entry.tags);
         assert_eq!(deserialized.metadata, entry.metadata);
+    }
+
+    /// The marker text every test below checks against, written out rather
+    /// than read from [`Disposition::marker`] itself - a test that asked the
+    /// function under test what its own answer should be would pass however
+    /// that function was neutered.
+    const EXPECTED_REFUTED_MARKER: &str = "recorded, later refuted: ";
+
+    /// Acceptance (#893): a refuted entry's rendered line always carries the
+    /// marker, whether the line falls back to the content or reads a stored
+    /// summary - the two sources [`KnowledgeEntry::display_line`] can draw on.
+    ///
+    /// Paired with `an_active_entrys_line_carries_no_marker` below: a filter
+    /// that always prefixed the marker would pass this test alone.
+    #[test]
+    fn a_refuted_entry_is_never_rendered_without_the_refuted_marker() {
+        let mut from_content = KnowledgeEntry::new("kb-1", "the office moves in March", vec![]);
+        from_content.disposition = Disposition::Refuted;
+        assert!(
+            from_content
+                .display_line()
+                .starts_with(EXPECTED_REFUTED_MARKER),
+            "a refuted entry rendered from its content must carry the marker: {}",
+            from_content.display_line()
+        );
+
+        let mut from_summary = KnowledgeEntry::new("kb-2", "long body text", vec![]);
+        from_summary.disposition = Disposition::Refuted;
+        from_summary.summary = Some("office moves in March".to_string());
+        assert!(
+            from_summary
+                .display_line()
+                .starts_with(EXPECTED_REFUTED_MARKER),
+            "a refuted entry rendered from its summary must carry the marker: {}",
+            from_summary.display_line()
+        );
+    }
+
+    /// The negative half of the test above: an ordinary entry's line carries
+    /// no marker at all, so the marker means something when it does appear.
+    #[test]
+    fn an_active_entrys_line_carries_no_marker() {
+        let entry = KnowledgeEntry::new("kb-1", "the office moves in March", vec![]);
+
+        assert_eq!(entry.display_line(), "the office moves in March");
+    }
+
+    /// The marker is reserved out of the cap rather than appended after it,
+    /// so a refuted entry's line never exceeds [`SUMMARY_MAX_CHARS`] - the
+    /// same bound [`display_line_never_exceeds_the_cap`] pins for the
+    /// unmarked case.
+    #[test]
+    fn a_refuted_entrys_marked_line_never_exceeds_the_cap() {
+        let mut entry = KnowledgeEntry::new("kb-1", "x".repeat(10_000), vec![]);
+        entry.disposition = Disposition::Refuted;
+
+        assert!(entry.display_line().chars().count() <= SUMMARY_MAX_CHARS);
+        assert!(entry.display_line().starts_with(EXPECTED_REFUTED_MARKER));
+    }
+
+    /// Every disposition but `refuted` renders with no marker at all - stated
+    /// exhaustively so a new variant added later has to answer this rather
+    /// than silently inheriting whichever arm the match falls into.
+    #[test]
+    fn only_refuted_carries_a_marker() {
+        for disposition in Disposition::ALL {
+            let expected = if disposition == Disposition::Refuted {
+                "recorded, later refuted: "
+            } else {
+                ""
+            };
+            assert_eq!(
+                disposition.marker(),
+                expected,
+                "{disposition:?} must answer the marker this test states, or nothing"
+            );
+        }
+    }
+
+    /// The domain type's marker and the wire view's answer identically over
+    /// every disposition, so the two implementations - which have to be
+    /// separate, because `desktop-assistant-api-model` does not depend on
+    /// this crate - cannot silently drift apart. Pins
+    /// [`Disposition::marker`] against
+    /// [`desktop_assistant_protocol::disposition_marker`], the function
+    /// `KnowledgeEntryView::display_line` calls on the other side of the
+    /// wire.
+    #[test]
+    fn the_domain_and_wire_refuted_markers_agree() {
+        for disposition in Disposition::ALL {
+            assert_eq!(
+                disposition.marker(),
+                desktop_assistant_protocol::disposition_marker(disposition.as_str()),
+                "{disposition:?}: the domain marker and the wire marker must agree"
+            );
+        }
     }
 }

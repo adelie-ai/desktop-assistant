@@ -10,7 +10,7 @@
 //! ## The score
 //!
 //! ```text
-//! A_i = semantic + lexical + reinforcement + situation + salience
+//! A_i = semantic + lexical + reinforcement + situation + salience + disposition
 //! ```
 //!
 //! - **`semantic`** is how far the candidate stands out of its own source,
@@ -44,6 +44,12 @@
 //!   [`crate::domain::salience`] states the signals, why they divide one lift
 //!   rather than each adding one, and why a reading of text is bounded by one
 //!   recorded use; [`ActivationWeights::salience`] turns it into deviations.
+//! - **`disposition`** is what consolidation, or a person, has judged the
+//!   entry to be (#893). Unlike every term above it never lifts - it only
+//!   ever subtracts, and only for one value
+//!   ([`crate::domain::knowledge::Disposition::Trivial`]).
+//!   [`ActivationWeights::disposition`] states why the other five values cost
+//!   nothing here.
 //!
 //! [`RecallDispersion::deviations_below_median`]:
 //!     crate::ports::recall::RecallDispersion::deviations_below_median
@@ -78,17 +84,15 @@
 //!   it. What the logarithm rules out is the other loop: an entry that keeps
 //!   being retrieved because it was retrieved.
 //!
-//! ## The terms that have no input yet
+//! ## The disposition penalty (#893)
 //!
-//! The full form the epic describes carries three more terms. None of them has
-//! anything to read today, so none of them is a parameter here - a weight with
-//! no input is a number nobody can fit and everybody has to maintain.
+//! `A_i` also carries a sixth term: what consolidation, or a person, has
+//! judged the entry to be
+//! ([`crate::domain::knowledge::Disposition`]). Only `trivial` costs
+//! anything - [`ActivationWeights::disposition`] states why the other five
+//! values are worth zero here rather than in this term.
 //!
-//! | term | where its input will come from |
-//! | --- | --- |
-//! | interference penalty | the entry disposition of #893, which no column holds yet |
-//!
-//! Each of them adds to `A_i` when it exists. The semantic term is already
+//! Each term the epic adds joins the same way. The semantic term is already
 //! dimensionless, so a new term states its own weight in the same deviations and
 //! nothing already fitted has to move - which is exactly how the lexical term
 //! joined, and what a recall lookup still answers
@@ -99,6 +103,7 @@
 
 use chrono::{DateTime, Utc};
 
+use crate::domain::knowledge::Disposition;
 use crate::domain::knowledge_use::{KnowledgeUseRecord, UseScoreWeights};
 
 /// The age of the one use that anchors the reinforcement scale, in seconds.
@@ -163,6 +168,22 @@ pub const DEFAULT_USE_LIFT: f64 = 0.5;
 /// set a minute ago, which is the single largest term the log can carry.
 pub const MAX_REINFORCEMENT_DEVIATIONS: f64 = 3.0;
 
+/// How many of a source's own deviations a `trivial` disposition subtracts.
+///
+/// **Decisive against a near-tie, not against a real semantic lead.** The two
+/// cheap signals ([`ActivationWeights::situation`],
+/// [`ActivationWeights::salience`]) are bounded by
+/// [`Self::reference_use_lift`] - about a third of a deviation - and adjacent
+/// candidates over a real store sit a few tenths of a deviation apart (see
+/// [`DEFAULT_USE_LIFT`]'s own measurement). A one-deviation penalty clears
+/// both: a `trivial` entry cannot lead an `active` one of comparable
+/// relevance, which is the one property this weight is fitted to. It is not
+/// fitted to survive an extreme use history stacked on top of a real
+/// semantic lead - a store's own spread can still put a well-used, `trivial`
+/// entry ahead of a barely-matching `active` one several deviations further
+/// out, which is the same trade every other cheap signal here makes.
+pub const DEFAULT_TRIVIAL_PENALTY: f64 = 1.0;
+
 /// The coefficients `activation` applies.
 ///
 /// A struct rather than constants for the same reason
@@ -175,6 +196,9 @@ pub struct ActivationWeights {
     pub use_lift: f64,
     /// What one use, and one mark, are worth to the base-level sum.
     pub use_score: UseScoreWeights,
+    /// How many deviations a `trivial` disposition costs. See
+    /// [`DEFAULT_TRIVIAL_PENALTY`].
+    pub trivial_penalty: f64,
 }
 
 impl Default for ActivationWeights {
@@ -182,6 +206,7 @@ impl Default for ActivationWeights {
         Self {
             use_lift: DEFAULT_USE_LIFT,
             use_score: UseScoreWeights::default(),
+            trivial_penalty: DEFAULT_TRIVIAL_PENALTY,
         }
     }
 }
@@ -400,6 +425,38 @@ impl ActivationWeights {
         // and a negative one would otherwise make a salient entry subtract.
         self.salience_lift().max(0.0) * share.min(1.0)
     }
+
+    /// What a disposition costs, in the source's own deviations (#893).
+    ///
+    /// Only [`Disposition::Trivial`] costs anything, and it always subtracts
+    /// [`Self::trivial_penalty`] - never more, never less, so the term cannot
+    /// be read as a graded judgement of how trivial an entry is. The other
+    /// five values answer zero here, each for its own reason and not because
+    /// nothing was checked:
+    ///
+    /// - [`Disposition::Active`] is the ordinary case this term did not exist
+    ///   to change.
+    /// - [`Disposition::Refuted`] must stay findable when the query is about
+    ///   its subject - that is the entire point of the value - so ranking is
+    ///   not where its asymmetry lives. [`Disposition::marker`] is: a refuted
+    ///   row can be found and must still never read as a current fact, which
+    ///   a rendered marker enforces on every surface regardless of where the
+    ///   row lands on a page.
+    /// - [`Disposition::Superseded`] and [`Disposition::Redundant`] are never
+    ///   shown under their own id at all - the search that admits them
+    ///   resolves each to its successor before ranking sees a candidate - so
+    ///   a penalty here would never reach a rendered row.
+    /// - [`Disposition::Obsolete`] is excluded from the candidate set by
+    ///   default, and a caller that asked to see it anyway asked to see it
+    ///   plainly, not deranked without being told.
+    ///
+    /// [`Disposition::marker`]: crate::domain::knowledge::Disposition::marker
+    pub fn disposition(&self, disposition: Disposition) -> f64 {
+        // STUB (red commit): the real penalty lands in the implementation
+        // commit. Until then no disposition costs anything.
+        let _ = disposition;
+        0.0
+    }
 }
 
 /// What one query's own words found, and how far this source lets anything
@@ -518,13 +575,23 @@ pub const NO_SALIENCE: f64 = 0.0;
 /// caller left; it stays as the fixture the arithmetic tests below and in
 /// [`crate::domain::replay`] pin their expectations against, and
 /// [`activation_terms`] is what it now delegates to.
+///
+/// One argument per term rather than a struct, for the same reason a struct
+/// was rejected above: a struct literal a caller builds once and reuses is
+/// exactly the shape that let the situation term travel as a stale field
+/// nobody updated. A positional argument added here is a compile error at
+/// every call site until it is answered; the same code as
+/// `desktop_assistant_daemon::recall::lookup`, which carries the same
+/// attribute for the same reason.
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn activation(
     semantic: f64,
     record: Option<&KnowledgeUseRecord>,
     situation_coverage: f64,
     salience_share: f64,
     lexical: LexicalMatch,
+    disposition: Disposition,
     now: DateTime<Utc>,
     weights: &ActivationWeights,
 ) -> f64 {
@@ -534,6 +601,7 @@ pub(crate) fn activation(
         situation_coverage,
         salience_share,
         lexical,
+        disposition,
         now,
         weights,
     )
@@ -581,9 +649,17 @@ pub struct ActivationTerms {
     /// How much of the salience information this build can detect the
     /// candidate carries (#1127), in deviations.
     pub salience: f64,
+    /// What consolidation, or a person, has judged the candidate to be
+    /// (#893), in the source's own deviations. Zero for every
+    /// [`crate::domain::knowledge::Disposition`] except
+    /// [`crate::domain::knowledge::Disposition::Trivial`], which this term
+    /// always answers as a negative deviation count - see
+    /// [`ActivationWeights::disposition`].
+    pub disposition: f64,
     /// `semantic.unwrap_or(0.0) + lexical + reinforcement + situation +
-    /// salience` - what [`rank_by_activation`](crate::ports::recall::rank_by_activation)
-    /// sorts by.
+    /// salience + disposition` - what
+    /// [`rank_by_activation`](crate::ports::recall::rank_by_activation) sorts
+    /// by.
     pub total: f64,
 }
 
@@ -600,12 +676,14 @@ pub struct ActivationTerms {
 /// [`activation`] is this function's `total`, over a `semantic` that is
 /// always `Some` - every caller of `activation` already has a distance to
 /// read, so its signature keeps that value required rather than optional.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn activation_terms(
     semantic: Option<f64>,
     record: Option<&KnowledgeUseRecord>,
     situation_coverage: f64,
     salience_share: f64,
     lexical: LexicalMatch,
+    disposition: Disposition,
     now: DateTime<Utc>,
     weights: &ActivationWeights,
 ) -> ActivationTerms {
@@ -614,17 +692,20 @@ pub(crate) fn activation_terms(
     let reinforcement_term = weights.reinforcement(sum);
     let situation_term = weights.situation(situation_coverage);
     let salience_term = weights.salience(salience_share);
+    let disposition_term = weights.disposition(disposition);
     let total = semantic.unwrap_or(0.0)
         + lexical_term
         + reinforcement_term
         + situation_term
-        + salience_term;
+        + salience_term
+        + disposition_term;
     ActivationTerms {
         semantic,
         lexical: lexical_term,
         reinforcement: reinforcement_term,
         situation: situation_term,
         salience: salience_term,
+        disposition: disposition_term,
         total,
     }
 }
@@ -702,6 +783,7 @@ mod tests {
             NO_SITUATION,
             NO_SALIENCE,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -711,6 +793,7 @@ mod tests {
             NO_SITUATION,
             NO_SALIENCE,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -760,6 +843,7 @@ mod tests {
             NO_SITUATION,
             NO_SALIENCE,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -769,6 +853,7 @@ mod tests {
             NO_SITUATION,
             NO_SALIENCE,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -812,6 +897,7 @@ mod tests {
             NO_SITUATION,
             NO_SALIENCE,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -822,6 +908,7 @@ mod tests {
                 NO_SITUATION,
                 NO_SALIENCE,
                 LexicalMatch::NONE,
+                Disposition::Active,
                 now,
                 &weights,
             );
@@ -857,6 +944,7 @@ mod tests {
             NO_SITUATION,
             NO_SALIENCE,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -866,6 +954,7 @@ mod tests {
             NO_SITUATION,
             NO_SALIENCE,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -925,6 +1014,7 @@ mod tests {
             NO_SITUATION,
             NO_SALIENCE,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -950,6 +1040,7 @@ mod tests {
                 NO_SITUATION,
                 NO_SALIENCE,
                 LexicalMatch::NONE,
+                Disposition::Active,
                 now,
                 &weights,
             );
@@ -990,6 +1081,7 @@ mod tests {
             NO_SITUATION,
             NO_SALIENCE,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -999,6 +1091,7 @@ mod tests {
             NO_SITUATION,
             NO_SALIENCE,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -1042,6 +1135,7 @@ mod tests {
             NO_SITUATION,
             NO_SALIENCE,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -1051,6 +1145,7 @@ mod tests {
             NO_SITUATION,
             NO_SALIENCE,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -1078,6 +1173,7 @@ mod tests {
                     NO_SITUATION,
                     NO_SALIENCE,
                     LexicalMatch::NONE,
+                    Disposition::Active,
                     now,
                     &weights
                 ),
@@ -1096,6 +1192,7 @@ mod tests {
                 NO_SITUATION,
                 NO_SALIENCE,
                 LexicalMatch::NONE,
+                Disposition::Active,
                 now,
                 &weights
             ),
@@ -1105,6 +1202,7 @@ mod tests {
                 NO_SITUATION,
                 NO_SALIENCE,
                 LexicalMatch::NONE,
+                Disposition::Active,
                 now,
                 &weights
             )
@@ -1136,6 +1234,7 @@ mod tests {
                 NO_SITUATION,
                 NO_SALIENCE,
                 LexicalMatch::NONE,
+                Disposition::Active,
                 now,
                 &weights,
             ) < activation(
@@ -1144,6 +1243,7 @@ mod tests {
                 NO_SITUATION,
                 NO_SALIENCE,
                 LexicalMatch::NONE,
+                Disposition::Active,
                 now,
                 &weights
             )
@@ -1189,6 +1289,7 @@ mod tests {
             NO_SITUATION,
             NO_SALIENCE,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -1214,6 +1315,7 @@ mod tests {
             NO_SITUATION,
             NO_SALIENCE,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -1223,6 +1325,7 @@ mod tests {
             NO_SITUATION,
             NO_SALIENCE,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -1253,6 +1356,7 @@ mod tests {
             NO_SITUATION,
             NO_SALIENCE,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -1289,6 +1393,7 @@ mod tests {
             1.0,
             NO_SALIENCE,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -1298,6 +1403,7 @@ mod tests {
             1.0,
             NO_SALIENCE,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -1333,6 +1439,7 @@ mod tests {
             NO_SITUATION,
             NO_SALIENCE,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -1372,6 +1479,7 @@ mod tests {
                         decay,
                         ..UseScoreWeights::default()
                     },
+                    ..ActivationWeights::default()
                 };
                 let expected = use_lift * std::f64::consts::LN_2;
                 assert!(
@@ -1400,6 +1508,7 @@ mod tests {
             1.0,
             NO_SALIENCE,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -1409,6 +1518,7 @@ mod tests {
             0.0,
             NO_SALIENCE,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -1439,6 +1549,7 @@ mod tests {
                 NO_SITUATION,
                 NO_SALIENCE,
                 LexicalMatch::NONE,
+                Disposition::Active,
                 now,
                 &weights,
             );
@@ -1453,6 +1564,7 @@ mod tests {
                 NO_SITUATION,
                 NO_SALIENCE,
                 LexicalMatch::NONE,
+                Disposition::Active,
                 now,
                 &weights,
             );
@@ -1493,6 +1605,7 @@ mod tests {
             NO_SITUATION,
             1.0,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -1502,6 +1615,7 @@ mod tests {
             NO_SITUATION,
             1.0,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -1563,6 +1677,7 @@ mod tests {
             NO_SITUATION,
             NO_SALIENCE,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -1602,6 +1717,7 @@ mod tests {
                         decay,
                         ..UseScoreWeights::default()
                     },
+                    ..ActivationWeights::default()
                 };
                 let expected = use_lift * std::f64::consts::LN_2;
                 assert!(
@@ -1637,6 +1753,7 @@ mod tests {
             NO_SITUATION,
             1.0,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -1646,6 +1763,7 @@ mod tests {
             NO_SITUATION,
             NO_SALIENCE,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -1677,6 +1795,7 @@ mod tests {
                     NO_SITUATION,
                     NO_SALIENCE,
                     LexicalMatch::NONE,
+                    Disposition::Active,
                     now,
                     &weights
                 ),
@@ -1689,6 +1808,7 @@ mod tests {
                     NO_SITUATION,
                     NO_SALIENCE,
                     LexicalMatch::NONE,
+                    Disposition::Active,
                     now,
                     &weights,
                 ),
@@ -1717,7 +1837,16 @@ mod tests {
         let weights = ActivationWeights::default();
         let one = weights.reference_use_lift();
 
-        let both_at_the_bar = activation(BAR, None, 1.0, 1.0, LexicalMatch::NONE, now, &weights);
+        let both_at_the_bar = activation(
+            BAR,
+            None,
+            1.0,
+            1.0,
+            LexicalMatch::NONE,
+            Disposition::Active,
+            now,
+            &weights,
+        );
         assert!(
             (both_at_the_bar - BAR - 2.0 * one).abs() < 1e-9,
             "a fully situated, fully salient candidate at the bar scored {both_at_the_bar}, and \
@@ -1739,6 +1868,7 @@ mod tests {
                     NO_SITUATION,
                     NO_SALIENCE,
                     LexicalMatch::NONE,
+                    Disposition::Active,
                     now,
                     &weights
                 ),
@@ -1766,6 +1896,7 @@ mod tests {
                         NO_SITUATION,
                         NO_SALIENCE,
                         LexicalMatch::NONE,
+                        Disposition::Active,
                         now,
                         &weights
                     ),
@@ -1790,6 +1921,7 @@ mod tests {
             NO_SITUATION,
             NO_SALIENCE,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -1800,6 +1932,7 @@ mod tests {
                 NO_SITUATION,
                 0.0,
                 LexicalMatch::NONE,
+                Disposition::Active,
                 now,
                 &weights
             ),
@@ -1812,6 +1945,7 @@ mod tests {
                 NO_SITUATION,
                 0.3,
                 LexicalMatch::NONE,
+                Disposition::Active,
                 now,
                 &weights
             ) > without
@@ -1834,6 +1968,7 @@ mod tests {
             NO_SITUATION,
             NO_SALIENCE,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -1844,6 +1979,7 @@ mod tests {
                 0.0,
                 NO_SALIENCE,
                 LexicalMatch::NONE,
+                Disposition::Active,
                 now,
                 &weights
             ),
@@ -1856,6 +1992,7 @@ mod tests {
                 0.3,
                 NO_SALIENCE,
                 LexicalMatch::NONE,
+                Disposition::Active,
                 now,
                 &weights
             ) > without
@@ -1879,6 +2016,7 @@ mod tests {
             1.0,
             NO_SALIENCE,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -1902,6 +2040,7 @@ mod tests {
                         NO_SITUATION,
                         NO_SALIENCE,
                         LexicalMatch::NONE,
+                        Disposition::Active,
                         now,
                         &weights
                     ),
@@ -1939,6 +2078,7 @@ mod tests {
             NO_SITUATION,
             NO_SALIENCE,
             LexicalMatch::NONE,
+            Disposition::Active,
             now,
             &weights,
         );
@@ -1948,6 +2088,7 @@ mod tests {
             NO_SITUATION,
             NO_SALIENCE,
             a_spread_of(spread),
+            Disposition::Active,
             now,
             &weights,
         );
@@ -1978,6 +2119,7 @@ mod tests {
                 NO_SITUATION,
                 NO_SALIENCE,
                 LexicalMatch::NONE,
+                Disposition::Active,
                 now,
                 &weights,
             );
@@ -1999,6 +2141,7 @@ mod tests {
                         share: NO_LEXICAL,
                         spread: 20.0
                     },
+                    Disposition::Active,
                     now,
                     &weights,
                 ),
@@ -2046,6 +2189,7 @@ mod tests {
                         decay,
                         ..UseScoreWeights::default()
                     },
+                    ..ActivationWeights::default()
                 };
                 assert!(
                     (weights.lexical(a_spread_of(4.0)) - 4.0).abs() < 1e-9,
@@ -2086,6 +2230,69 @@ mod tests {
         assert_eq!(weights.lexical(a_spread_of(f64::INFINITY)), 0.0);
     }
 
+    // --- The disposition term (#893) -----------------------------------
+
+    /// Only `trivial` costs anything. Stated exhaustively over every
+    /// disposition, so the five refusing values are checked as hard as the
+    /// one permit, and a new variant added later has to answer this rather
+    /// than falling through to whichever arm a `match` happened to put it
+    /// in.
+    #[test]
+    fn only_a_trivial_disposition_costs_anything() {
+        let weights = ActivationWeights::default();
+
+        for disposition in Disposition::ALL {
+            let term = weights.disposition(disposition);
+            if disposition == Disposition::Trivial {
+                assert_eq!(
+                    term, -weights.trivial_penalty,
+                    "trivial must cost exactly the stated penalty"
+                );
+            } else {
+                assert_eq!(term, 0.0, "{disposition:?} must cost nothing in this term");
+            }
+        }
+    }
+
+    /// Acceptance (#893): with every other term held equal, a `trivial`
+    /// entry's whole score sits below a comparable `active` one's - the
+    /// property the search page's own ranking test
+    /// (`a_trivial_entry_ranks_below_an_active_one_of_comparable_relevance`
+    /// in `knowledge_search.rs`) exercises end to end. This is the unit
+    /// underneath it: the term itself, not the page it moves.
+    #[test]
+    fn a_trivial_disposition_lowers_the_whole_score_relative_to_active() {
+        let now = now();
+        let weights = ActivationWeights::default();
+
+        let active = activation(
+            7.0,
+            None,
+            NO_SITUATION,
+            NO_SALIENCE,
+            LexicalMatch::NONE,
+            Disposition::Active,
+            now,
+            &weights,
+        );
+        let trivial = activation(
+            7.0,
+            None,
+            NO_SITUATION,
+            NO_SALIENCE,
+            LexicalMatch::NONE,
+            Disposition::Trivial,
+            now,
+            &weights,
+        );
+
+        assert!(
+            trivial < active,
+            "a trivial entry must score below a comparable active one: trivial={trivial}, \
+             active={active}"
+        );
+    }
+
     /// Acceptance (#1123): scoring a corpus far larger than any one lookup reads
     /// costs a fraction of the budget the lookup already has.
     ///
@@ -2114,6 +2321,7 @@ mod tests {
                     NO_SITUATION,
                     NO_SALIENCE,
                     LexicalMatch::NONE,
+                    Disposition::Active,
                     now,
                     &weights,
                 )

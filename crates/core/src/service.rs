@@ -2374,7 +2374,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
         let entries: Option<planning::PinnedEntries> = resolved.as_ref().map(|found| {
             found
                 .iter()
-                .map(|e| (e.id.as_str(), e.content.as_str()))
+                .map(|e| (e.id.as_str(), (e.content.as_str(), e.disposition)))
                 .collect()
         });
         self.release_dangling_references(conversation_id, &notes, entries.as_ref())

@@ -77,6 +77,7 @@
 use chrono::{DateTime, Utc};
 use desktop_assistant_core::domain::KnowledgeEntry;
 use desktop_assistant_core::domain::activation::{LexicalMatch, NO_SITUATION};
+use desktop_assistant_core::domain::knowledge::Disposition;
 use desktop_assistant_core::domain::knowledge_use::KnowledgeUseRecord;
 use desktop_assistant_core::domain::salience::{SalienceReading, SalienceSource};
 use desktop_assistant_core::domain::situation::{SituationCue, SituationRecord};
@@ -151,6 +152,12 @@ impl Activatable for SearchCandidate {
     /// [`LexicalMatch::NONE`].
     fn lexical(&self) -> LexicalMatch {
         self.lexical
+    }
+
+    /// The row's own stored disposition (#893), read from the same entry the
+    /// other terms read.
+    fn disposition(&self) -> Disposition {
+        self.entry.disposition
     }
 }
 
@@ -284,6 +291,53 @@ pub(crate) fn rank_page(
 /// deliberately unscoped, which is what turns a model change into degraded
 /// recall rather than content that cannot be found at all.
 ///
+/// ## Disposition admission and resolution (#893)
+///
+/// **Both arms admit every disposition but `obsolete`.** `active`,
+/// `refuted`, `trivial`, `superseded` and `redundant` all reach `d` and
+/// `lexical` on the same terms as before this changed - a row's disposition
+/// no longer decided whether it could be found, only what happens to the id
+/// once it is. `obsolete` is the one exclusion, and `$9` lifts it: a caller
+/// that explicitly asked to see dispositioned history gets it, and every
+/// other caller does not.
+///
+/// **`chain` resolves `superseded` and `redundant` through `superseded_by`
+/// before anything is shown.** A row admitted under either disposition is
+/// never returned under its own id - the search that admitted it wanted
+/// what that id says, and what it says now is "ask the row it points to".
+/// The walk is a recursive CTE over `superseded_by`, one step per row,
+/// bounded at depth 8: `chain.depth < 8` in the recursive term is what makes
+/// a cycle terminate rather than hang the query, at the cost of not
+/// necessarily reaching a true terminal on a chain that long. Consolidation
+/// never writes a chain anywhere near that deep - the bound exists for
+/// defense, not for the ordinary case.
+///
+/// **`terminal` answers every admitted id, not only the resolved ones.** An
+/// id whose own disposition is not `superseded`/`redundant` never satisfies
+/// the recursive term's `WHERE`, so its own chain has exactly one row and its
+/// terminal is itself - which is what lets `resolved`/`final_admitted` treat
+/// every id uniformly instead of branching on whether resolution applied.
+///
+/// **`final_admitted` deduplicates a resolved id against one the arms
+/// admitted directly, and the direct admission wins.** Two ids can resolve to
+/// the same terminal - a chain's origin and a row the arms separately
+/// matched on its own words - and showing both would be the same content
+/// twice. `DISTINCT ON (terminal_id)` keeps one row per terminal, and the
+/// `ORDER BY` inside it prefers, in order: the id that *is* its own terminal
+/// (a direct match needs no resolution to explain its seat), then the
+/// vector arm over the full-text arm, then the better seat. **The resolved
+/// row inherits the match's seat** in the remaining case - a chain's origin
+/// matched and its terminal did not - so a query that only names the old
+/// wording still places its successor by how well the old wording matched,
+/// not by whatever position the successor's own (unrelated) row would have
+/// taken.
+///
+/// **The final join re-applies both the live-row predicate and the obsolete
+/// exclusion to the *terminal* id.** A chain can resolve to a row this
+/// caller would otherwise refuse - reaped, or itself `obsolete` - and the
+/// terminal's own state is what decides visibility, not the state of the id
+/// that led there.
+///
 /// Every returned row repeats the same three statistics, which is the price of
 /// stating them in the same answer as the candidates.
 ///
@@ -296,11 +350,12 @@ pub(crate) fn rank_page(
 /// reinforcement term exists to settle. `crates/storage/tests/knowledge_hybrid_and_pagination.rs`
 /// binds this against a seeded store and asserts the numbers.
 pub const HYBRID_SEARCH_SQL: &str = "\
-    WITH d AS (
+    WITH RECURSIVE d AS (
          SELECT id, MIN(chunk <=> $1) AS distance
          FROM knowledge_base, unnest(embedding) AS chunk
          WHERE user_id = $6
            AND deleted_at IS NULL
+           AND (disposition <> 'obsolete' OR true)
            AND ($2::text[] IS NULL OR tags && $2)
            AND ($7::text[] IS NULL OR NOT (tags && $7))
            AND embedding IS NOT NULL
@@ -333,6 +388,7 @@ pub const HYBRID_SEARCH_SQL: &str = "\
          CROSS JOIN plainto_tsquery('english', $4) AS query
          WHERE kb.user_id = $6
            AND kb.deleted_at IS NULL
+           AND (kb.disposition <> 'obsolete' OR true)
            AND ($2::text[] IS NULL OR kb.tags && $2)
            AND ($7::text[] IS NULL OR NOT (kb.tags && $7))
            AND kb.tsv @@ query
@@ -358,6 +414,7 @@ pub const HYBRID_SEARCH_SQL: &str = "\
          LEFT JOIN d ON d.id = kb.id
          WHERE kb.user_id = $6
            AND kb.deleted_at IS NULL
+           AND (kb.disposition <> 'obsolete' OR true)
            AND ($2::text[] IS NULL OR kb.tags && $2)
            AND ($7::text[] IS NULL OR NOT (kb.tags && $7))
            AND kb.tsv @@ query
@@ -377,14 +434,48 @@ pub const HYBRID_SEARCH_SQL: &str = "\
                 coalesce(min(seat) FILTER (WHERE arm = 0), min(seat)) AS seat
          FROM admitted
          GROUP BY id
+     ),
+     chain(start_id, current_id, depth) AS (
+         SELECT id, id, 0
+         FROM merged
+         UNION ALL
+         SELECT chain.start_id, kb.superseded_by, chain.depth + 1
+         FROM chain
+         JOIN knowledge_base kb
+           ON kb.id = chain.current_id AND kb.user_id = $6 AND kb.deleted_at IS NULL
+         WHERE kb.disposition IN ('superseded', 'redundant')
+           AND kb.superseded_by IS NOT NULL
+           AND chain.depth < 8
+     ),
+     terminal AS (
+         -- STUB (red commit): resolution lands in the implementation commit.
+         SELECT DISTINCT ON (start_id) start_id, start_id AS terminal_id
+         FROM chain
+         ORDER BY start_id, depth DESC
+     ),
+     resolved AS (
+         SELECT m.id AS original_id, m.distance, m.lexical_share, m.arm, m.seat,
+                t.terminal_id
+         FROM merged m
+         JOIN terminal t ON t.start_id = m.id
+     ),
+     final_admitted AS (
+         SELECT DISTINCT ON (terminal_id)
+                terminal_id AS id, distance, lexical_share, arm, seat
+         FROM resolved
+         ORDER BY terminal_id,
+                  (terminal_id = original_id) DESC,
+                  arm,
+                  seat
      )
      SELECT kb.id, kb.content, kb.tags, kb.metadata, kb.created_at, kb.updated_at,
-            kb.source, kb.summary,
+            kb.source, kb.summary, kb.disposition,
             a.distance, a.lexical_share,
             s.median, s.rows_read, s.deviation, s.nearest, s.furthest
-     FROM merged a
+     FROM final_admitted a
      JOIN knowledge_base kb
        ON kb.id = a.id AND kb.user_id = $6 AND kb.deleted_at IS NULL
+       AND (kb.disposition <> 'obsolete' OR true)
      CROSS JOIN s
      ORDER BY a.arm, a.seat";
 
@@ -471,6 +562,13 @@ mod tests {
             use_record: Some(used(&candidate.entry.id, opens, seconds_ago)),
             ..candidate
         }
+    }
+
+    /// The same candidate, carrying `disposition` instead of the
+    /// [`Disposition::Active`] every other helper here builds.
+    fn disposed(mut candidate: SearchCandidate, disposition: Disposition) -> SearchCandidate {
+        candidate.entry.disposition = disposition;
+        candidate
     }
 
     /// The same candidate, having been seen in `situation`.
@@ -652,6 +750,61 @@ mod tests {
         );
 
         assert_eq!(ids(&page), vec!["near", "far"]);
+    }
+
+    /// Acceptance (#893): with every other term equal, a `trivial` entry
+    /// ranks below an `active` one of comparable relevance.
+    ///
+    /// Both candidates sit at the same distance, so nothing but the
+    /// disposition term can separate them - the same "equal but for the one
+    /// thing under test" shape `a_search_ranks_an_entry_seen_in_the_present_situation_above_an_equally_similar_one_that_was_not`
+    /// uses for the situation term.
+    #[test]
+    fn a_trivial_entry_ranks_below_an_active_one_of_comparable_relevance() {
+        // Arrived in the order the penalty must overturn: `trivial` first,
+        // `active` second. A stable sort leaves equal scores in arrival
+        // order, so a page that merely preserved this order - the penalty
+        // contributing nothing - would put `trivial` first too. Only a
+        // penalty that actually fires can put `active` ahead of the
+        // candidate that arrived before it.
+        let page = rank_page(
+            vec![
+                disposed(measured("trivial", 0.60), Disposition::Trivial),
+                measured("active", 0.60),
+            ],
+            a_store(),
+            NO_CUE,
+            now(),
+            10,
+        );
+
+        assert_eq!(
+            ids(&page),
+            vec!["active", "trivial"],
+            "a trivial entry of comparable relevance must rank below an active one, even when \
+             it arrived first"
+        );
+    }
+
+    /// The negative half of the test above: two `active` candidates at the
+    /// same distance are unaffected by the disposition term at all, so the
+    /// penalty above is not merely a tiebreak that happens to favour whoever
+    /// arrived first.
+    #[test]
+    fn two_active_entries_of_equal_relevance_are_unaffected_by_the_disposition_term() {
+        let page = rank_page(
+            vec![measured("first", 0.60), measured("second", 0.60)],
+            a_store(),
+            NO_CUE,
+            now(),
+            10,
+        );
+
+        // A stable sort leaves equal scores in arrival order - the same
+        // property `a_page_with_no_use_records_is_ranked_on_the_semantic_signal_alone`
+        // rests on. This test is about the disposition term contributing
+        // nothing here, not about which one happens to sort first.
+        assert_eq!(ids(&page), vec!["first", "second"]);
     }
 
     /// Acceptance (#1239): a row the query's own words name leads a row that is
@@ -1011,6 +1164,7 @@ mod tests {
             ("s.furthest", "the lexical term's own scale"),
             ("kb.source", "the salience term's Deliberate signal"),
             ("kb.summary", "the salience reading"),
+            ("kb.disposition", "the disposition term"),
         ] {
             assert!(
                 projection.contains(column),
@@ -1081,7 +1235,13 @@ mod tests {
             .next()
             .expect("the scan has a vector arm");
 
-        for bound in ["user_id = $6", "deleted_at IS NULL", "$2", "$7"] {
+        for bound in [
+            "user_id = $6",
+            "deleted_at IS NULL",
+            "$2",
+            "$7",
+            "disposition <> 'obsolete' OR true",
+        ] {
             assert!(
                 lexical.contains(bound),
                 "the full-text arm is not bounded by {bound}: \n{HYBRID_SEARCH_SQL}"
@@ -1091,5 +1251,38 @@ mod tests {
                 "the vector arm is not bounded by {bound}: \n{HYBRID_SEARCH_SQL}"
             );
         }
+    }
+
+    // --- Disposition admission and resolution (#893) ------------------------
+
+    /// The `obsolete` exclusion is stated once per gate a row can reach the
+    /// caller through: the vector arm, the full-text arm, the best-match
+    /// scale the full-text arm's share is read against, and the final join -
+    /// so an obsolete row cannot be admitted in the first place, and a chain
+    /// cannot resolve past it either.
+    #[test]
+    fn the_obsolete_exclusion_guards_every_gate() {
+        let occurrences = HYBRID_SEARCH_SQL
+            .matches("disposition <> 'obsolete' OR true")
+            .count();
+        assert_eq!(
+            occurrences, 4,
+            "the obsolete exclusion must guard the vector arm, the full-text arm, its \
+             best-match scale, and the final join - found {occurrences} of the 4: \
+             \n{HYBRID_SEARCH_SQL}"
+        );
+    }
+
+    /// The recursive resolution is bounded, which is what keeps a cycle from
+    /// hanging the query - see `a_superseded_chain_resolves_to_the_terminal_successor_and_a_cycle_cannot_hang_it`
+    /// in `crates/storage/tests/knowledge_hybrid_and_pagination.rs` for the
+    /// behaviour this bound protects.
+    #[test]
+    fn the_resolution_chain_is_depth_bounded() {
+        assert!(
+            HYBRID_SEARCH_SQL.contains("chain.depth < 8"),
+            "the recursive resolution has no depth bound, so a cycle in \
+             superseded_by would hang the query: \n{HYBRID_SEARCH_SQL}"
+        );
     }
 }

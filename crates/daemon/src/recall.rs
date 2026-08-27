@@ -68,6 +68,7 @@ use std::sync::Arc;
 
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::ScratchpadNote;
+use desktop_assistant_core::domain::knowledge::{Disposition, KnowledgeEntry};
 use desktop_assistant_core::domain::knowledge_use::KnowledgeUseRecord;
 use desktop_assistant_core::domain::situation::{SituationCue, SituationRecord};
 use desktop_assistant_core::ports::embedding::{EMBED_TIMEOUT, EmbedFn};
@@ -187,6 +188,27 @@ type KnowledgeArm = (
 /// own.
 type NoteArm = (Vec<RecallNote>, Option<RecallDispersion>);
 
+/// Whether the knowledge arm may offer this entry at all (#893).
+///
+/// **`active`, plus `refuted` rendered with the marker; nothing else.** This
+/// is a narrower bar than the knowledge-base search tool's: the tool
+/// resolves `superseded`/`redundant` to a successor and deranks `trivial`
+/// rather than hiding it, because a person asking the tool a direct question
+/// benefits from that nuance. The `[Recall]` block is different - it is
+/// candidate memory offered unasked, ahead of the model's first move, so a
+/// row this permissive would put a merged-away duplicate or a
+/// not-worth-surfacing aside in front of every turn. Only the two values the
+/// design's vocabulary marks "admitted" for `[Recall]` clear this: `active`
+/// is the ordinary case, and `refuted` must stay findable so the assistant
+/// can report a correction instead of silently forgetting it -
+/// [`KnowledgeEntry::display_line`] is what keeps a `refuted` row from ever
+/// reading as a current fact once it is offered.
+fn recall_admits(disposition: Disposition) -> bool {
+    // STUB (red commit): the real bar lands in the implementation commit.
+    let _ = disposition;
+    true
+}
+
 /// Hold one lookup to [`RECALL_CALL_CEILING`].
 ///
 /// Separate from [`lookup`] so the ceiling can be proven without a database:
@@ -229,6 +251,10 @@ async fn lookup(
                         .search_text_any_term(&request.prompt, request.entry_limit)
                         .await?
                         .into_iter()
+                        // `active` and `refuted` only (#893) - see
+                        // `recall_admits`. The degraded arm still owes the
+                        // same admission bar the measured arm below does.
+                        .filter(|entry: &KnowledgeEntry| recall_admits(entry.disposition))
                         // No use records are read here, and that is deliberate.
                         // A lexical candidate carries no distance, so it has no
                         // semantic term, so the core does not rank it by
@@ -297,6 +323,15 @@ async fn lookup(
             let found = kb_store
                 .nearest_by_embedding(vector, embedding_model, request.entry_limit)
                 .await?;
+            let dispersion = found.dispersion;
+            // `active` and `refuted` only (#893) - see `recall_admits`.
+            // Filtered before the use log is read, so the batched read below
+            // never spends a round trip on an id the block will not offer.
+            let entries: Vec<(KnowledgeEntry, f64)> = found
+                .entries
+                .into_iter()
+                .filter(|(entry, _)| recall_admits(entry.disposition))
+                .collect();
             // One batched read after the scan, of at most one scan's worth of
             // ids, by primary key on both tables.
             //
@@ -311,7 +346,7 @@ async fn lookup(
             // `use_records`. The price is one round trip per turn, paid on every
             // turn including the many where the bar admits nothing and every
             // record read is discarded.
-            let ids: Vec<String> = found.entries.iter().map(|(e, _)| e.id.clone()).collect();
+            let ids: Vec<String> = entries.iter().map(|(e, _)| e.id.clone()).collect();
             let (mut records, mut situations, cue) = if ids.is_empty() {
                 (
                     std::collections::HashMap::new(),
@@ -342,7 +377,7 @@ async fn lookup(
             // `how_the_distances_are_read` exists. Two counts, and nothing of
             // what any entry holds: this runs on every turn.
             tracing::debug!(
-                candidates = found.entries.len(),
+                candidates = entries.len(),
                 with_use_record = records.len(),
                 with_situation_record = situations.len(),
                 situation_cue = cue
@@ -352,8 +387,7 @@ async fn lookup(
                  say about"
             );
             Ok((
-                found
-                    .entries
+                entries
                     .into_iter()
                     .map(|(entry, distance)| {
                         let record = records.remove(&entry.id);
@@ -363,7 +397,7 @@ async fn lookup(
                             .with_situation(seen_in)
                     })
                     .collect(),
-                found.dispersion,
+                dispersion,
                 cue,
             ))
         },
@@ -753,6 +787,26 @@ mod tests {
             );
         }
     }
+
+    /// Acceptance (#893): the `[Recall]` block's admission bar is `active`,
+    /// plus `refuted`, and nothing else - stated exhaustively over every
+    /// disposition, so the four refusals are checked as hard as the two
+    /// permits and a new variant added later has to answer this.
+    #[test]
+    fn the_recall_block_admits_only_active_and_marked_refuted_entries() {
+        use desktop_assistant_core::domain::knowledge::Disposition;
+
+        for disposition in Disposition::ALL {
+            let expected = matches!(disposition, Disposition::Active | Disposition::Refuted);
+            assert_eq!(
+                recall_admits(disposition),
+                expected,
+                "{disposition:?} must {} the recall block's admission bar",
+                if expected { "clear" } else { "not clear" }
+            );
+        }
+    }
+
     use super::*;
     use desktop_assistant_storage::{
         RECALL_SCAN_STATEMENT_TIMEOUT, USE_LOG_READ_STATEMENT_TIMEOUT,

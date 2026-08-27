@@ -195,13 +195,18 @@ impl KnowledgeBaseStore for PgKnowledgeBaseStore {
             self.search_text_scoped(query, &tags, &exclude_tags, limit)
                 .await?
         } else {
-            self.search_hybrid(
+            // `false`: the tool path admits every disposition but `obsolete`,
+            // which is the default every caller gets - see
+            // `Self::search_hybrid_including_dispositioned` for the request-it
+            // path.
+            self.search_hybrid_scoped(
                 query,
                 query_embedding,
                 embedding_model,
                 &tags,
                 &exclude_tags,
                 limit,
+                false,
             )
             .await?
         };
@@ -435,7 +440,22 @@ impl PgKnowledgeBaseStore {
     /// is one the model can run several times inside a turn.
     ///
     /// Both tag filters must already be normalized (`normalize_tag_filter`).
-    async fn search_hybrid(
+    /// The hybrid search both `search` (the trait method) and
+    /// [`Self::search_hybrid_including_dispositioned`] run, differing only in
+    /// `include_dispositioned` - whether an `obsolete` row may be admitted.
+    ///
+    /// Not on the trait itself: [`KnowledgeBaseStore::search`]'s signature is
+    /// shared by every store this trait has, and widening it to carry a
+    /// disposition-inclusion flag is a wider change than this unit makes -
+    /// see the type's own module docs for what already reads `obsolete` on
+    /// request today.
+    ///
+    /// Every parameter is an independent scope dimension the two callers
+    /// already had to supply separately (this method only adds one, over the
+    /// shape `search_hybrid` had before it), so a bundling struct here would
+    /// wrap them without unifying anything.
+    #[allow(clippy::too_many_arguments)]
+    async fn search_hybrid_scoped(
         &self,
         query: &str,
         query_embedding: Vec<f32>,
@@ -443,6 +463,7 @@ impl PgKnowledgeBaseStore {
         tags: &Option<Vec<String>>,
         exclude_tags: &Option<Vec<String>>,
         limit: usize,
+        include_dispositioned: bool,
     ) -> Result<Vec<KnowledgeEntry>, CoreError> {
         let user_id = current_user_id();
         let embedding_vec = Vector::from(query_embedding);
@@ -463,6 +484,7 @@ impl PgKnowledgeBaseStore {
             .bind(user_id.as_str())
             .bind(exclude_tags)
             .bind(embedding_model)
+            .bind(include_dispositioned)
             .fetch_all(&mut *scan)
             .await
             .map_err(|e| CoreError::Storage(e.to_string()))?;
@@ -527,6 +549,39 @@ impl PgKnowledgeBaseStore {
             chrono::Utc::now(),
             limit,
         ))
+    }
+
+    /// The same hybrid search [`KnowledgeBaseStore::search`] runs, but also
+    /// admitting `obsolete` rows (#893) - the "included on request" half of
+    /// `an_obsolete_entry_is_excluded_by_default_and_included_on_request`.
+    ///
+    /// Not yet reachable from a tool argument: threading
+    /// `include_dispositioned` through [`KnowledgeBaseStore::search`] widens a
+    /// trait every store implements and every caller of `search` depends on,
+    /// which is a wider change than retrieval honouring the disposition
+    /// requires on its own. This method is the seam a later unit wires a
+    /// caller onto.
+    pub async fn search_hybrid_including_dispositioned(
+        &self,
+        query: &str,
+        query_embedding: Vec<f32>,
+        embedding_model: &str,
+        tags: Option<Vec<String>>,
+        exclude_tags: Option<Vec<String>>,
+        limit: usize,
+    ) -> Result<Vec<KnowledgeEntry>, CoreError> {
+        let tags = normalize_tag_filter(tags);
+        let exclude_tags = normalize_tag_filter(exclude_tags);
+        self.search_hybrid_scoped(
+            query,
+            query_embedding,
+            embedding_model,
+            &tags,
+            &exclude_tags,
+            limit,
+            true,
+        )
+        .await
     }
 
     /// What the use log knows about `ids`, keyed by id, and an empty map where
@@ -1159,6 +1214,13 @@ struct KbSearchRow {
     /// this work exists to remove.
     source: Option<String>,
     summary: Option<String>,
+    /// The row's own stored disposition (#893) - what consolidation, or a
+    /// person, judged this entry to be. Read for real now: the scan admits
+    /// every disposition but `obsolete` by default and resolves `superseded`
+    /// / `redundant` to a successor before this row is built, so what
+    /// reaches here is whatever disposition the admitted-and-resolved row
+    /// actually carries.
+    disposition: String,
     /// `None` for a row the full-text arm admitted and the vector arm cannot
     /// compare - no stored vector, or one from another model.
     distance: Option<f64>,
@@ -1213,12 +1275,17 @@ impl KbSearchRow {
             created_at: self.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
             updated_at: self.updated_at.format("%Y-%m-%d %H:%M:%S").to_string(),
             source: self.source,
-            // `HYBRID_SEARCH_SQL` does not select disposition yet: every row it
-            // can reach is already filtered to `deleted_at IS NULL`, and
-            // nothing before this unit ever sets a live row's disposition away
-            // from the default. Reading it for real is retrieval's job, not
-            // this row mapping's.
-            disposition: Disposition::Active,
+            // `HYBRID_SEARCH_SQL` now selects the admitted-and-resolved row's
+            // own disposition (#893): a `superseded`/`redundant` match has
+            // already been re-pointed at its successor by the time this row
+            // is built, so what is read here is what the caller should
+            // actually be shown, not what the query first matched.
+            // STUB (red commit): reading the real value lands in the
+            // implementation commit.
+            disposition: {
+                let _ = &self.disposition;
+                Disposition::Active
+            },
             // Search does select the summary: it is what a caller reads to
             // decide whether a hit is worth pulling the body for.
             summary: self.summary,
