@@ -618,7 +618,11 @@ pub(crate) fn activation(
 /// A stored row's `weights` travel with this string (#1327) so a reader
 /// comparing an old turn's terms against today's ranking knows whether the two
 /// are the same computation or a different one wearing the same field names.
-pub const ACTIVATION_SCORER_VERSION: &str = "1327-v1";
+///
+/// Bumped from `1327-v1` when the disposition term joined `ActivationTerms`
+/// (#893): a row stored under the old string was scored on five terms, not
+/// six, and the two must not compare as the same computation.
+pub const ACTIVATION_SCORER_VERSION: &str = "1327-v2";
 
 /// One candidate's activation score, kept broken out by term (#1327).
 ///
@@ -2294,6 +2298,55 @@ mod tests {
             trivial < active,
             "a trivial entry must score below a comparable active one: trivial={trivial}, \
              active={active}"
+        );
+    }
+
+    /// Acceptance (#893, #1327): the breakdown [`rank_by_activation_traced`]
+    /// hands a reader must show *why* a trivial entry sank, not only *that*
+    /// it sank. A penalty that only ever reached `total` would move the score
+    /// while leaving [`ActivationTerms::disposition`] silent about it - the
+    /// exact failure this test exists to catch.
+    ///
+    /// [`rank_by_activation_traced`]: crate::ports::recall::rank_by_activation_traced
+    #[test]
+    fn a_trivial_entry_records_its_penalty_in_the_disposition_term_not_only_in_the_total() {
+        let now = now();
+        let weights = ActivationWeights::default();
+
+        let active = activation_terms(
+            Some(7.0),
+            None,
+            NO_SITUATION,
+            NO_SALIENCE,
+            LexicalMatch::NONE,
+            Disposition::Active,
+            now,
+            &weights,
+        );
+        let trivial = activation_terms(
+            Some(7.0),
+            None,
+            NO_SITUATION,
+            NO_SALIENCE,
+            LexicalMatch::NONE,
+            Disposition::Trivial,
+            now,
+            &weights,
+        );
+
+        assert_eq!(
+            active.disposition, 0.0,
+            "an active entry's disposition term must read zero"
+        );
+        assert_eq!(
+            trivial.disposition, -weights.trivial_penalty,
+            "the penalty must be visible in the disposition term itself, not only folded into \
+             total"
+        );
+        assert_eq!(
+            trivial.total,
+            active.total - weights.trivial_penalty,
+            "total must fall by exactly the term that now accounts for it"
         );
     }
 
