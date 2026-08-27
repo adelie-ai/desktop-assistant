@@ -102,10 +102,12 @@ impl Disposition {
     /// `active` and `trivial`, are both ordinary content that needs no
     /// warning label.
     pub const fn marker(self) -> &'static str {
-        // STUB (red commit): the real mapping lands in the implementation
-        // commit. Until then every disposition answers no marker at all.
-        let _ = self;
-        ""
+        match self {
+            Self::Refuted => "recorded, later refuted: ",
+            Self::Active | Self::Superseded | Self::Redundant | Self::Obsolete | Self::Trivial => {
+                ""
+            }
+        }
     }
 }
 

@@ -1280,12 +1280,7 @@ impl KbSearchRow {
             // already been re-pointed at its successor by the time this row
             // is built, so what is read here is what the caller should
             // actually be shown, not what the query first matched.
-            // STUB (red commit): reading the real value lands in the
-            // implementation commit.
-            disposition: {
-                let _ = &self.disposition;
-                Disposition::Active
-            },
+            disposition: parse_disposition(&self.disposition),
             // Search does select the summary: it is what a caller reads to
             // decide whether a hit is worth pulling the body for.
             summary: self.summary,

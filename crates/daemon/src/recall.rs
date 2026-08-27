@@ -204,9 +204,7 @@ type NoteArm = (Vec<RecallNote>, Option<RecallDispersion>);
 /// [`KnowledgeEntry::display_line`] is what keeps a `refuted` row from ever
 /// reading as a current fact once it is offered.
 fn recall_admits(disposition: Disposition) -> bool {
-    // STUB (red commit): the real bar lands in the implementation commit.
-    let _ = disposition;
-    true
+    matches!(disposition, Disposition::Active | Disposition::Refuted)
 }
 
 /// Hold one lookup to [`RECALL_CALL_CEILING`].

@@ -355,7 +355,7 @@ pub const HYBRID_SEARCH_SQL: &str = "\
          FROM knowledge_base, unnest(embedding) AS chunk
          WHERE user_id = $6
            AND deleted_at IS NULL
-           AND (disposition <> 'obsolete' OR true)
+           AND (disposition <> 'obsolete' OR $9)
            AND ($2::text[] IS NULL OR tags && $2)
            AND ($7::text[] IS NULL OR NOT (tags && $7))
            AND embedding IS NOT NULL
@@ -388,7 +388,7 @@ pub const HYBRID_SEARCH_SQL: &str = "\
          CROSS JOIN plainto_tsquery('english', $4) AS query
          WHERE kb.user_id = $6
            AND kb.deleted_at IS NULL
-           AND (kb.disposition <> 'obsolete' OR true)
+           AND (kb.disposition <> 'obsolete' OR $9)
            AND ($2::text[] IS NULL OR kb.tags && $2)
            AND ($7::text[] IS NULL OR NOT (kb.tags && $7))
            AND kb.tsv @@ query
@@ -414,7 +414,7 @@ pub const HYBRID_SEARCH_SQL: &str = "\
          LEFT JOIN d ON d.id = kb.id
          WHERE kb.user_id = $6
            AND kb.deleted_at IS NULL
-           AND (kb.disposition <> 'obsolete' OR true)
+           AND (kb.disposition <> 'obsolete' OR $9)
            AND ($2::text[] IS NULL OR kb.tags && $2)
            AND ($7::text[] IS NULL OR NOT (kb.tags && $7))
            AND kb.tsv @@ query
@@ -448,8 +448,7 @@ pub const HYBRID_SEARCH_SQL: &str = "\
            AND chain.depth < 8
      ),
      terminal AS (
-         -- STUB (red commit): resolution lands in the implementation commit.
-         SELECT DISTINCT ON (start_id) start_id, start_id AS terminal_id
+         SELECT DISTINCT ON (start_id) start_id, current_id AS terminal_id
          FROM chain
          ORDER BY start_id, depth DESC
      ),
@@ -475,7 +474,7 @@ pub const HYBRID_SEARCH_SQL: &str = "\
      FROM final_admitted a
      JOIN knowledge_base kb
        ON kb.id = a.id AND kb.user_id = $6 AND kb.deleted_at IS NULL
-       AND (kb.disposition <> 'obsolete' OR true)
+       AND (kb.disposition <> 'obsolete' OR $9)
      CROSS JOIN s
      ORDER BY a.arm, a.seat";
 
@@ -1240,7 +1239,7 @@ mod tests {
             "deleted_at IS NULL",
             "$2",
             "$7",
-            "disposition <> 'obsolete' OR true",
+            "disposition <> 'obsolete' OR $9",
         ] {
             assert!(
                 lexical.contains(bound),
@@ -1263,7 +1262,7 @@ mod tests {
     #[test]
     fn the_obsolete_exclusion_guards_every_gate() {
         let occurrences = HYBRID_SEARCH_SQL
-            .matches("disposition <> 'obsolete' OR true")
+            .matches("disposition <> 'obsolete' OR $9")
             .count();
         assert_eq!(
             occurrences, 4,

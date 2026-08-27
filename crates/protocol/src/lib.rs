@@ -100,9 +100,11 @@ pub const REFUTED_DISPOSITION: &str = "refuted";
 /// wire renders a refuted entry the same way. See [`REFUTED_DISPOSITION`]
 /// for why this takes the stored spelling rather than a typed enum.
 pub fn disposition_marker(disposition: &str) -> &'static str {
-    // STUB (red commit): the real mapping lands in the implementation commit.
-    let _ = disposition;
-    ""
+    if disposition == REFUTED_DISPOSITION {
+        "recorded, later refuted: "
+    } else {
+        ""
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -2137,9 +2137,7 @@ impl BuiltinToolService {
                 // helper `KnowledgeEntry::display_line` uses for the
                 // `[Recall]` block, so a caller reading only `content` still
                 // meets it.
-                // STUB (red commit): wiring lands in the implementation commit.
-                let marker = "";
-                let _ = &entry.disposition;
+                let marker = entry.disposition.marker();
                 serde_json::json!({
                     "id": entry.id,
                     "content": format!("{marker}{}", entry.content),
@@ -2639,9 +2637,7 @@ impl BuiltinToolService {
                 // is the only thing standing between that and an unmarked
                 // claim, so it goes through the same shared helper the search
                 // tool and the by-id fetch do.
-                // STUB (red commit): wiring lands in the implementation commit.
-                let marker = "";
-                let _ = &entry.disposition;
+                let marker = entry.disposition.marker();
                 serde_json::json!({
                     "id": entry.id,
                     "content": format!("{marker}{}", entry.content),
@@ -3713,9 +3709,12 @@ fn required_string(args: &serde_json::Value, key: &str) -> Result<String, CoreEr
 /// it holds the whole entry, which is the claim every other read of this store
 /// makes too.
 fn kb_get_row(entry: &KnowledgeEntry, content: &str, content_truncated: bool) -> serde_json::Value {
-    // STUB (red commit): wiring lands in the implementation commit.
-    let _ = &entry.disposition;
-    let content = content.to_string();
+    // A fetch by id reaches whatever disposition the row carries (#893) - this
+    // read has never filtered on it - so a refuted entry named by a search
+    // result or a `[Recall]` line still comes back here, and must carry the
+    // same marker those surfaces do. `Disposition::marker` is the one shared
+    // helper every surface routes through.
+    let content = format!("{}{content}", entry.disposition.marker());
     let mut row = serde_json::json!({
         "id": entry.id,
         "content": content,

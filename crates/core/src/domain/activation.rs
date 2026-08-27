@@ -452,10 +452,14 @@ impl ActivationWeights {
     ///
     /// [`Disposition::marker`]: crate::domain::knowledge::Disposition::marker
     pub fn disposition(&self, disposition: Disposition) -> f64 {
-        // STUB (red commit): the real penalty lands in the implementation
-        // commit. Until then no disposition costs anything.
-        let _ = disposition;
-        0.0
+        match disposition {
+            Disposition::Trivial => -self.trivial_penalty,
+            Disposition::Active
+            | Disposition::Refuted
+            | Disposition::Superseded
+            | Disposition::Redundant
+            | Disposition::Obsolete => 0.0,
+        }
     }
 }
 

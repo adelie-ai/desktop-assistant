@@ -1033,8 +1033,7 @@ fn pinned_chunk(note: &RawNote<'_>, entry: Option<(&str, crate::domain::Disposit
                 // reading as a current fact here - reserved out of the cap
                 // first, the same way `KnowledgeEntry::display_line` reserves
                 // it, so a marked line still fits the budget.
-                // STUB (red commit): wiring lands in the implementation commit.
-                let marker = { let _ = disposition; "" };
+                let marker = disposition.marker();
                 let budget = crate::ports::scratchpad::PINNED_ENTRY_MAX_CHARS
                     .saturating_sub(marker.chars().count());
                 chunk.push_str(marker);
