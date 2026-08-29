@@ -201,12 +201,21 @@ async fn load_user_ids_with_trash(pool: &PgPool) -> Result<Vec<String>, CoreErro
 /// (design doc section 1: "a negative is instructive"), and worse here
 /// because it destroys the *person's* correction rather than the model's
 /// guess. So a `refuted` tombstone keeps its disposition and its reason;
-/// every other disposition resets. `superseded_by` clears unconditionally -
-/// `refuted` never carries one (the schema's own
-/// `knowledge_base_superseded_by_chk` forbids it), so clearing it costs
-/// nothing on that path and removes a stale successor link on every other.
-/// Pinned by `restoring_a_refuted_entry_keeps_the_refutation` - read that
-/// test before "simplifying" this back to an unconditional reset.
+/// every other disposition resets to `active`.
+///
+/// `superseded_by` clears only for the two dispositions that resolve
+/// through it, `superseded` and `redundant` - restore overrides exactly the
+/// judgement that made the link meaningful, so the link goes with it. Every
+/// other disposition keeps whatever `superseded_by` it carries:
+/// `knowledge_base_superseded_by_chk` is a one-way implication, not a
+/// biconditional (#1345), so the schema does not forbid a successor id on a
+/// disposition other than those two, and migration 056 deliberately
+/// preserves such a link, for example on a `trivial` tombstone that also
+/// names a successor. An inert link costs nothing to keep; a cleared one
+/// cannot be recovered, so restore must not destroy it. Pinned by
+/// `restoring_an_entry_keeps_a_successor_link_that_does_not_resolve_through_it`
+/// and `restoring_a_refuted_entry_keeps_the_refutation` - read both before
+/// "simplifying" this back to an unconditional reset.
 ///
 /// User-scoped by the ambient [`current_user_id`]. Zero rows touched is not
 /// one outcome: an id another user's tombstone holds, an id a live row
@@ -223,7 +232,8 @@ pub async fn restore_entry(pool: &PgPool, id: &str) -> Result<RestoreOutcome, Co
              disposition = CASE WHEN disposition = 'refuted' THEN disposition ELSE 'active' END, \
              disposition_reason = CASE WHEN disposition = 'refuted' THEN disposition_reason \
                                         ELSE NULL END, \
-             superseded_by = NULL, \
+             superseded_by = CASE WHEN disposition IN ('superseded', 'redundant') \
+                                   THEN NULL ELSE superseded_by END, \
              updated_at = NOW() \
          WHERE user_id = $1 AND id = $2 AND deleted_at IS NOT NULL \
          RETURNING id",
