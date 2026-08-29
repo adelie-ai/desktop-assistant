@@ -213,6 +213,44 @@ pub struct ConsolidationStats {
     pub backstop_firings: usize,
 }
 
+impl ConsolidationStats {
+    /// Rows this run changed: the sum of every counter that means at least one
+    /// row was written.
+    pub fn applied_count(&self) -> usize {
+        self.merged_clusters + self.updated + self.dispositioned + self.scope_added
+    }
+
+    /// Proposals this run understood and declined: every guard, every budget,
+    /// and the applier's own backstop. A refusal is a normal outcome, so a
+    /// caller reports this count and never raises it as a failure.
+    ///
+    /// A reader of the counters has to know which of them mean "refused", and
+    /// a reader that lists them by hand goes stale the next time a guard is
+    /// added. There is one list, and it is here.
+    pub fn refusal_count(&self) -> usize {
+        self.explicit_guard_refusals
+            + self.settled_unchanged
+            + self.scope_guard_refusals
+            + self.backstop_firings
+            + self.dispositions_over_cap
+            + self.rewrites_over_cap
+    }
+
+    /// One line naming each refusal counter, for a report a person reads.
+    pub fn describe_refusals(&self) -> String {
+        format!(
+            "{} explicit-entry, {} settled-entry, {} scope-guard, {} backstop, {} over the \
+             disposition share, {} over the rewrite share",
+            self.explicit_guard_refusals,
+            self.settled_unchanged,
+            self.scope_guard_refusals,
+            self.backstop_firings,
+            self.dispositions_over_cap,
+            self.rewrites_over_cap,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

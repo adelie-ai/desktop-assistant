@@ -984,9 +984,11 @@ pub trait KnowledgeService: Send + Sync {
 /// Each method is long-running and runs as a tracked background task; the
 /// supplied `cancellation` token (the task's `ctx.token`) is observed at batch
 /// boundaries and before each external (LLM/embedding) call, so the existing
-/// task-cancel command stops a run promptly. Returns a count of work done
-/// (facts written / entries changed / rows re-embedded). Implementations reject
-/// a concurrent run of the same op with `CoreError`.
+/// task-cancel command stops a run promptly. Each returns what its pass did:
+/// a count of work done (facts written / rows re-embedded), and for
+/// consolidation a [`ConsolidationOutcome`], because a change count alone
+/// cannot state what that pass refused. Implementations reject a concurrent
+/// run of the same op with `CoreError`.
 ///
 /// Object-safe (`async_trait`) so the API handler can hold it as an optional
 /// `Arc<dyn KnowledgeMaintenanceService>` rather than threading another generic.
@@ -996,7 +998,10 @@ pub trait KnowledgeMaintenanceService: Send + Sync {
     async fn run_extraction(&self, cancellation: CancellationToken) -> Result<usize, CoreError>;
 
     /// Run one holistic consolidation pass over the active knowledge base.
-    async fn run_consolidation(&self, cancellation: CancellationToken) -> Result<usize, CoreError>;
+    async fn run_consolidation(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<ConsolidationOutcome, CoreError>;
 
     /// Force-recompute embeddings for EVERY active knowledge entry, regardless
     /// of model stamp or freshness (for out-of-band cases). Returns the number
@@ -1005,6 +1010,26 @@ pub trait KnowledgeMaintenanceService: Send + Sync {
         &self,
         cancellation: CancellationToken,
     ) -> Result<usize, CoreError>;
+}
+
+/// What one consolidation pass did, as the maintenance task reports it.
+///
+/// A change count on its own cannot tell "the model proposed nothing" from
+/// "every proposal was refused": both apply zero changes, and a task log that
+/// states only the count reads the same either way. The refusals travel beside
+/// the count so the two runs are distinguishable.
+///
+/// A refusal is a normal outcome - a fixed rule declined a proposal that was
+/// understood - so it is reported and never turns the pass into a failure.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConsolidationOutcome {
+    /// Knowledge rows the pass changed.
+    pub changes: usize,
+    /// Proposals a guard, a budget, or a backstop declined.
+    pub refusals: usize,
+    /// One line naming each refusal counter, for the task log. Present when
+    /// `refusals` is above zero.
+    pub refusal_detail: Option<String>,
 }
 
 #[cfg(test)]

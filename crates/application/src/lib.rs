@@ -2404,21 +2404,30 @@ where
                     name.to_string(),
                     move |ctx| async move {
                         let token = ctx.token.clone();
-                        let result = match op {
-                            api::MaintenanceOp::Extraction => service.run_extraction(token).await,
-                            api::MaintenanceOp::Consolidation => {
-                                service.run_consolidation(token).await
+                        // Each pass reports a change count; consolidation also
+                        // reports what it refused, because a run that proposed
+                        // nothing and a run whose every proposal was refused
+                        // both changed nothing and must not read the same in
+                        // the task log.
+                        let result: Result<(usize, Option<String>), _> = match op {
+                            api::MaintenanceOp::Extraction => {
+                                service.run_extraction(token).await.map(|n| (n, None))
                             }
-                            api::MaintenanceOp::RecalculateEmbeddings => {
-                                service.recalculate_embeddings(token).await
-                            }
+                            api::MaintenanceOp::Consolidation => service
+                                .run_consolidation(token)
+                                .await
+                                .map(|outcome| (outcome.changes, outcome.refusal_detail)),
+                            api::MaintenanceOp::RecalculateEmbeddings => service
+                                .recalculate_embeddings(token)
+                                .await
+                                .map(|n| (n, None)),
                         };
                         match result {
-                            Ok(n) => {
+                            Ok((n, refusals)) => {
                                 ctx.logs.append(
                                     api::LogLevel::Info,
                                     api::LogCategory::Lifecycle,
-                                    format!("{name}: {n} change(s)"),
+                                    maintenance_log_line(name, n, refusals.as_deref()),
                                     None,
                                 );
                                 Ok(())
@@ -4836,6 +4845,19 @@ where
                 .await;
             Err(e)
         }
+    }
+}
+
+/// The line a finished maintenance pass writes to its task log.
+///
+/// A pass that refused everything and a pass that was asked for nothing both
+/// changed zero rows, so the count alone reads the same for both. When there
+/// is something refused, it is named beside the count, which is what tells a
+/// person which run they are looking at.
+fn maintenance_log_line(name: &str, changes: usize, refusals: Option<&str>) -> String {
+    match refusals {
+        Some(refusals) => format!("{name}: {changes} change(s); refused {refusals}"),
+        None => format!("{name}: {changes} change(s)"),
     }
 }
 
@@ -10905,5 +10927,31 @@ mod tests {
             )
             .await;
         assert!(matches!(refused, Err(ApiError::Unsupported)));
+    }
+
+    /// Acceptance (#712 item 1): the task log a person reads tells a pass that
+    /// was asked for nothing from a pass whose every proposal was refused.
+    /// Both changed nothing, so the two lines must still differ.
+    #[test]
+    fn the_maintenance_task_log_distinguishes_a_quiet_pass_from_a_refused_one() {
+        let quiet = maintenance_log_line("Knowledge consolidation", 0, None);
+        let refused = maintenance_log_line(
+            "Knowledge consolidation",
+            0,
+            Some("3 explicit-entry, 0 settled-entry"),
+        );
+
+        assert_ne!(
+            quiet, refused,
+            "two passes that both changed nothing must not read the same"
+        );
+        assert!(
+            refused.contains("3 explicit-entry"),
+            "the refusal counts must reach the line a person reads: {refused}"
+        );
+        assert!(
+            quiet.contains("0 change(s)") && !quiet.contains("refused"),
+            "a pass with nothing to report adds nothing to its count: {quiet}"
+        );
     }
 }

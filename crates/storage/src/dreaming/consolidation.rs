@@ -70,7 +70,7 @@
 //! failure: a plan that produced no work must not look like a model that kept
 //! everything.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use desktop_assistant_core::CoreError;
@@ -285,8 +285,7 @@ async fn consolidate_user(
     let mut merge_ops: Vec<MergeOp> = Vec::new();
     let mut update_ops: Vec<(String, String)> = Vec::new();
     let mut scope_ops: Vec<(String, KbScope)> = Vec::new();
-    let mut disposition_ops: Vec<(String, Disposition, Option<String>, Option<String>)> =
-        Vec::new();
+    let mut disposition_ops: Vec<DispositionOp> = Vec::new();
     // Refusals, reported so an operator can see what the model keeps asking
     // for and the guards keep declining.
     let mut explicit_guard_refusals = 0usize;
@@ -539,21 +538,16 @@ async fn consolidate_user(
     // yields a cap of zero, which is how a deployment keeps consolidation's
     // merges and declines its dispositions.
     let subsumed = buffer.clustered_ids();
-    let mut disposition_ops: Vec<(String, Disposition, Option<String>, Option<String>)> =
-        disposition_ops
-            .into_iter()
-            .filter(|(id, ..)| !subsumed.contains(id))
-            .collect();
     let disposition_cap = policy.prune_cap(total_entries);
-    let dispositions_over_cap = disposition_ops.len().saturating_sub(disposition_cap);
+    let (disposition_ops, dispositions_over_cap) =
+        take_within_disposition_cap(disposition_ops, &subsumed, disposition_cap);
     if dispositions_over_cap > 0 {
         tracing::warn!(
-            "dreaming: holistic consolidation proposed {} disposition(s) for {total_entries} \
-             entries; capping at {disposition_cap} ({dispositions_over_cap} deferred to a later \
-             run)",
-            disposition_ops.len()
+            "dreaming: holistic consolidation proposed {} standalone disposition(s) for \
+             {total_entries} entries; capping at {disposition_cap} ({dispositions_over_cap} \
+             deferred to a later run)",
+            disposition_ops.len() + dispositions_over_cap
         );
-        disposition_ops.truncate(disposition_cap);
     }
     for (id, disposition, reason, superseded_by) in disposition_ops.iter().cloned() {
         tracing::debug!(
@@ -587,6 +581,40 @@ async fn consolidate_user(
     stats.rewrites_over_cap = rewrites_over_cap;
     stats.dropped_operations = dropped_operations;
     Ok(stats)
+}
+
+/// One disposition the model proposed: the entry, what it is judged to be, the
+/// stated reason, and the successor it names.
+type DispositionOp = (String, Disposition, Option<String>, Option<String>);
+
+/// Drop the dispositions a merge already absorbs, then bound what is left by
+/// the run's share of the active set. Returns what to apply and how many were
+/// deferred.
+///
+/// The order is the whole point. A merge dispositions every member
+/// `redundant` by itself, so a member that also carries a standalone
+/// disposition needs no slot of its own: charging it one spends the budget on
+/// work that never runs, and truncates a legitimate disposition to pay for it.
+/// The subsumed ids come out first, and the cap is measured against what
+/// remains.
+///
+/// Two properties hold for every input, and the unit tests assert them rather
+/// than one worked example. What the plan spends plus what it defers equals
+/// what it proposed and was not subsumed, so no proposal is lost without being
+/// counted; and what it spends never exceeds the cap. A deferred proposal is
+/// not discarded - the next run reads the same entry again.
+fn take_within_disposition_cap(
+    proposed: Vec<DispositionOp>,
+    subsumed: &BTreeSet<String>,
+    cap: usize,
+) -> (Vec<DispositionOp>, usize) {
+    let mut kept: Vec<DispositionOp> = proposed
+        .into_iter()
+        .filter(|(id, ..)| !subsumed.contains(id))
+        .collect();
+    let deferred = kept.len().saturating_sub(cap);
+    kept.truncate(cap);
+    (kept, deferred)
 }
 
 /// One merge the model proposed, before the rewrite cap decides whether it is
@@ -2743,5 +2771,86 @@ mod tests {
             1,
             "two entries of half the character budget fit in one slice"
         );
+    }
+
+    /// Build a proposed disposition for `id`. What it is judged to be does not
+    /// matter to the budget, which counts proposals.
+    fn proposed_disposition(id: &str) -> DispositionOp {
+        (id.to_string(), Disposition::Trivial, None, None)
+    }
+
+    /// Acceptance (#712 item 3): the disposition budget is charged after
+    /// clustering, and the charge is conserved. For every plan shape, what the
+    /// plan spends plus what it defers equals what it proposed and no merge
+    /// absorbed, and what it spends never exceeds the cap.
+    ///
+    /// Asserted over a spread of shapes rather than one worked example,
+    /// because a single shape agrees with a budget charged at the wrong
+    /// moment as readily as with one charged at the right moment.
+    #[test]
+    fn the_disposition_budget_conserves_what_a_plan_spends_and_defers() {
+        for proposed_count in 0..6usize {
+            for subsumed_count in 0..=proposed_count {
+                for cap in 0..6usize {
+                    let proposed: Vec<DispositionOp> = (0..proposed_count)
+                        .map(|i| proposed_disposition(&format!("kb-{i}")))
+                        .collect();
+                    // The subsumed ids are the ones a merge cluster already
+                    // absorbed, so they are dispositioned by the merge itself.
+                    let subsumed: BTreeSet<String> =
+                        (0..subsumed_count).map(|i| format!("kb-{i}")).collect();
+                    let standalone = proposed_count - subsumed_count;
+
+                    let (kept, deferred) = take_within_disposition_cap(proposed, &subsumed, cap);
+
+                    assert_eq!(
+                        kept.len() + deferred,
+                        standalone,
+                        "a plan of {proposed_count} proposal(s), {subsumed_count} of them \
+                         subsumed, under a cap of {cap}: what it spends plus what it defers \
+                         must equal the {standalone} proposal(s) no merge absorbed"
+                    );
+                    assert!(
+                        kept.len() <= cap,
+                        "a plan of {proposed_count} proposal(s) under a cap of {cap} spent \
+                         {} slot(s)",
+                        kept.len()
+                    );
+                    assert!(
+                        kept.iter().all(|(id, ..)| !subsumed.contains(id)),
+                        "a proposal a merge already absorbed must not be applied on its own"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Acceptance (#712 item 3): a plan whose dispositions are all subsumed by
+    /// merges spends none of the budget, so the whole cap is still available
+    /// to the rest of the run.
+    #[test]
+    fn dispositions_all_subsumed_by_merges_leave_the_whole_budget_unspent() {
+        let ids = ["kb-a", "kb-b", "kb-c", "kb-d"];
+        for cap in 0..5usize {
+            let proposed: Vec<DispositionOp> =
+                ids.iter().map(|id| proposed_disposition(id)).collect();
+            let subsumed: BTreeSet<String> = ids.iter().map(|id| (*id).to_string()).collect();
+
+            let (kept, deferred) = take_within_disposition_cap(proposed, &subsumed, cap);
+
+            assert!(
+                kept.is_empty(),
+                "every proposal is absorbed by a merge, so none of them is applied on its own"
+            );
+            assert_eq!(
+                deferred, 0,
+                "an absorbed proposal is not deferred either - the merge disposes of it"
+            );
+            assert_eq!(
+                cap - kept.len(),
+                cap,
+                "the whole budget of {cap} is still available"
+            );
+        }
     }
 }
