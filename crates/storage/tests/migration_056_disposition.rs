@@ -459,8 +459,9 @@ async fn a_row_that_would_violate_the_constraint_fails_the_migration_by_name() {
         "the failure should name the constraint that would be violated: {message}"
     );
     assert!(
-        message.contains('1'),
-        "the failure should name the offending row count: {message}"
+        message.contains("1 row(s) would violate knowledge_base_superseded_by_chk"),
+        "the failure should name the offending row count in the diagnostic's own words: \
+         {message}"
     );
 
     fx.cleanup().await;
