@@ -163,6 +163,11 @@ const PERSONAL_DATA_TABLES: &[&str] = &[
     "recall_snapshot_uses",
     "recall_cases",
     "recall_case_embeddings",
+    // 062 - the episodic turn index. One digest per turn, holding the
+    // person's own words and what the assistant answered, and offered across
+    // every conversation they own. Unscoped, one tenant would read another's
+    // turns through this tool.
+    "turn_digests",
 ];
 
 /// The canonical set of personal-data tables (see `PERSONAL_DATA_TABLES`).

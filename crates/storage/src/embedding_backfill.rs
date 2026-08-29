@@ -835,6 +835,162 @@ async fn write_scratchpad_embedding(
     Ok(())
 }
 
+/// Backfill NULL / stale-model embeddings for `turn_digests` rows (#1349),
+/// mirroring [`backfill_scratchpad_embeddings`].
+///
+/// The digest write path embeds a digest as it is written, so this pass exists
+/// for the digests it could not embed (no backend configured, a stalled
+/// backend), the ones the stale sweep cleared after a model change, and every
+/// digest the transcript backfill wrote.
+///
+/// The embedded text is `content` alone, matching `NewTurnDigest::embed_text`.
+/// The opening message id is deliberately not part of it: it is a UUID and
+/// says nothing about what the turn was about. A vector built from a different
+/// string is not comparable with the vectors it would be ranked against, so
+/// the two must stay byte-identical.
+///
+/// A soft-deleted digest is skipped, the same way the knowledge backfill skips
+/// a tombstone: an invisible row is not worth an embedding call.
+///
+/// Returns the number of rows updated.
+pub async fn backfill_turn_digest_embeddings(
+    pool: &PgPool,
+    embed_fn: &BackfillEmbedFn,
+    current_model: &str,
+) -> Result<usize, String> {
+    let mut total = 0usize;
+    let mut consecutive_failures = 0u32;
+
+    loop {
+        // Selecting on the stamp alone, never on `embedding IS NULL`, is what
+        // makes this converge: the failure path below stamps the row without a
+        // vector, which takes it out of this SELECT.
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, content AS text \
+             FROM turn_digests \
+             WHERE deleted_at IS NULL \
+               AND (embedding_model IS NULL OR embedding_model != $1) \
+             LIMIT $2",
+        )
+        .bind(current_model)
+        .bind(BATCH_SIZE)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        if rows.is_empty() {
+            break;
+        }
+
+        let mut all_chunks: Vec<(usize, String)> = Vec::new();
+        for (i, (_, text)) in rows.iter().enumerate() {
+            for chunk in chunk_text(text, CHUNK_MAX_CHARS, CHUNK_OVERLAP) {
+                all_chunks.push((i, chunk));
+            }
+        }
+
+        let texts: Vec<String> = all_chunks.iter().map(|(_, t)| t.clone()).collect();
+        // A short batch is a failed batch, not a partial success. Zipping a
+        // short answer would pair a digest with another digest's vector, and
+        // nothing downstream detects that.
+        let batch = match embed_fn(texts).await {
+            Ok(embeddings) if embeddings.len() == all_chunks.len() => Ok(embeddings),
+            Ok(embeddings) => Err(format!(
+                "embedder returned {} vector(s) for {} chunk(s)",
+                embeddings.len(),
+                all_chunks.len()
+            )),
+            Err(e) => Err(e),
+        };
+
+        match batch {
+            Ok(embeddings) => {
+                consecutive_failures = 0;
+                let mut row_embeddings: Vec<Vec<Vector>> = vec![Vec::new(); rows.len()];
+                for ((row_idx, _), emb) in all_chunks.iter().zip(embeddings) {
+                    row_embeddings[*row_idx].push(Vector::from(emb));
+                }
+                for ((id, _), vecs) in rows.iter().zip(row_embeddings) {
+                    write_turn_digest_embedding(pool, id, Some(vecs), current_model).await?;
+                }
+                total += rows.len();
+            }
+            Err(e) => {
+                tracing::warn!("turn-digest embedding batch failed, retrying individually: {e}");
+                let mut any_succeeded = false;
+                for (id, text) in &rows {
+                    let chunks = chunk_text(text, CHUNK_MAX_CHARS, CHUNK_OVERLAP);
+                    let expected = chunks.len();
+                    match embed_fn(chunks).await {
+                        Ok(embeddings) if embeddings.len() == expected => {
+                            let vecs: Vec<Vector> =
+                                embeddings.into_iter().map(Vector::from).collect();
+                            write_turn_digest_embedding(pool, id, Some(vecs), current_model)
+                                .await?;
+                            total += 1;
+                            any_succeeded = true;
+                        }
+                        // Both remaining arms stamp the model without a vector,
+                        // so a permanently failing digest is retried once per
+                        // model change rather than on every pass.
+                        Ok(embeddings) => {
+                            tracing::warn!(
+                                "skipping turn digest {id}: embedder returned {} vector(s) \
+                                 for {expected} chunk(s)",
+                                embeddings.len()
+                            );
+                            write_turn_digest_embedding(pool, id, None, current_model).await?;
+                        }
+                        Err(e) => {
+                            tracing::warn!("skipping turn digest {id}: {e}");
+                            write_turn_digest_embedding(pool, id, None, current_model).await?;
+                        }
+                    }
+                }
+                if any_succeeded {
+                    consecutive_failures = 0;
+                } else {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= 3 {
+                        tracing::error!(
+                            "turn-digest embedding backfill aborting after \
+                             {consecutive_failures} consecutive failures"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(total)
+}
+
+/// Write one digest's vectors and model stamp.
+///
+/// `vectors: None` records a failed attempt, for the reason
+/// [`write_scratchpad_embedding`] gives.
+async fn write_turn_digest_embedding(
+    pool: &PgPool,
+    id: &str,
+    vectors: Option<Vec<Vector>>,
+    current_model: &str,
+) -> Result<(), String> {
+    let vectors = normalize_embedding(vectors);
+    sqlx::query(
+        "UPDATE turn_digests \
+         SET embedding = $1::vector[], embedding_model = $2 \
+         WHERE id = $3",
+    )
+    .bind(&vectors)
+    .bind(current_model)
+    .bind(id)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Sweep one table: restamp what only needs relabelling, invalidate what is
 /// genuinely stale, and clear orphaned stamps. Table names come from
 /// [`EMBEDDED_TABLES`], which holds compile-time constants and never external
@@ -1277,6 +1433,46 @@ mod tests {
         assert!(
             is_null,
             "write_scratchpad_embedding must normalize an empty vector list to NULL, \
+             not write it as an empty array"
+        );
+
+        drop_test_schema(&schema, &admin_url).await;
+    }
+
+    #[tokio::test]
+    async fn write_turn_digest_embedding_clears_rather_than_writes_an_empty_array() {
+        let Some((pool, schema, admin_url)) = test_pool("normalize_digest").await else {
+            return;
+        };
+        sqlx::query("INSERT INTO conversations (id, title) VALUES ($1, 'test')")
+            .bind("conv-1")
+            .execute(&pool)
+            .await
+            .expect("seed conversation row");
+        sqlx::query(
+            "INSERT INTO turn_digests \
+                 (id, user_id, conversation_id, opening_message_id, content) \
+             VALUES ($1, 'default', $2, 'm-1', 'Asked: something')",
+        )
+        .bind("digest-1")
+        .bind("conv-1")
+        .execute(&pool)
+        .await
+        .expect("seed turn_digests row");
+
+        write_turn_digest_embedding(&pool, "digest-1", Some(Vec::new()), "model-A")
+            .await
+            .expect("write succeeds");
+
+        let is_null: bool =
+            sqlx::query_scalar("SELECT embedding IS NULL FROM turn_digests WHERE id = $1")
+                .bind("digest-1")
+                .fetch_one(&pool)
+                .await
+                .expect("read back embedding");
+        assert!(
+            is_null,
+            "write_turn_digest_embedding must normalize an empty vector list to NULL, \
              not write it as an empty array"
         );
 

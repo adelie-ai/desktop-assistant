@@ -32,7 +32,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use desktop_assistant_core::domain::{Conversation, ConversationId, Message, Role};
+use desktop_assistant_core::domain::{
+    Conversation, ConversationId, LEGACY_TURN_NOTE_TYPE, Message, Role,
+};
 use desktop_assistant_core::ports::embedding::EmbedFn;
 use desktop_assistant_core::ports::scratchpad::{
     NewScratchpadNote, NoteEmbedding, ScratchpadStore, embed_notes,
@@ -195,6 +197,94 @@ async fn a_note_is_found_by_a_semantically_similar_query_sharing_no_words() {
             Some("n1"),
             "the semantically nearest note must rank first, got {:?}",
             hits.iter().map(|n| &n.key).collect::<Vec<_>>()
+        );
+    })
+    .await;
+
+    fx.cleanup().await;
+}
+
+/// A per-turn capture written before the episodic turn index existed (#1349)
+/// stays on the pad but is never offered by the `[Recall]` pad arm.
+///
+/// The digests of those same turns land in `turn_digests` once the transcript
+/// backfill runs. If the pad arm still offered the legacy rows, one turn could
+/// arrive twice in one `[Recall]` block through two arms under two different
+/// keys, and the already-in-view dedup keys on identity, so it would not see
+/// that the two are one turn.
+///
+/// Both reads behind the block are checked, and each is paired with its permit:
+/// a test that only proved the exclusion would pass against an arm that
+/// returned nothing at all.
+#[tokio::test]
+async fn a_legacy_turn_capture_stays_on_the_pad_but_is_not_offered_by_the_recall_arm() {
+    let Some(fx) = fixture("sp1349legacy").await else {
+        return;
+    };
+    let convs = PgConversationStore::new(fx.pool.clone());
+    let pad = PgScratchpadStore::new(fx.pool.clone());
+
+    with_user_id(UserId::new(USER), async {
+        convs.create(make_conversation("c1")).await.expect("conv");
+
+        // An ordinary note and a legacy turn capture, identical in every way
+        // the two reads rank on: same vector, same words.
+        let words = "Asked: deploy with the kustomization";
+        write_embedded(
+            &pad,
+            "c1",
+            "n1",
+            words,
+            vec![1.0, 0.0, 0.0],
+            &current_model(),
+        )
+        .await;
+
+        let mut capture = NewScratchpadNote::new("turn:m-01", words);
+        capture.note_type = LEGACY_TURN_NOTE_TYPE.to_string();
+        capture.embedding = Some(NoteEmbedding {
+            chunks: vec![vec![1.0, 0.0, 0.0]],
+            model: current_model(),
+        });
+        pad.write("c1", &[capture]).await.expect("write capture");
+
+        // It is still on the pad: this is a durable record, and until the
+        // transcript backfill has run it is the only copy of that capture.
+        let listed = pad.list("c1", None, 50).await.expect("list");
+        assert!(
+            key_set(&listed).contains("turn:m-01"),
+            "the legacy row must not be destroyed: {:?}",
+            key_set(&listed)
+        );
+
+        // The vector arm: the ordinary note comes back, the capture does not.
+        let nearest = pad
+            .nearest_by_embedding("c1", vec![1.0, 0.0, 0.0], &current_model(), 10)
+            .await
+            .expect("nearest");
+        let offered: HashSet<String> = nearest.notes.iter().map(|(n, _)| n.key.clone()).collect();
+        assert!(
+            offered.contains("n1"),
+            "the permit: an ordinary note is still offered: {offered:?}"
+        );
+        assert!(
+            !offered.contains("turn:m-01"),
+            "a legacy turn capture must not be offered beside its own digest: {offered:?}"
+        );
+
+        // The full-text arm, on the same terms.
+        let lexical = pad
+            .search_text_any_term("c1", "kustomization deploy", 10)
+            .await
+            .expect("text search");
+        let offered = key_set(&lexical);
+        assert!(
+            offered.contains("n1"),
+            "the permit: an ordinary note is still offered lexically: {offered:?}"
+        );
+        assert!(
+            !offered.contains("turn:m-01"),
+            "a legacy turn capture must not be offered lexically either: {offered:?}"
         );
     })
     .await;

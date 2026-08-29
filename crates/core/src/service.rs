@@ -155,10 +155,13 @@ fn close_unanswered_tool_calls(messages: &mut Vec<Message>) -> usize {
 /// the work stopped rather than simply ending. `executed` counts the tool
 /// results this turn already holds; `unanswered` the calls it never dispatched.
 fn cancelled_turn_notice(executed: usize, unanswered: usize) -> String {
+    // The opening is a named constant for the same reason
+    // `user_visible_llm_error_message`'s arms are.
+    let opening = crate::turn_capture::CANCELLED_TURN_NOTICE;
     let mut notice = match executed {
-        0 => "[Turn cancelled. No tool call had finished".to_string(),
-        1 => "[Turn cancelled after 1 tool call, whose effects stand".to_string(),
-        n => format!("[Turn cancelled after {n} tool calls, whose effects stand"),
+        0 => format!("{opening}. No tool call had finished"),
+        1 => format!("{opening} after 1 tool call, whose effects stand"),
+        n => format!("{opening} after {n} tool calls, whose effects stand"),
     };
     match unanswered {
         0 => notice.push('.'),
@@ -458,35 +461,39 @@ fn cutoff_timestamp(max_age_days: u32) -> String {
 /// generic "I hit an LLM backend error..." line that includes the raw
 /// detail for debugging.
 fn user_visible_llm_error_message(error: &CoreError) -> String {
+    // Every arm's opening is a named constant rather than a literal here,
+    // because a reader reconstructing a finished turn from the transcript
+    // recognises this text by its opening - the rows record what was said and
+    // not how the turn ended. Named, not indexed into
+    // `FAILED_TURN_NOTICE_PREFIXES`: a slice index compiles whatever the list
+    // holds, so a reordered or shortened list would panic here, inside the
+    // path that reports an error.
+    //
+    // A new arm that writes its own literal instead of adding a constant is
+    // not caught by the compiler. `every_listed_failure_notice_is_written_by_a_
+    // real_error` is what limits the damage: it holds the list to the
+    // producers in the one direction a test can.
+    use crate::turn_capture::{
+        CONTEXT_OVERFLOW_NOTICE, CONTEXT_RECOVERY_EXHAUSTED_NOTICE, LLM_BACKEND_ERROR_NOTICE,
+        MODEL_LOADING_NOTICE, QUOTA_EXCEEDED_NOTICE, RATE_LIMITED_NOTICE, TOOLS_UNSUPPORTED_NOTICE,
+    };
     match error {
-        CoreError::ContextOverflow { detail, .. } => format!(
-            "The conversation exceeded the model's context window. We'll truncate older content and retry. Details: {detail}"
-        ),
-        CoreError::Llm(detail) if detail == CONTEXT_RECOVERY_EXHAUSTED => format!(
-            "The conversation is too large for this model's context window, and \
-             shortening it further would leave nothing to work from. Start a new \
-             conversation, or switch to a model with a larger window. Details: {detail}"
-        ),
-        CoreError::RateLimited { detail, .. } => format!(
-            "The API rate limit was exceeded. Please wait a moment and try again. Details: {detail}"
-        ),
-        CoreError::QuotaExceeded { detail } => format!(
-            "Your API quota is exhausted. Top up the account or switch to a different API key. Details: {detail}"
-        ),
-        CoreError::ModelLoading { detail } => format!(
-            "The model is still downloading or loading. Please wait a moment and try again. Details: {detail}"
-        ),
-        CoreError::ToolsUnsupported { detail } => format!(
-            "This model does not support tool use. Please switch to a tool-capable model or disable tools for this chat. Details: {detail}"
-        ),
+        CoreError::ContextOverflow { detail, .. } => {
+            format!("{CONTEXT_OVERFLOW_NOTICE}{detail}")
+        }
+        CoreError::Llm(detail) if detail == CONTEXT_RECOVERY_EXHAUSTED => {
+            format!("{CONTEXT_RECOVERY_EXHAUSTED_NOTICE}{detail}")
+        }
+        CoreError::RateLimited { detail, .. } => format!("{RATE_LIMITED_NOTICE}{detail}"),
+        CoreError::QuotaExceeded { detail } => format!("{QUOTA_EXCEEDED_NOTICE}{detail}"),
+        CoreError::ModelLoading { detail } => format!("{MODEL_LOADING_NOTICE}{detail}"),
+        CoreError::ToolsUnsupported { detail } => format!("{TOOLS_UNSUPPORTED_NOTICE}{detail}"),
         // Bare LLM error and any non-LLM variant share the generic
         // fallback. This intentionally does NOT enumerate every
         // CoreError variant — `Display` already produces a readable
         // string and the surrounding service layer is the right place
         // to add tailored messages for non-LLM domains.
-        _ => format!(
-            "I hit an LLM backend error and could not complete this request. Details: {error}"
-        ),
+        _ => format!("{LLM_BACKEND_ERROR_NOTICE}{error}"),
     }
 }
 
@@ -603,6 +610,11 @@ pub struct ConversationHandler<S, L, T = NoopToolExecutor> {
     /// exactly as before. Wire the daemon's *event-emitting* write closure so
     /// plan changes reach clients via `ScratchpadChanged`.
     scratchpad_write: Option<ScratchpadWriteFn>,
+    /// Optional writer for the episodic turn index (#1349). When set, every
+    /// ordinary turn exit keeps one digest of the turn - see
+    /// [`crate::turn_capture`]. `None` leaves the digest unwritten; the
+    /// transcript still holds every byte the digest restates.
+    turn_digest_write: Option<crate::ports::turn_digest::TurnDigestWriteFn>,
     /// Whether this daemon bounds the verbatim window by tokens, and to
     /// what (#1208). Default is off, which leaves the window byte-for-byte as
     /// it was - though not the whole prompt, since `[Earlier turns]` is gated
@@ -770,6 +782,7 @@ impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
             categorize_lock: tokio::sync::Mutex::new(()),
             scratchpad_get_many: None,
             scratchpad_write: None,
+            turn_digest_write: None,
             verbatim_window: crate::verbatim_window::WindowPolicy::default(),
             skill_search: None,
             skill_get: None,
@@ -998,6 +1011,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             categorize_lock: tokio::sync::Mutex::new(()),
             scratchpad_get_many: None,
             scratchpad_write: None,
+            turn_digest_write: None,
             verbatim_window: crate::verbatim_window::WindowPolicy::default(),
             skill_search: None,
             skill_get: None,
@@ -1247,6 +1261,16 @@ impl<S, L, T> ConversationHandler<S, L, T> {
 
     pub fn with_scratchpad_write(mut self, write: ScratchpadWriteFn) -> Self {
         self.scratchpad_write = Some(write);
+        self
+    }
+
+    /// Wire the writer for the episodic turn index (#1349), so every ordinary
+    /// turn exit keeps one digest of the turn.
+    pub fn with_turn_digest_write(
+        mut self,
+        write: crate::ports::turn_digest::TurnDigestWriteFn,
+    ) -> Self {
+        self.turn_digest_write = Some(write);
         self
     }
 
@@ -2623,8 +2647,8 @@ impl<S: ConversationStore, L, T> ConversationHandler<S, L, T> {
     }
 
     /// Keep the user's own words, the tool calls with their arguments and
-    /// outcomes, and the assistant's closing text, on this conversation's pad
-    /// (#1207).
+    /// outcomes, and the assistant's closing text, in the person's episodic
+    /// turn index (#1207, #1349).
     ///
     /// **Nothing here asks the model to have noticed.** Volunteering asks it
     /// to decide, mid-task, that something was worth keeping, and gives it no
@@ -2644,7 +2668,9 @@ impl<S: ConversationStore, L, T> ConversationHandler<S, L, T> {
     /// Every turn is captured, including a short one that ran no tool. The
     /// obvious saving - skip a turn that looks trivial - would drop exactly
     /// the case this exists for, because "use the kustomization from now on"
-    /// is short and calls nothing.
+    /// is short and calls nothing. A subagent's conversation is the one
+    /// exception, and [`crate::turn_capture::capture_turn`] makes it on the
+    /// conversation's own reserved tag rather than on anything a tool can set.
     async fn capture_turn_record(
         &self,
         conv: &Conversation,
@@ -2652,27 +2678,28 @@ impl<S: ConversationStore, L, T> ConversationHandler<S, L, T> {
         provenance: TurnProvenance,
         ending: TurnEnding,
     ) {
-        let Some(write) = self.scratchpad_write.clone() else {
+        let Some(write) = self.turn_digest_write.clone() else {
             return;
         };
         // The writing turn's provenance decides the stamp, and the operator's
         // `hard_withhold` decides whether the turn's own derived text is kept
         // at all. Both are read here rather than inside the capture, so the
         // one place that knows the turn is the one place that says.
-        let Some(note) = crate::turn_capture::capture_turn(
+        let Some(digest) = crate::turn_capture::capture_turn(
             &conv.messages,
             turn_start,
             provenance,
             self.hard_withhold,
             ending,
+            &conv.tags,
         ) else {
             return;
         };
-        let key = note.key.clone();
-        if let Err(e) = write(conv.id.0.clone(), vec![note]).await {
+        let opening = digest.opening_message_id.clone();
+        if let Err(e) = write(conv.id.0.clone(), vec![digest]).await {
             tracing::warn!(
                 conversation_id = %conv.id.0,
-                note_key = %key,
+                opening_message_id = %opening,
                 error = %e,
                 "could not keep this turn's record; the transcript still holds every byte of it"
             );
@@ -9540,16 +9567,35 @@ mod tests {
     // Turn-end capture (#1207).
     // -----------------------------------------------------------------------
 
-    /// The turn captures written by a run, keyed as they were stored.
+    /// An in-memory episodic turn index backing the digest write closure, plus
+    /// a handle to inspect what was written. Keyed by opening message id, so
+    /// the double-write a re-run would make shows up as one row and not two.
+    fn in_memory_turn_digests() -> (
+        crate::ports::turn_digest::TurnDigestWriteFn,
+        Arc<Mutex<HashMap<String, crate::ports::turn_digest::NewTurnDigest>>>,
+    ) {
+        let store: Arc<Mutex<HashMap<String, crate::ports::turn_digest::NewTurnDigest>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let for_write = Arc::clone(&store);
+        let write: crate::ports::turn_digest::TurnDigestWriteFn =
+            Arc::new(move |_conv: String, digests| {
+                let store = Arc::clone(&for_write);
+                Box::pin(async move {
+                    let mut store = store.lock().unwrap();
+                    for digest in digests {
+                        store.insert(digest.opening_message_id.clone(), digest);
+                    }
+                    Ok(Vec::new())
+                })
+            });
+        (write, store)
+    }
+
+    /// The turn digests written by a run.
     fn captures(
-        pad: &Arc<Mutex<HashMap<String, crate::domain::ScratchpadNote>>>,
-    ) -> Vec<crate::domain::ScratchpadNote> {
-        pad.lock()
-            .unwrap()
-            .values()
-            .filter(|n| n.note_type == crate::turn_capture::TURN_NOTE_TYPE)
-            .cloned()
-            .collect()
+        kept: &Arc<Mutex<HashMap<String, crate::ports::turn_digest::NewTurnDigest>>>,
+    ) -> Vec<crate::ports::turn_digest::NewTurnDigest> {
+        kept.lock().unwrap().values().cloned().collect()
     }
 
     /// AC: a decision the user stated is durable after the turn, without the
@@ -9557,15 +9603,14 @@ mod tests {
     /// opens a step, or calls a memory tool.
     #[tokio::test]
     async fn a_decision_the_user_stated_survives_a_turn_that_recorded_nothing() {
-        let (write, list, pad) = in_memory_scratchpad();
+        let (write, pad) = in_memory_turn_digests();
         let handler = ConversationHandler::with_tools(
             MockStore::new(),
             ToolCallingLlm::new(vec![LlmResponse::text("understood")]),
             MockToolExecutor::new(vec![], HashMap::new()),
             id_gen(),
         )
-        .with_scratchpad_write(write)
-        .with_scratchpad_list(list);
+        .with_turn_digest_write(write);
 
         let conv = handler
             .create_conversation("Test".into(), vec![])
@@ -9604,10 +9649,10 @@ mod tests {
         let mut results = HashMap::new();
         results.insert(
             "notes_search".to_string(),
-            "PAYLOAD-THAT-MUST-NOT-REACH-THE-PAD".to_string(),
+            "PAYLOAD-THAT-MUST-NOT-REACH-THE-INDEX".to_string(),
         );
 
-        let (write, list, pad) = in_memory_scratchpad();
+        let (write, pad) = in_memory_turn_digests();
         let handler = ConversationHandler::with_tools(
             MockStore::new(),
             ToolCallingLlm::new(vec![
@@ -9617,8 +9662,7 @@ mod tests {
             MockToolExecutor::new(tools, results),
             id_gen(),
         )
-        .with_scratchpad_write(write)
-        .with_scratchpad_list(list);
+        .with_turn_digest_write(write);
 
         let conv = handler
             .create_conversation("Test".into(), vec![])
@@ -9645,7 +9689,7 @@ mod tests {
         assert!(
             !kept[0]
                 .content
-                .contains("PAYLOAD-THAT-MUST-NOT-REACH-THE-PAD"),
+                .contains("PAYLOAD-THAT-MUST-NOT-REACH-THE-INDEX"),
             "a tool's bytes stay in the transcript: {}",
             kept[0].content
         );
@@ -9655,7 +9699,7 @@ mod tests {
     /// one. The user's words are exactly what a failed turn most needs kept.
     #[tokio::test]
     async fn a_turn_that_ended_in_an_error_is_still_captured() {
-        let (write, list, pad) = in_memory_scratchpad();
+        let (write, pad) = in_memory_turn_digests();
         let handler = ConversationHandler::with_tools(
             MockStore::new(),
             // Fails on the first call, so the turn really does leave through
@@ -9664,8 +9708,7 @@ mod tests {
             MockToolExecutor::new(vec![], HashMap::new()),
             id_gen(),
         )
-        .with_scratchpad_write(write)
-        .with_scratchpad_list(list);
+        .with_turn_digest_write(write);
 
         let conv = handler
             .create_conversation("Test".into(), vec![])
@@ -9711,15 +9754,14 @@ mod tests {
             }
         }
 
-        let (write, list, pad) = in_memory_scratchpad();
+        let (write, pad) = in_memory_turn_digests();
         let handler = ConversationHandler::with_tools(
             MockStore::new(),
             CancellingLlm,
             MockToolExecutor::new(vec![], HashMap::new()),
             id_gen(),
         )
-        .with_scratchpad_write(write)
-        .with_scratchpad_list(list);
+        .with_turn_digest_write(write);
 
         let conv = handler
             .create_conversation("Test".into(), vec![])
@@ -9755,7 +9797,7 @@ mod tests {
     /// capture findable.
     #[tokio::test]
     async fn a_turn_that_ends_in_a_provider_error_captures_the_question_without_the_error_text() {
-        let (write, list, pad) = in_memory_scratchpad();
+        let (write, pad) = in_memory_turn_digests();
         let handler = ConversationHandler::with_tools(
             MockStore::new(),
             FailingLlm::new(Vec::new(), 0)
@@ -9763,8 +9805,7 @@ mod tests {
             MockToolExecutor::new(vec![], HashMap::new()),
             id_gen(),
         )
-        .with_scratchpad_write(write)
-        .with_scratchpad_list(list);
+        .with_turn_digest_write(write);
 
         let conv = handler
             .create_conversation("Test".into(), vec![])
@@ -9821,15 +9862,14 @@ mod tests {
             }
         }
 
-        let (write, list, pad) = in_memory_scratchpad();
+        let (write, pad) = in_memory_turn_digests();
         let handler = ConversationHandler::with_tools(
             MockStore::new(),
             CancellingLlm,
             MockToolExecutor::new(vec![], HashMap::new()),
             id_gen(),
         )
-        .with_scratchpad_write(write)
-        .with_scratchpad_list(list);
+        .with_turn_digest_write(write);
 
         let conv = handler
             .create_conversation("Test".into(), vec![])
@@ -9873,15 +9913,14 @@ mod tests {
     /// ordinary turn keeps both halves, which is what the capture is for.
     #[tokio::test]
     async fn an_ordinary_turn_still_captures_both_halves() {
-        let (write, list, pad) = in_memory_scratchpad();
+        let (write, pad) = in_memory_turn_digests();
         let handler = ConversationHandler::with_tools(
             MockStore::new(),
             ToolCallingLlm::new(vec![LlmResponse::text("use the sealed secret for that")]),
             MockToolExecutor::new(vec![], HashMap::new()),
             id_gen(),
         )
-        .with_scratchpad_write(write)
-        .with_scratchpad_list(list);
+        .with_turn_digest_write(write);
 
         let conv = handler
             .create_conversation("Test".into(), vec![])
@@ -9918,8 +9957,8 @@ mod tests {
     /// the turn over it would trade the answer against a convenience.
     #[tokio::test]
     async fn a_capture_that_cannot_be_written_does_not_fail_the_turn() {
-        let failing: ScratchpadWriteFn = Arc::new(|_conv, _notes| {
-            Box::pin(async { Err(CoreError::Storage("the pad is unreachable".into())) })
+        let failing: crate::ports::turn_digest::TurnDigestWriteFn = Arc::new(|_conv, _digests| {
+            Box::pin(async { Err(CoreError::Storage("the turn index is unreachable".into())) })
         });
         let handler = ConversationHandler::with_tools(
             MockStore::new(),
@@ -9927,7 +9966,7 @@ mod tests {
             MockToolExecutor::new(vec![], HashMap::new()),
             id_gen(),
         )
-        .with_scratchpad_write(failing);
+        .with_turn_digest_write(failing);
 
         let conv = handler
             .create_conversation("Test".into(), vec![])
@@ -9959,10 +9998,11 @@ mod tests {
         });
 
         let o = Arc::clone(&order);
-        let write: ScratchpadWriteFn = Arc::new(move |_conv, _notes| {
-            o.lock().unwrap().push("capture");
-            Box::pin(async { Ok(Vec::new()) })
-        });
+        let write: crate::ports::turn_digest::TurnDigestWriteFn =
+            Arc::new(move |_conv, _digests| {
+                o.lock().unwrap().push("capture");
+                Box::pin(async { Ok(Vec::new()) })
+            });
 
         let handler = ConversationHandler::with_tools(
             MockStore::new(),
@@ -9970,7 +10010,7 @@ mod tests {
             MockToolExecutor::new(vec![], HashMap::new()),
             id_gen(),
         )
-        .with_scratchpad_write(write);
+        .with_turn_digest_write(write);
 
         let conv = handler
             .create_conversation("Test".into(), vec![])
@@ -20767,6 +20807,99 @@ mod tests {
             "[Turn cancelled after 3 tool calls, whose effects stand; \
              2 further calls were requested and never ran.]"
         );
+    }
+
+    /// Every message the two failure-notice producers can write, for the two
+    /// tests below. Hand-enumerated, which is this pair's known limit: see
+    /// `every_failure_notice_these_producers_write_is_recognised`.
+    fn every_failure_notice_written() -> Vec<String> {
+        let mut notices = vec![
+            cancelled_turn_notice(0, 0),
+            cancelled_turn_notice(1, 0),
+            cancelled_turn_notice(3, 2),
+        ];
+        for error in [
+            CoreError::ContextOverflow {
+                detail: "over the window".into(),
+                prompt_tokens: None,
+                max_tokens: None,
+            },
+            CoreError::Llm(CONTEXT_RECOVERY_EXHAUSTED.to_string()),
+            CoreError::RateLimited {
+                detail: "slow down".into(),
+                retry_after: None,
+            },
+            CoreError::QuotaExceeded {
+                detail: "out of credit".into(),
+            },
+            CoreError::ModelLoading {
+                detail: "still loading".into(),
+            },
+            CoreError::ToolsUnsupported {
+                detail: "no tools".into(),
+            },
+            CoreError::Storage("something else entirely".into()),
+        ] {
+            notices.push(user_visible_llm_error_message(&error));
+        }
+        notices
+    }
+
+    /// The list and the producers are coupled in the one direction a test can
+    /// hold: nothing may sit in `FAILED_TURN_NOTICE_PREFIXES` that no error
+    /// actually writes. A renamed, reordered or dead entry fails here.
+    ///
+    /// **The reverse direction is not held, and cannot be.** A new match arm
+    /// in `user_visible_llm_error_message` that writes its own literal instead
+    /// of adding a constant compiles, ships, and is read back as an answer by
+    /// `derive_turn_ending`. The enumeration in `every_failure_notice_written`
+    /// is maintained by hand for the same reason. Adding an arm means adding
+    /// its constant and its case here.
+    #[test]
+    fn every_listed_failure_notice_is_written_by_a_real_error() {
+        let written = every_failure_notice_written();
+        for prefix in crate::turn_capture::FAILED_TURN_NOTICE_PREFIXES {
+            assert!(
+                written.iter().any(|notice| notice.starts_with(prefix)),
+                "no error writes a message opening with this, so nothing in a \
+                 transcript can carry it: {prefix:?}"
+            );
+        }
+    }
+
+    /// Every message these two producers write is read back as a failed turn,
+    /// so a backfill does not file it as an answer (#1351).
+    ///
+    /// This proves the producers and the recogniser agree with each other. It
+    /// does NOT prove either agrees with what is already in a transcript -
+    /// both could have drifted together - and
+    /// `the_recogniser_matches_the_wording_already_in_transcripts`
+    /// (`crate::turn_capture`) is what holds that, by spelling the stored
+    /// wording out by hand.
+    #[test]
+    fn every_failure_notice_these_producers_write_is_recognised() {
+        use crate::turn_capture::{TurnEnding, derive_turn_ending};
+
+        for notice in every_failure_notice_written() {
+            let turn = vec![
+                Message::new(Role::User, "the question"),
+                Message::new(Role::Assistant, &notice),
+            ];
+            assert_eq!(
+                derive_turn_ending(&turn),
+                TurnEnding::Unanswered,
+                "the harness writes this and a backfill must not file it as an \
+                 answer: {notice}"
+            );
+        }
+
+        // The refusal: an ordinary reply is still an answer. Without this the
+        // recogniser could return `Unanswered` for everything and pass.
+        let answered = vec![
+            Message::new(Role::User, "the question"),
+            Message::new(Role::Assistant, "use the sealed secret for that"),
+        ];
+        assert_eq!(derive_turn_ending(&answered), TurnEnding::Answered);
     }
 
     /// AC (#731), failure path: a storage error on the cancel-path persist must

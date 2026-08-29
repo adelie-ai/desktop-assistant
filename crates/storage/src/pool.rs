@@ -269,6 +269,10 @@ const MIGRATIONS: &[Migration] = &[
     // `knowledge_base_superseded_by_chk` (a biconditional) onto the
     // corrected forward implication a fresh 056 now installs directly.
     migration!("061_superseded_by_constraint_widening.sql"),
+    // #1349: the episodic turn index - one bounded, provenance-stamped digest
+    // per turn, scoped to the person rather than to the conversation, so a
+    // past turn is reachable by relevance from anywhere in the account.
+    migration!("062_turn_digests.sql"),
 ];
 
 /// Second half of the advisory-lock key: the schema the migrations write to.

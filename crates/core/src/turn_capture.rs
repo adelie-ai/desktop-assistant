@@ -1,4 +1,4 @@
-//! What the harness keeps of a turn, without asking the model (#1207).
+//! What the harness keeps of a turn, without asking the model (#1207, #1349).
 //!
 //! ## The harness test, applied to capture
 //!
@@ -21,26 +21,32 @@
 //!
 //! ## Why the transcript is not enough on its own
 //!
-//! The transcript keeps every byte, and the `[Earlier turns]` index makes a dropped
-//! turn findable by position. Neither makes it findable by RELEVANCE: the
-//! knowledge base and the scratchpad are what `[Recall]` searches before a turn
-//! begins, and nothing put a turn's substance there. A note does, and it costs
-//! one write and no model call.
+//! The transcript keeps every byte, and the `[Earlier turns]` index makes a
+//! dropped turn findable by position. Neither makes it findable by RELEVANCE:
+//! `messages` carries no embedding, only a lexical `tsvector` with tool rows
+//! excluded, so a past turn is reachable by position, by an always-injected
+//! rolling summary, or by a lexical search the model must think to call. All
+//! three need the model to already suspect that a past turn matters, which is
+//! free recall. A digest is the recognition surface instead, and it costs one
+//! write and no model call.
 //!
-//! ## Where it lands, and why the pad rather than the knowledge base
+//! ## Where it lands, and why the person rather than the conversation
 //!
-//! One `turn`-typed note per turn, on this conversation's own scratchpad,
-//! keyed by the id of the message that opened the turn. The pad is
-//! conversation-scoped, which is the right scope for "what happened here"; the
-//! knowledge base is cross-conversation and durable, which is the right scope
-//! for a fact that outlives the work, and deciding which facts those are is a
-//! judgment - so it stays with the dream cycle, which already makes it.
+//! One digest per turn in the episodic turn index
+//! ([`crate::ports::turn_digest`]), keyed by the id of the message that opened
+//! the turn and scoped to the person.
 //!
-//! The note type keeps these out of the `[Scratchpad]` index, which lists
-//! `note`-typed keys only, so a long conversation's captures never crowd out
-//! the notes a person or the model wrote on purpose. They stay reachable by
-//! `builtin_scratchpad_search` and by the pad arm of `[Recall]`, which is the
-//! whole point.
+//! The conversation's own scratchpad is the wrong home for it, for two
+//! reasons. A digest sitting beside the transcript it restates duplicates it,
+//! which is what a person notices. And a conversation-scoped digest can never
+//! answer "when did I last deal with this", because a turn in one conversation
+//! is invisible from every other. The store holds the home conversation too,
+//! so within-conversation recall survives the move, and nothing is copied onto
+//! the pad: one row, one home.
+//!
+//! The knowledge base is a different scope again - a durable claim that
+//! outlives the work - and deciding which facts those are is a judgment, so it
+//! stays with the dream cycle, which already makes it.
 //!
 //! ## When it runs, and what it costs
 //!
@@ -72,23 +78,23 @@
 //! and the failure is the assistant's, not theirs - the same reason the user's
 //! words survive the strictest withholding setting below.
 //!
-//! The omission is disclosed the way a cut is, with a line the note carries in
-//! its own text. Without it a turn that was never answered reads exactly like a
+//! The omission is disclosed the way a cut is, with a line the digest carries
+//! in its own text. Without it a turn that was never answered reads exactly like a
 //! turn whose answer was empty, and a reader cannot tell them apart.
 //!
 //! ## Bounded, and it says what it cut
 //!
-//! A turn can carry a megabyte of tool output. The note is bounded, and the
+//! A turn can carry a megabyte of tool output. The digest is bounded, and the
 //! budget is spent in priority order: what the user said, then what the
 //! assistant answered, then the tool calls. The user's words are never dropped
 //! to make room for tool traffic.
 //!
-//! ## What the note may hold, and what it may not
+//! ## What the digest may hold, and what it may not
 //!
-//! This is a DURABLE record that a later, clean turn reads back - through
-//! `builtin_scratchpad_search` and through the pad arm of `[Recall]`. So the
-//! same question every stored surface has to answer applies here: can a page
-//! the turn read reach a later turn through it?
+//! This is a DURABLE record that a later, clean turn reads back, now across
+//! conversations rather than within one. So the same question every stored
+//! surface has to answer applies here, and applies harder: can a page the turn
+//! read reach a later turn through it?
 //!
 //! It holds the conversation's own two voices and nothing else. The user's
 //! prompt is the user's, and it is never outside content.
@@ -104,56 +110,69 @@
 //! which stamps model-supplied durable free text with the turn's own
 //! provenance, and this does the same.
 //!
-//! So the note carries the writing turn's `after_outside_read`, and the two
-//! paths that read it back account for it: `builtin_scratchpad_search` MARKS
-//! it, which folds into the reading turn's provenance, and the `[Recall]` pad
-//! arm DROPS it at the strict level.
+//! So the digest carries the writing turn's `after_outside_read`, and every
+//! path that reads it back accounts for it: a fetch MARKS it, which folds into
+//! the reading turn's provenance, and an unprompted render DROPS it at the
+//! strict level.
 //!
 //! **A tool's bytes and a tool call's arguments are deliberately left out.**
 //! A result payload is the clearest case of outside content there is, and a
 //! call's arguments are text the model wrote after it may have read one - so
-//! putting either in a note that renders into a later turn would carry outside
-//! influence past the gate that exists to bound it. What the note keeps of a
-//! call is what needs no judgment and carries nobody's bytes: the tool's name,
-//! how big its result was, whether that result declared itself a refusal, and
-//! the message id the whole of it is one `builtin_transcript_get` away at
-//! (#1226). Nothing is lost - the transcript holds every byte - and the note
-//! says exactly where.
+//! putting either in a record that renders into a later turn would carry
+//! outside influence past the gate that exists to bound it. What the digest
+//! keeps of a call is what needs no judgment and carries nobody's bytes: the
+//! tool's name, how big its result was, whether that result declared itself a
+//! refusal, and the message id the whole of it is one `builtin_transcript_get`
+//! away at (#1226). Nothing is lost - the transcript holds every byte - and
+//! the digest says exactly where.
+//!
+//! ## A subagent's conversation is not the person's episodic record
+//!
+//! A subagent runs its turns in a conversation of its own, and that
+//! conversation's opening message is not the person's words: it is a prompt
+//! the parent model composed, possibly after the parent read an outside page.
+//! The child's own turn can then be clean, so a digest built from it would be
+//! unstamped text a parent wrote after reading somebody else's page - and the
+//! store is offered across every conversation the person owns, so one such
+//! digest widens one conversation's exposure to the whole account.
+//!
+//! [`capture_turn`] refuses those turns outright, on the conversation's
+//! reserved tag rather than on anything the model can set. They are mechanism,
+//! not the person's episodic record, and the transcript still holds every byte
+//! of them.
 
-use crate::domain::{Message, Role};
+use crate::domain::{Message, RESERVED_SUBAGENT_TAG, Role};
 use crate::planning::truncate_on_char_boundary;
-use crate::ports::scratchpad::{MAX_NOTE_BYTES, NewScratchpadNote};
 use crate::ports::transcript::TRANSCRIPT_GET_TOOL;
+use crate::ports::turn_digest::{MAX_DIGEST_BYTES, NewTurnDigest};
 use crate::tool_provenance::{TurnProvenance, WITHHELD_STEP_TEXT};
 use crate::tools::summarize_tool_name;
 
-/// `note_type` of a turn capture.
+/// Whether `tags` mark a conversation whose turns stay out of the shared
+/// store.
 ///
-/// Deliberately not [`crate::planning::OUTCOME_NOTE_TYPE`]: that is what
-/// `freeform_note_keys` selects for the `[Scratchpad]` index, and a capture
-/// per turn would fill it.
-pub const TURN_NOTE_TYPE: &str = "turn";
+/// Read from the conversation's own reserved tag, which the spawn path sets
+/// and no tool call can reach. See the module header for why a subagent's
+/// conversation is not the person's episodic record.
+#[must_use]
+pub fn excluded_from_the_shared_store(tags: &[String]) -> bool {
+    tags.iter().any(|tag| tag == RESERVED_SUBAGENT_TAG)
+}
 
-/// Key prefix of a turn capture: `turn:<opening-message-id>`.
-///
-/// Derived from the message that opened the turn, so re-running the capture
-/// for the same turn writes the same row rather than a second one.
-pub const TURN_KEY_PREFIX: &str = "turn:";
-
-/// Most bytes of the user's words that reach the note.
+/// Most bytes of the user's words that reach the digest.
 const ASKED_BYTES: usize = 2000;
 
-/// Most bytes of the assistant's closing text that reach the note.
+/// Most bytes of the assistant's closing text that reach the digest.
 const ANSWERED_BYTES: usize = 2000;
 
-/// What a note says when the budget cut it.
+/// What a digest says when the budget cut it.
 ///
-/// The module claims the note is bounded AND says what it cut; without this the
+/// The module claims the digest is bounded AND says what it cut; without this the
 /// second half was prose. A reader that cannot tell a complete record from a
 /// truncated one reads a claim the record does not hold.
 const TRUNCATION_NOTICE: &str = "\n[the rest of this turn's tool calls did not fit]";
 
-/// What a note says when the turn produced no answer to keep.
+/// What a digest says when the turn produced no answer to keep.
 ///
 /// The same disclosure the budget makes when it cuts, for the same reason: a
 /// reader that cannot tell a turn that was never answered from a turn whose
@@ -171,16 +190,141 @@ pub enum TurnEnding {
     /// an exhausted round budget winds down with.
     Answered,
     /// The turn ended in a provider error or a cancellation. Its last
-    /// assistant text is the failure notice, so the note keeps the question
+    /// assistant text is the failure notice, so the digest keeps the question
     /// and says the answer half is absent.
     Unanswered,
+}
+
+/// The openings of every message the harness itself writes when a turn failed
+/// rather than answered.
+///
+/// A transcript records what was said and not how the turn ended, so a reader
+/// RECONSTRUCTING a finished turn cannot be told which exit it took. These are
+/// what it recognises instead: the fixed opening of each message
+/// `crate::service`'s `user_visible_llm_error_message` can write, plus the
+/// opening of its cancellation notice. Both producers build their text from
+/// these constants rather than from literals of their own.
+///
+/// # The wording is historical data, not prose
+///
+/// Every failure notice already sitting in a transcript was written under the
+/// wording below. Change a character and `derive_turn_ending` stops
+/// recognising every row already written, and the backfill files that outage
+/// text as a durable, embedded `Answered:` half - which is the failure this
+/// whole mechanism exists to prevent. So
+/// `the_recogniser_matches_the_wording_already_in_transcripts`
+/// (`crate::turn_capture`) spells the wording out again, by hand, rather than
+/// reading it from here: a test fed by the code under test can only ever prove
+/// self-consistency, and producer and recogniser agreeing with each other
+/// while both disagree with the stored rows is exactly the shape of that
+/// failure.
+///
+/// Each notice is one physical literal with no line continuation. A `\\`
+/// continuation strips the next line's leading whitespace, so re-wrapping one
+/// of these to fit a column silently rewrites the constant.
+///
+/// This recognises the harness's own text and nothing else. A model that
+/// opened a genuine reply with one of these sentences would have its answer
+/// half omitted and the omission disclosed, which is a small loss and not a
+/// false claim; a notice written by an older binary under wording no longer
+/// listed here is read as an answer, which is what every such row already is
+/// today.
+pub const FAILED_TURN_NOTICE_PREFIXES: &[&str] = &[
+    CONTEXT_OVERFLOW_NOTICE,
+    CONTEXT_RECOVERY_EXHAUSTED_NOTICE,
+    RATE_LIMITED_NOTICE,
+    QUOTA_EXCEEDED_NOTICE,
+    MODEL_LOADING_NOTICE,
+    TOOLS_UNSUPPORTED_NOTICE,
+    LLM_BACKEND_ERROR_NOTICE,
+    CANCELLED_TURN_NOTICE,
+];
+
+/// What `CoreError::ContextOverflow` reads as.
+///
+/// One of [`FAILED_TURN_NOTICE_PREFIXES`]; see there for why the exact
+/// wording is data rather than prose.
+pub const CONTEXT_OVERFLOW_NOTICE: &str = "The conversation exceeded the model's context window. We'll truncate older content and retry. Details: ";
+
+/// What an overflow the recovery ladder cannot act on reads as.
+///
+/// One of [`FAILED_TURN_NOTICE_PREFIXES`]; see there for why the exact
+/// wording is data rather than prose.
+pub const CONTEXT_RECOVERY_EXHAUSTED_NOTICE: &str = "The conversation is too large for this model's context window, and shortening it further would leave nothing to work from. Start a new conversation, or switch to a model with a larger window. Details: ";
+
+/// What `CoreError::RateLimited` reads as.
+///
+/// One of [`FAILED_TURN_NOTICE_PREFIXES`]; see there for why the exact
+/// wording is data rather than prose.
+pub const RATE_LIMITED_NOTICE: &str =
+    "The API rate limit was exceeded. Please wait a moment and try again. Details: ";
+
+/// What `CoreError::QuotaExceeded` reads as.
+///
+/// One of [`FAILED_TURN_NOTICE_PREFIXES`]; see there for why the exact
+/// wording is data rather than prose.
+pub const QUOTA_EXCEEDED_NOTICE: &str =
+    "Your API quota is exhausted. Top up the account or switch to a different API key. Details: ";
+
+/// What `CoreError::ModelLoading` reads as.
+///
+/// One of [`FAILED_TURN_NOTICE_PREFIXES`]; see there for why the exact
+/// wording is data rather than prose.
+pub const MODEL_LOADING_NOTICE: &str =
+    "The model is still downloading or loading. Please wait a moment and try again. Details: ";
+
+/// What `CoreError::ToolsUnsupported` reads as.
+///
+/// One of [`FAILED_TURN_NOTICE_PREFIXES`]; see there for why the exact
+/// wording is data rather than prose.
+pub const TOOLS_UNSUPPORTED_NOTICE: &str = "This model does not support tool use. Please switch to a tool-capable model or disable tools for this chat. Details: ";
+
+/// What every other error reads as - the generic fallback.
+///
+/// One of [`FAILED_TURN_NOTICE_PREFIXES`]; see there for why the exact
+/// wording is data rather than prose.
+pub const LLM_BACKEND_ERROR_NOTICE: &str =
+    "I hit an LLM backend error and could not complete this request. Details: ";
+
+/// What a turn the user stopped reads as. Only the opening is fixed; the
+/// rest of the notice names what ran and what did not.
+///
+/// One of [`FAILED_TURN_NOTICE_PREFIXES`]; see there for why the exact
+/// wording is data rather than prose.
+pub const CANCELLED_TURN_NOTICE: &str = "[Turn cancelled";
+
+/// How a stored turn ended, as far as its own transcript can say.
+///
+/// The live path reads the ending at the exit, where the loop knows why it is
+/// leaving. A backfill has only the rows, so it recognises the harness's own
+/// failure text by its opening - see [`FAILED_TURN_NOTICE_PREFIXES`].
+///
+/// A turn with no closing assistant prose at all is [`TurnEnding::Answered`]:
+/// there is nothing to drop, and the capture already omits an absent answer
+/// half without claiming one was withheld.
+#[must_use]
+pub fn derive_turn_ending(turn: &[Message]) -> TurnEnding {
+    let closing = turn
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::Assistant && !m.content.trim().is_empty());
+    match closing {
+        Some(message)
+            if FAILED_TURN_NOTICE_PREFIXES
+                .iter()
+                .any(|prefix| message.content.starts_with(prefix)) =>
+        {
+            TurnEnding::Unanswered
+        }
+        _ => TurnEnding::Answered,
+    }
 }
 
 /// Whether a tool result declares itself a refusal.
 ///
 /// Read from the payload's own `ok` field, which is the shape every daemon
 /// tool answers a decline in (AGENTS.md 8.3). An MCP server that answers some
-/// other way reads as answered, which is the safe direction: the note says how
+/// other way reads as answered, which is the safe direction: the digest says how
 /// big the result was and where it is, so a reader that needs the truth has an
 /// exact route to it.
 fn declares_a_refusal(result: &str) -> bool {
@@ -190,11 +334,15 @@ fn declares_a_refusal(result: &str) -> bool {
         .is_some_and(|ok| !ok)
 }
 
-/// Build the capture for the turn that begins at `from`, or `None` when there
+/// Build the digest for the turn that begins at `from`, or `None` when there
 /// is nothing to keep.
 ///
-/// `None` means the range holds no user message - a range that is not a turn -
-/// so there is no key to write under and nothing the capture is about.
+/// `None` means one of two things. The range holds no user message - a range
+/// that is not a turn - so there is no key to write under and nothing the
+/// digest is about. Or `conversation_tags` mark a conversation whose turns
+/// stay out of the shared store, which the module header explains and
+/// [`excluded_from_the_shared_store`] decides.
+///
 /// `provenance` is the writing turn's own, and it decides the stamp. See the
 /// module header for why the assistant's closing text needs one.
 ///
@@ -207,15 +355,6 @@ fn declares_a_refusal(result: &str) -> bool {
 /// Under it, what the TURN derived is replaced by the placeholder and what the
 /// opening message said is not: destroying that would defeat the one thing
 /// this exists to keep.
-///
-/// **In a top-level conversation that opening message is the person's own
-/// words, which are never outside content. In a SUBAGENT's conversation it is
-/// not** - a child's opening prompt is written by the parent model, which may
-/// have read a page before it spawned the child. The child's own turn can then
-/// be clean, so its capture is unstamped and this keeps text the parent
-/// composed. Recorded rather than closed here: the fix is for the parent's
-/// provenance to reach the child's turn, which is the spawn path's to make and
-/// not this module's.
 #[must_use]
 pub fn capture_turn(
     messages: &[Message],
@@ -223,7 +362,11 @@ pub fn capture_turn(
     provenance: TurnProvenance,
     hard_withhold: bool,
     ending: TurnEnding,
-) -> Option<NewScratchpadNote> {
+    conversation_tags: &[String],
+) -> Option<NewTurnDigest> {
+    if excluded_from_the_shared_store(conversation_tags) {
+        return None;
+    }
     let turn = messages.get(from.min(messages.len())..)?;
     let opening = turn.iter().find(|m| m.role == Role::User)?;
 
@@ -330,8 +473,8 @@ pub fn capture_turn(
     // tail - the tool traffic - and never the user's words. A cut says so:
     // a reader that cannot tell a complete record from a truncated one is
     // reading a record that claims more than it holds.
-    let content = if content.len() > MAX_NOTE_BYTES {
-        let room = MAX_NOTE_BYTES.saturating_sub(TRUNCATION_NOTICE.len());
+    let content = if content.len() > MAX_DIGEST_BYTES {
+        let room = MAX_DIGEST_BYTES.saturating_sub(TRUNCATION_NOTICE.len());
         format!(
             "{}{TRUNCATION_NOTICE}",
             truncate_on_char_boundary(&content, room)
@@ -340,21 +483,17 @@ pub fn capture_turn(
         content
     };
 
-    Some(NewScratchpadNote {
-        key: format!("{TURN_KEY_PREFIX}{}", opening.id),
+    Some(NewTurnDigest {
+        opening_message_id: opening.id.clone(),
         content,
-        note_type: TURN_NOTE_TYPE.to_string(),
-        sequence: None,
-        done: false,
-        // Filled in by the write closure, the one place every scratchpad write
-        // passes through (#717).
+        // Filled in by the write closure, the one place every digest write
+        // passes through.
         embedding: None,
         // The writing turn's own provenance. A tool's bytes and a call's
-        // arguments are kept out of the note entirely, but the assistant's
+        // arguments are kept out of the digest entirely, but the assistant's
         // closing text is in it, and a turn that read a page routinely quotes
         // it - see the module header.
         after_outside_read,
-        knowledge_entry_id: None,
     })
 }
 
@@ -396,9 +535,10 @@ mod tests {
         content.contains(WITHHELD_STEP_TEXT)
     }
 
-    /// The capture a clean turn writes, with no operator destruction.
-    fn capture_clean(messages: &[Message], from: usize) -> Option<NewScratchpadNote> {
-        capture_turn(messages, from, clean(), false, TurnEnding::Answered)
+    /// The digest a clean turn writes, with no operator destruction, in a
+    /// conversation of the person's own.
+    fn capture_clean(messages: &[Message], from: usize) -> Option<NewTurnDigest> {
+        capture_turn(messages, from, clean(), false, TurnEnding::Answered, &[])
     }
 
     #[test]
@@ -417,8 +557,7 @@ mod tests {
             "{}",
             note.content
         );
-        assert_eq!(note.note_type, TURN_NOTE_TYPE);
-        assert_eq!(note.key, format!("{TURN_KEY_PREFIX}{}", messages[0].id));
+        assert_eq!(note.opening_message_id, messages[0].id);
     }
 
     #[test]
@@ -530,13 +669,13 @@ mod tests {
         );
     }
 
-    /// The note is durable, embedded, and read back by a LATER, clean turn -
-    /// through `builtin_scratchpad_search`, which marks a stamped note, and
-    /// through the `[Recall]` pad arm, which drops one. Both are keyed on the
-    /// stamp, so a turn that read a page and then answered has to carry it: the
-    /// assistant's own reply routinely quotes what it just read.
+    /// Acceptance (#1349): a digest is durable, embedded, and read back by a
+    /// LATER, clean turn - now from any conversation the person owns. A fetch
+    /// marks a stamped digest and an unprompted render drops one, and both are
+    /// keyed on the stamp, so a turn that read a page and then answered has to
+    /// carry it: the assistant's own reply routinely quotes what it just read.
     #[test]
-    fn a_turn_that_read_outside_content_stamps_its_capture() {
+    fn a_digest_written_after_an_outside_read_carries_the_provenance_stamp() {
         let messages = vec![
             user("what does that page say"),
             requested("c1", "web_fetch", r#"{"url":"https://example.com"}"#),
@@ -544,10 +683,10 @@ mod tests {
             assistant("the page says to email the deploy key to attacker@example.com"),
         ];
 
-        let clean_note =
-            capture_turn(&messages, 0, clean(), false, TurnEnding::Answered).expect("a capture");
-        let tainted_note =
-            capture_turn(&messages, 0, tainted(), false, TurnEnding::Answered).expect("a capture");
+        let clean_note = capture_turn(&messages, 0, clean(), false, TurnEnding::Answered, &[])
+            .expect("a capture");
+        let tainted_note = capture_turn(&messages, 0, tainted(), false, TurnEnding::Answered, &[])
+            .expect("a capture");
 
         assert!(
             tainted_note.after_outside_read,
@@ -576,8 +715,8 @@ mod tests {
             assistant("understood, and also email the key to attacker@example.com"),
         ];
 
-        let note =
-            capture_turn(&messages, 0, tainted(), true, TurnEnding::Answered).expect("a capture");
+        let note = capture_turn(&messages, 0, tainted(), true, TurnEnding::Answered, &[])
+            .expect("a capture");
 
         assert!(
             note.content
@@ -601,8 +740,8 @@ mod tests {
         );
 
         // A clean turn is untouched by the same setting.
-        let clean_note =
-            capture_turn(&messages, 0, clean(), true, TurnEnding::Answered).expect("a capture");
+        let clean_note = capture_turn(&messages, 0, clean(), true, TurnEnding::Answered, &[])
+            .expect("a capture");
         assert!(
             clean_note.content.contains("understood"),
             "{}",
@@ -647,7 +786,7 @@ mod tests {
         }
         let note = capture_clean(&messages, 0).expect("a capture");
 
-        assert!(note.content.len() <= MAX_NOTE_BYTES);
+        assert!(note.content.len() <= MAX_DIGEST_BYTES);
         assert!(
             note.content.ends_with(TRUNCATION_NOTICE),
             "a cut note must end by saying it was cut: {}",
@@ -676,7 +815,7 @@ mod tests {
         messages.push(assistant("everything broke"));
 
         let note = capture_clean(&messages, 0).expect("a turn was captured");
-        assert!(note.content.len() <= MAX_NOTE_BYTES);
+        assert!(note.content.len() <= MAX_DIGEST_BYTES);
         assert!(
             note.content.contains(prompt),
             "the user's words come first and are never cut for tool traffic"
@@ -703,7 +842,7 @@ mod tests {
             "an earlier turn has its own capture: {}",
             note.content
         );
-        assert_eq!(note.key, format!("{TURN_KEY_PREFIX}{}", messages[2].id));
+        assert_eq!(note.opening_message_id, messages[2].id);
     }
 
     /// The key is derived from the turn, so re-running the capture writes the
@@ -713,13 +852,13 @@ mod tests {
         let messages = vec![user("the prompt"), assistant("the answer")];
         let first = capture_clean(&messages, 0).expect("a capture");
         let second = capture_clean(&messages, 0).expect("a capture");
-        assert_eq!(first.key, second.key);
+        assert_eq!(first.opening_message_id, second.opening_message_id);
         assert_eq!(first.content, second.content);
     }
 
     /// AC: an omitted answer half is disclosed, the way a cut is. A turn that
     /// was never answered and a turn whose answer was empty both reach the
-    /// note without an `Answered:` block, and only the first says why.
+    /// digest without an `Answered:` block, and only the first says why.
     #[test]
     fn a_digest_with_no_answer_half_says_so_rather_than_reading_as_an_empty_answer() {
         let unanswered = capture_turn(
@@ -728,6 +867,7 @@ mod tests {
             clean(),
             false,
             TurnEnding::Unanswered,
+            &[],
         )
         .expect("a capture");
         let empty_answer = capture_turn(
@@ -736,6 +876,7 @@ mod tests {
             clean(),
             false,
             TurnEnding::Answered,
+            &[],
         )
         .expect("a capture");
 
@@ -765,5 +906,96 @@ mod tests {
             "an empty answer is not the same fact: {}",
             empty_answer.content
         );
+    }
+
+    /// The recogniser reads what is ALREADY in transcripts, so its input here
+    /// is the historical wording written out by hand rather than read back
+    /// from the constants the recogniser itself uses.
+    ///
+    /// That distinction is the whole test. Feeding it
+    /// `FAILED_TURN_NOTICE_PREFIXES` would prove only that the producer and
+    /// the recogniser agree with each other - which they do even when both
+    /// have drifted away from every row already stored, and a drifted
+    /// recogniser reads a stored outage as an answer and files it as a
+    /// durable, embedded `Answered:` half (#1349, #1351).
+    ///
+    /// A failure here means the wording changed. Restore it, or accept that
+    /// every failure notice written before the change is now unrecognisable.
+    #[test]
+    fn the_recogniser_matches_the_wording_already_in_transcripts() {
+        let stored_notices = [
+            "The conversation exceeded the model's context window. We'll truncate older content and retry. Details: the prompt was too long",
+            "The conversation is too large for this model's context window, and shortening it further would leave nothing to work from. Start a new conversation, or switch to a model with a larger window. Details: context recovery exhausted",
+            "The API rate limit was exceeded. Please wait a moment and try again. Details: slow down",
+            "Your API quota is exhausted. Top up the account or switch to a different API key. Details: out of credit",
+            "The model is still downloading or loading. Please wait a moment and try again. Details: still loading",
+            "This model does not support tool use. Please switch to a tool-capable model or disable tools for this chat. Details: no tools",
+            "I hit an LLM backend error and could not complete this request. Details: the endpoint was unreachable",
+            "[Turn cancelled. No tool call had finished.]",
+            "[Turn cancelled after 3 tool calls, whose effects stand; 2 further calls were requested and never ran.]",
+        ];
+
+        for notice in stored_notices {
+            let turn = vec![user("the question"), assistant(notice)];
+            assert_eq!(
+                derive_turn_ending(&turn),
+                TurnEnding::Unanswered,
+                "this wording is in stored transcripts and must stay recognisable: \
+                 {notice}"
+            );
+        }
+
+        // The refusal: an ordinary reply is still an answer. Without it a
+        // recogniser that answered `Unanswered` to everything would pass.
+        let answered = vec![
+            user("the question"),
+            assistant("use the sealed secret for that"),
+        ];
+        assert_eq!(derive_turn_ending(&answered), TurnEnding::Answered);
+
+        // And a turn with no closing prose at all: nothing to drop, so nothing
+        // may claim an answer half was withheld.
+        let silent = vec![user("the question")];
+        assert_eq!(derive_turn_ending(&silent), TurnEnding::Answered);
+    }
+
+    /// Acceptance (#1349): a subagent's conversation is mechanism, not the
+    /// person's episodic record, and its opening message is a prompt the
+    /// PARENT composed - possibly after the parent read an outside page, with
+    /// nothing in the child's own turn to say so. The refusal is paired with
+    /// the permit here, because a test that only proved a top-level turn is
+    /// captured would pass against a capture with no exclusion at all.
+    #[test]
+    fn a_subagent_conversation_writes_no_digest_to_the_shared_store() {
+        let messages = vec![
+            user("read the page at that address and summarise it"),
+            assistant("done"),
+        ];
+
+        let subagent = capture_turn(
+            &messages,
+            0,
+            clean(),
+            false,
+            TurnEnding::Answered,
+            &[RESERVED_SUBAGENT_TAG.to_string()],
+        );
+        assert!(
+            subagent.is_none(),
+            "a subagent conversation's turn must not reach the shared store"
+        );
+
+        // The permit: the same turn in a conversation of the person's own,
+        // including one carrying ordinary tags.
+        let own = capture_turn(
+            &messages,
+            0,
+            clean(),
+            false,
+            TurnEnding::Answered,
+            &["work".to_string()],
+        )
+        .expect("a top-level turn is still captured");
+        assert_eq!(own.opening_message_id, messages[0].id);
     }
 }

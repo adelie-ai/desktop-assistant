@@ -1175,6 +1175,26 @@ impl TurnProvenance {
         GateChange::JustClosed
     }
 
+    /// Fold in a result the reader cannot attribute to a tool.
+    ///
+    /// The gate's ordinary input is a tool name and the bytes that came back
+    /// under it. A reader RECONSTRUCTING a finished turn from the stored
+    /// transcript can meet a result whose request is not in the turn - a tool
+    /// row whose `tool_call_id` names no call the range holds - so it knows
+    /// bytes came in and cannot know from where.
+    ///
+    /// Unattributable counts as external, which is the direction that fails
+    /// safe. The alternative reads a page the turn may well have fetched as
+    /// though it were trusted, and every read path keyed on the stamp would
+    /// then treat that turn's derived text as the person's own.
+    pub fn observe_unattributed_result(&mut self) -> GateChange {
+        if self.ingested_external {
+            return GateChange::Unchanged;
+        }
+        self.ingested_external = true;
+        GateChange::JustClosed
+    }
+
     /// Decide whether the model may run `name` now.
     ///
     /// `interactivity` changes only what the model is told, never the answer.

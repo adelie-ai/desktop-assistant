@@ -67,6 +67,24 @@ pub struct ScratchpadNote {
 /// Default `note_type` when a writer doesn't specify one.
 pub const DEFAULT_NOTE_TYPE: &str = "note";
 
+/// `note_type` of a per-turn capture written before the episodic turn index
+/// existed (#1207, #1349).
+///
+/// Turn captures used to land on the conversation's own scratchpad. They land
+/// in `turn_digests` now, and no writer produces this type any more - but the
+/// rows already written are still there, and they are still a record of what
+/// happened.
+///
+/// **They are deliberately not deleted.** The transcript backfill has to run
+/// before `turn_digests` holds the same turns, and on any instance where it
+/// has not run yet these rows are the only copy of that capture. Trading a
+/// durable record for tidiness is the trade this whole epic exists to stop
+/// making. What they must not do is be OFFERED beside the digest of the same
+/// turn: the `[Recall]` pad arm excludes this type so one turn cannot arrive
+/// twice in one block under two different keys, which the already-in-view
+/// dedup would not catch.
+pub const LEGACY_TURN_NOTE_TYPE: &str = "turn";
+
 impl ScratchpadNote {
     /// Construct a `note`-typed, unsequenced, not-done note. `created_at` /
     /// `updated_at` are left empty for the storage layer to populate from the
