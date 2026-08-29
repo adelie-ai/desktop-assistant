@@ -191,3 +191,154 @@ fn migrations_056_and_061_declare_the_same_superseded_by_check() {
          mismatch means 056's copy is dead text and only 061's takes effect"
     );
 }
+
+/// Pull the `WHERE ...;` predicate out of a migration file's pre-flight
+/// diagnostic -- the `SELECT count(*) INTO offending_count FROM
+/// knowledge_base WHERE ...` block that runs just before the `ADD
+/// CONSTRAINT` the file installs. Whitespace is normalized the same way
+/// [`superseded_by_check_expression`] normalizes the CHECK expression, so an
+/// indentation difference between files never registers as a difference in
+/// the predicate itself.
+///
+/// The anchor is `INTO offending_count`, the diagnostic's own output
+/// variable, because it appears exactly once per file and sits immediately
+/// before the `FROM knowledge_base WHERE ...` this function reads.
+fn preflight_predicate(migration_sql: &str) -> String {
+    const ANCHOR: &str = "INTO offending_count";
+    const WHERE_KEYWORD: &str = "WHERE";
+
+    let after_anchor = migration_sql
+        .split_once(ANCHOR)
+        .map(|(_, rest)| rest)
+        .unwrap_or_else(|| panic!("{ANCHOR:?} not found in migration text"));
+    let after_where = after_anchor
+        .split_once(WHERE_KEYWORD)
+        .map(|(_, rest)| rest)
+        .unwrap_or_else(|| panic!("{WHERE_KEYWORD:?} not found after {ANCHOR:?}"));
+    let end = after_where
+        .find(';')
+        .unwrap_or_else(|| panic!("no terminating ';' found after {WHERE_KEYWORD:?}"));
+
+    after_where[..end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// #1345: each migration's pre-flight diagnostic must refuse exactly the
+/// rows its own `CHECK` would refuse. `migrations_056_and_061_declare_the_same_superseded_by_check`
+/// above only pins the two files' CHECK expressions to each other -- nothing
+/// before this test held either migration's pre-flight predicate to its own
+/// CHECK, so a future change to the disposition vocabulary could edit both
+/// CHECKs and leave a pre-flight behind: the drift test still passes (the
+/// CHECKs still agree with each other), and a store holding a row of the new
+/// shape aborts at `ADD CONSTRAINT` with Postgres's own undiagnosed error --
+/// exactly what the pre-flight exists to prevent.
+///
+/// Proved behaviourally rather than by comparing text: for every disposition,
+/// this seeds a row carrying that disposition with no successor and checks
+/// that the migration's own pre-flight predicate flags the row if and only if
+/// the migration's own CHECK expression would refuse it. Run once per
+/// migration file, because each declares its own copy of both and could
+/// drift from either independently.
+#[tokio::test]
+async fn the_preflight_predicate_agrees_with_the_check_for_every_disposition() {
+    use desktop_assistant_core::domain::knowledge::Disposition;
+
+    for (migration_name, migration_sql) in [("056", MIGRATION_056), ("061", MIGRATION_061)] {
+        let Some(fx) =
+            support::DbFixture::try_new(&format!("mig{migration_name}_preflight_agrees")).await
+        else {
+            eprintln!("skip: TEST_DATABASE_URL not set");
+            return;
+        };
+
+        let check_expr = superseded_by_check_expression(migration_sql);
+        let predicate = preflight_predicate(migration_sql);
+
+        for disposition in Disposition::ALL {
+            // Install this migration's own CHECK text, so the oracle below
+            // reflects that file's declaration specifically, rather than
+            // whichever migration's copy happens to survive last on a fresh
+            // database.
+            sqlx::query(
+                "ALTER TABLE knowledge_base \
+                     DROP CONSTRAINT IF EXISTS knowledge_base_superseded_by_chk",
+            )
+            .execute(&fx.pool)
+            .await
+            .expect("drop the constraint to install this migration's own text");
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "ALTER TABLE knowledge_base \
+                     ADD CONSTRAINT knowledge_base_superseded_by_chk CHECK ({check_expr})"
+            )))
+            .execute(&fx.pool)
+            .await
+            .expect("install this migration's own CHECK expression");
+
+            let id = format!("chk-{migration_name}-{}", disposition.as_str());
+            let insert = sqlx::query(
+                "INSERT INTO knowledge_base (id, user_id, content, disposition, superseded_by) \
+                 VALUES ($1, 'u1', 'x', $2, NULL)",
+            )
+            .bind(&id)
+            .bind(disposition.as_str())
+            .execute(&fx.pool)
+            .await;
+            let check_refuses = insert.is_err();
+            if insert.is_ok() {
+                sqlx::query("DELETE FROM knowledge_base WHERE id = $1")
+                    .bind(&id)
+                    .execute(&fx.pool)
+                    .await
+                    .expect("clean up the row the CHECK permitted");
+            }
+
+            // Drop the constraint so a row shaped exactly the way the CHECK
+            // would refuse can still be written, for the pre-flight
+            // predicate to examine on its own terms.
+            sqlx::query(
+                "ALTER TABLE knowledge_base \
+                     DROP CONSTRAINT IF EXISTS knowledge_base_superseded_by_chk",
+            )
+            .execute(&fx.pool)
+            .await
+            .expect("drop the constraint to seed a possibly-violating row");
+
+            let pre_id = format!("pre-{migration_name}-{}", disposition.as_str());
+            sqlx::query(
+                "INSERT INTO knowledge_base (id, user_id, content, disposition, superseded_by) \
+                 VALUES ($1, 'u1', 'x', $2, NULL)",
+            )
+            .bind(&pre_id)
+            .bind(disposition.as_str())
+            .execute(&fx.pool)
+            .await
+            .expect("seed the row for the pre-flight predicate to examine");
+
+            let flagged: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT count(*) FROM knowledge_base WHERE id = $1 AND ({predicate})"
+            )))
+            .bind(&pre_id)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("run the extracted pre-flight predicate");
+            let preflight_flags = flagged.0 > 0;
+
+            sqlx::query("DELETE FROM knowledge_base WHERE id = $1")
+                .bind(&pre_id)
+                .execute(&fx.pool)
+                .await
+                .expect("clean up the seeded row");
+
+            assert_eq!(
+                check_refuses, preflight_flags,
+                "migration {migration_name}, disposition {disposition:?} with no \
+                 successor: the pre-flight predicate and the CHECK constraint must \
+                 agree on whether this row is refused"
+            );
+        }
+
+        fx.cleanup().await;
+    }
+}
