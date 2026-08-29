@@ -22,19 +22,25 @@
 --   disposition_reason   The model's or the person's stated reason. Renamed
 --                        from `deleted_reason`.
 --   superseded_by        Unchanged: the id of the row that replaced this one.
---                        Required exactly when disposition is 'superseded' or
---                        'redundant'.
+--                        Required when disposition is 'superseded' or
+--                        'redundant'; a 'refuted' entry names one too, per
+--                        the consolidation contract. Not required for any
+--                        other disposition.
 --
 -- Old data is backfilled rather than left to default, because a live row and
 -- a tombstone written before this migration both read `disposition` as NULL
 -- once the rename lands, and NULL cannot satisfy the NOT NULL this migration
 -- adds:
 --
---   * A merge tombstone (`deleted_kind = 'merge'`) already names its
---     successor in `superseded_by`, so it maps to 'superseded'.
+--   * A merge tombstone (`deleted_kind = 'merge'`) that still names its
+--     successor in `superseded_by` maps to 'superseded'. One with no
+--     successor id maps to 'active' instead, the same as a tombstone that
+--     never recorded a kind -- 'superseded' asserts a link the row does
+--     not have.
 --   * A prune tombstone (`deleted_kind = 'prune'`) was judged not worth
 --     keeping at all, which is what 'trivial' means; the model's stated
---     reason survives unchanged in `disposition_reason`.
+--     reason survives unchanged in `disposition_reason`, and any
+--     `superseded_by` the row happens to carry survives with it.
 --   * Everything else reading NULL -- every live row, and a tombstone written
 --     before migration 038 ever recorded a kind -- maps to 'active', the
 --     column's own default. For a pre-038 tombstone this records that no
@@ -117,9 +123,30 @@ ALTER TABLE knowledge_base DROP CONSTRAINT IF EXISTS knowledge_base_deleted_kind
 
 -- Backfill. Each statement matches nothing on a replay, once the first run
 -- has already rewritten every value it targets.
-UPDATE knowledge_base SET disposition = 'superseded' WHERE disposition = 'merge';
-UPDATE knowledge_base SET disposition = 'trivial'    WHERE disposition = 'prune';
-UPDATE knowledge_base SET disposition = 'active'      WHERE disposition IS NULL;
+--
+-- A prune tombstone that also carries a `superseded_by` keeps both: the
+-- disposition still records the judgement that the content was not worth
+-- keeping ('trivial'), the link still records where the replacement went,
+-- and `disposition_reason` still holds the model's stated reason. Nothing
+-- about the row is guessed at or discarded.
+--
+-- A merge tombstone with no successor id cannot become 'superseded': that
+-- disposition asserts a link the row does not have, and the constraint
+-- added below refuses it. Such a row becomes 'active' instead, the same
+-- outcome a tombstone with no recorded kind gets. It stays a tombstone --
+-- `deleted_at` is untouched -- restorable individually through the existing
+-- restore path, the same way migration 058 leaves prune tombstones.
+-- Migration 058's arm 2 will not revive a row backfilled this way: 058
+-- describes arm 2 as the case where the successor id names a row that was
+-- hard-reaped, not the case where no successor was ever recorded, so this
+-- backfill narrows 058 to the shape its own documentation already
+-- describes rather than widening what 058 has to handle.
+UPDATE knowledge_base SET disposition = 'superseded'
+    WHERE disposition = 'merge' AND superseded_by IS NOT NULL;
+UPDATE knowledge_base SET disposition = 'active'
+    WHERE disposition = 'merge';
+UPDATE knowledge_base SET disposition = 'trivial' WHERE disposition = 'prune';
+UPDATE knowledge_base SET disposition = 'active'  WHERE disposition IS NULL;
 
 ALTER TABLE knowledge_base
     ALTER COLUMN disposition SET DEFAULT 'active',
@@ -142,10 +169,35 @@ BEGIN
     END IF;
 END $$;
 
--- A successor id is meaningful for exactly the two dispositions that resolve
--- through it, and only those two: an entry cannot be 'superseded' or
--- 'redundant' without naming what replaced it, and no other disposition names
--- anything.
+-- 'superseded' and 'redundant' resolve through the link, so they must name
+-- one: an entry cannot carry either disposition without saying what
+-- replaced it. Nothing requires that they are the only dispositions that
+-- may -- a 'refuted' entry naming its successor is exactly what the
+-- consolidation contract (see the "Rules the store enforces" section of
+-- the dreaming prompt, and the write path in
+-- `crates/storage/src/dreaming/consolidation.rs`) asks the model to
+-- produce, and the constraint below does not stand in its way.
+--
+-- A count-and-raise runs first so a row that would fail this constraint is
+-- diagnosed by name and count, rather than surfacing at ADD CONSTRAINT time
+-- as Postgres's own "is violated by some row", which names neither.
+DO $$
+DECLARE
+    offending_count bigint;
+BEGIN
+    SELECT count(*) INTO offending_count
+    FROM knowledge_base
+    WHERE disposition IN ('superseded', 'redundant') AND superseded_by IS NULL;
+
+    IF offending_count > 0 THEN
+        RAISE EXCEPTION
+            'migration 056: % row(s) would violate knowledge_base_superseded_by_chk '
+            '(disposition superseded or redundant with no superseded_by). '
+            'Give each such row a successor, or change its disposition to one '
+            'that does not require one.', offending_count;
+    END IF;
+END $$;
+
 DO $$
 BEGIN
     IF NOT EXISTS (
@@ -155,7 +207,7 @@ BEGIN
     ) THEN
         ALTER TABLE knowledge_base
             ADD CONSTRAINT knowledge_base_superseded_by_chk
-            CHECK ((disposition IN ('superseded', 'redundant')) = (superseded_by IS NOT NULL));
+            CHECK (disposition NOT IN ('superseded', 'redundant') OR superseded_by IS NOT NULL);
     END IF;
 END $$;
 

@@ -261,7 +261,7 @@ async fn disposition_check_rejects_an_unknown_value() {
 }
 
 #[tokio::test]
-async fn superseded_without_a_successor_is_rejected_by_the_schema() {
+async fn the_constraint_still_refuses_superseded_without_a_successor() {
     let Some(fx) = support::DbFixture::try_new("mig056_no_successor").await else {
         eprintln!("skip: TEST_DATABASE_URL not set");
         return;
@@ -283,7 +283,7 @@ async fn superseded_without_a_successor_is_rejected_by_the_schema() {
 }
 
 #[tokio::test]
-async fn redundant_without_a_successor_is_rejected_by_the_schema() {
+async fn the_constraint_still_refuses_redundant_without_a_successor() {
     // The same constraint covers both dispositions that resolve through a
     // link; this is the sibling case to the test above, not a repeat of it.
     let Some(fx) = support::DbFixture::try_new("mig056_redundant_no_successor").await else {
@@ -307,25 +307,160 @@ async fn redundant_without_a_successor_is_rejected_by_the_schema() {
 }
 
 #[tokio::test]
-async fn an_active_row_may_not_name_a_successor() {
-    // The constraint is an equivalence, not a one-way implication: a
-    // successor link on a row that is not superseded or redundant is just as
-    // much a lie as a superseded row with no link.
-    let Some(fx) = support::DbFixture::try_new("mig056_active_with_successor").await else {
+async fn the_constraint_permits_a_refuted_entry_naming_its_successor() {
+    // The constraint is a one-way implication, not an equivalence: a
+    // disposition other than superseded/redundant is free to name a
+    // successor too. 'refuted' is exactly the case the consolidation
+    // contract asks the model to produce (see the "Rules the store
+    // enforces" section of the dreaming prompt).
+    let Some(fx) = support::DbFixture::try_new("mig056_refuted_with_successor").await else {
         eprintln!("skip: TEST_DATABASE_URL not set");
         return;
     };
 
-    let err = sqlx::query(
-        "INSERT INTO knowledge_base (id, user_id, content, disposition, superseded_by) \
-         VALUES ('kb-a', 'u1', 'x', 'active', 'kb-b')",
+    sqlx::query(
+        "INSERT INTO knowledge_base (id, user_id, content, disposition) \
+         VALUES ('kb-successor', 'u1', 'the corrected fact', 'active')",
     )
     .execute(&fx.pool)
     .await
-    .expect_err("an active row naming a successor must be refused");
+    .expect("seed the successor row");
+
+    sqlx::query(
+        "INSERT INTO knowledge_base (id, user_id, content, disposition, superseded_by) \
+         VALUES ('kb-refuted', 'u1', 'the wrong fact', 'refuted', 'kb-successor')",
+    )
+    .execute(&fx.pool)
+    .await
+    .expect("a refuted row naming its successor must be permitted");
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn the_backfill_preserves_a_successor_link_whatever_the_tombstone_kind() {
+    // A prune tombstone (kind 'prune') is not one of the two kinds the old
+    // backfill ever mapped to 'superseded', but a superseded_by id on such a
+    // row is still real data, not noise: it must survive the backfill
+    // untouched, whatever disposition the kind maps to. The same holds for a
+    // tombstone with no recorded kind at all.
+    let Some(fx) = support::DbFixture::try_new("mig056_link_survives_kind").await else {
+        eprintln!("skip: TEST_DATABASE_URL not set");
+        return;
+    };
+    rollback_to_pre_056(&fx.pool).await;
+
+    sqlx::query(
+        "INSERT INTO knowledge_base (id, user_id, content, deleted_at) \
+         VALUES ('kb-successor', 'u1', 'the row that absorbed it', NOW())",
+    )
+    .execute(&fx.pool)
+    .await
+    .expect("seed a successor row");
+    insert_row(
+        &fx.pool,
+        "kb-pruned-linked",
+        "u1",
+        "a fact judged not worth keeping, but linked anyway",
+        Tombstone {
+            days_ago: Some(1),
+            kind: Some("prune"),
+            reason: Some("mattered only in the moment"),
+            superseded_by: Some("kb-successor"),
+        },
+    )
+    .await;
+    insert_row(
+        &fx.pool,
+        "kb-unkinded-linked",
+        "u1",
+        "a tombstone from before deleted_kind ever recorded anything",
+        Tombstone {
+            days_ago: Some(1),
+            superseded_by: Some("kb-successor"),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    run_migrations(&fx.pool)
+        .await
+        .expect("migration 056 replays");
+
+    assert_eq!(
+        disposition(&fx.pool, "kb-pruned-linked").await,
+        "trivial",
+        "the prune kind still maps to trivial"
+    );
+    assert_eq!(
+        superseded_by(&fx.pool, "kb-pruned-linked").await.as_deref(),
+        Some("kb-successor"),
+        "a prune tombstone's successor link must survive the backfill"
+    );
+    assert_eq!(
+        disposition(&fx.pool, "kb-unkinded-linked").await,
+        "active",
+        "a kindless tombstone still maps to active"
+    );
+    assert_eq!(
+        superseded_by(&fx.pool, "kb-unkinded-linked")
+            .await
+            .as_deref(),
+        Some("kb-successor"),
+        "a kindless tombstone's successor link must survive the backfill too"
+    );
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_row_that_would_violate_the_constraint_fails_the_migration_by_name() {
+    // A merge tombstone with no successor id backfills to 'active', which
+    // this migration's own logic guarantees never violates the constraint
+    // it adds. To exercise the pre-flight diagnostic itself, this test
+    // instead puts a row directly into the one shape the diagnostic exists
+    // to catch -- disposition already 'superseded' with no superseded_by --
+    // by writing it while the guarding constraints are absent, standing in
+    // for however such a row might reach this shape (hand-edited data, or a
+    // future change to the backfill that stops preserving the invariant).
+    let Some(fx) = support::DbFixture::try_new("mig056_preflight_fires").await else {
+        eprintln!("skip: TEST_DATABASE_URL not set");
+        return;
+    };
+
+    sqlx::query(
+        "ALTER TABLE knowledge_base \
+             DROP CONSTRAINT IF EXISTS knowledge_base_disposition_chk, \
+             DROP CONSTRAINT IF EXISTS knowledge_base_superseded_by_chk",
+    )
+    .execute(&fx.pool)
+    .await
+    .expect("drop migration 056's constraints so a violating row can be written");
+
+    sqlx::query(
+        "INSERT INTO knowledge_base (id, user_id, content, disposition, superseded_by) \
+         VALUES ('kb-violator', 'u1', 'x', 'superseded', NULL)",
+    )
+    .execute(&fx.pool)
+    .await
+    .expect("seed a row shaped to violate the constraint once it is re-added");
+
+    sqlx::query("DELETE FROM schema_migrations WHERE name = '056_kb_disposition.sql'")
+        .execute(&fx.pool)
+        .await
+        .expect("unrecord migration 056 so it replays");
+
+    let err = run_migrations(&fx.pool)
+        .await
+        .expect_err("a violating row must fail the migration rather than silently pass");
+    let message = err.to_string();
     assert!(
-        err.to_string().contains("knowledge_base_superseded_by_chk"),
-        "the refusal should name the constraint that fired: {err}"
+        message.contains("knowledge_base_superseded_by_chk"),
+        "the failure should name the constraint that would be violated: {message}"
+    );
+    assert!(
+        message.contains('1'),
+        "the failure should name the offending row count: {message}"
     );
 
     fx.cleanup().await;

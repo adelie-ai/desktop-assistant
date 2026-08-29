@@ -265,6 +265,10 @@ const MIGRATIONS: &[Migration] = &[
     // rankings of the same substrate instead of two rankings of a corpus
     // that moved underneath them.
     migration!("060_recall_snapshots.sql"),
+    // #1345: converge a store that already applied 056's old, tighter
+    // `knowledge_base_superseded_by_chk` (a biconditional) onto the
+    // corrected forward implication a fresh 056 now installs directly.
+    migration!("061_superseded_by_constraint_widening.sql"),
 ];
 
 /// Second half of the advisory-lock key: the schema the migrations write to.
