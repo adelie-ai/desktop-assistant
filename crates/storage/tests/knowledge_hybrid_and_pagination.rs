@@ -153,7 +153,7 @@ async fn set_embedding(pool: &PgPool, id: &str, chunks: Vec<Vec<f32>>) {
 /// successor) directly, the same way `set_embedding` stamps a vector: no
 /// store method sets a disposition yet (that lands with a later unit), so
 /// tests reach the column the way the schema itself requires it be written -
-/// `superseded_by` set exactly when the disposition needs one, per
+/// `superseded_by` set at least when the disposition needs one, per
 /// `knowledge_base_superseded_by_chk`.
 async fn set_disposition(pool: &PgPool, id: &str, disposition: &str, superseded_by: Option<&str>) {
     sqlx::query("UPDATE knowledge_base SET disposition = $1, superseded_by = $2 WHERE id = $3")
