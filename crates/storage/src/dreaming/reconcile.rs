@@ -541,10 +541,13 @@ pub async fn apply_ops(
             }
         }
 
-        // The schema's own CHECK constraint requires `superseded_by` exactly
-        // when the disposition is `superseded` or `redundant`, and forbids it
-        // otherwise. A `refuted` op may still have named a target - read
-        // above for the scope guard - but it is not stored.
+        // The schema's CHECK constraint requires `superseded_by` for
+        // `superseded` and `redundant`, because those two dispositions
+        // resolve through the link. It does not restrict which other
+        // disposition may carry a successor id; no read path needs that
+        // restriction. A `refuted` op may still name a target - read above
+        // for the scope guard - but this path does not store it. Issue
+        // #1346 tracks storing a refuted row's successor.
         let stored_target = match disposition {
             Disposition::Superseded | Disposition::Redundant => superseded_by.as_deref(),
             _ => None,

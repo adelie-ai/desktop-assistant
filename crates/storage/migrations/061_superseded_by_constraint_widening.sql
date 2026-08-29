@@ -4,11 +4,12 @@
 -- 056 originally pinned the successor link with a biconditional: a
 -- disposition of 'superseded' or 'redundant' required a `superseded_by`,
 -- AND no other disposition was allowed to name one. The second half
--- contradicts the consolidation contract, which has a 'refuted'
--- disposition name its successor too (see the "Rules the store enforces"
--- section of the dreaming prompt, and the write path in
--- `crates/storage/src/dreaming/consolidation.rs`). 056 has since been
--- corrected in place to add only the forward implication:
+-- refused rows that carry real information: a prune tombstone that also
+-- names a successor is one such row, it occurs in practice, and
+-- ADD CONSTRAINT on it aborts the migration and blocks daemon boot. No
+-- read path depends on forbidding a successor id on any other
+-- disposition. 056 has since been corrected in place to add only the
+-- forward implication:
 --
 --   CHECK (disposition NOT IN ('superseded', 'redundant') OR superseded_by IS NOT NULL)
 --

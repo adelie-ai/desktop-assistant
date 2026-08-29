@@ -23,9 +23,9 @@
 --                        from `deleted_reason`.
 --   superseded_by        Unchanged: the id of the row that replaced this one.
 --                        Required when disposition is 'superseded' or
---                        'redundant'; a 'refuted' entry names one too, per
---                        the consolidation contract. Not required for any
---                        other disposition.
+--                        'redundant'. Not required for any other
+--                        disposition, and not forbidden for one either;
+--                        see #1346 for a 'refuted' entry naming one.
 --
 -- Old data is backfilled rather than left to default, because a live row and
 -- a tombstone written before this migration both read `disposition` as NULL
@@ -172,11 +172,11 @@ END $$;
 -- 'superseded' and 'redundant' resolve through the link, so they must name
 -- one: an entry cannot carry either disposition without saying what
 -- replaced it. Nothing requires that they are the only dispositions that
--- may -- a 'refuted' entry naming its successor is exactly what the
--- consolidation contract (see the "Rules the store enforces" section of
--- the dreaming prompt, and the write path in
--- `crates/storage/src/dreaming/consolidation.rs`) asks the model to
--- produce, and the constraint below does not stand in its way.
+-- may: no read path depends on forbidding a successor id on any other
+-- disposition, and the reverse rule refused rows that carry real
+-- information, such as a prune tombstone that also names a successor.
+-- Issue #1346 tracks having a 'refuted' entry store its successor too;
+-- this constraint does not stand in the way of that.
 --
 -- A count-and-raise runs first so a row that would fail this constraint is
 -- diagnosed by name and count, rather than surfacing at ADD CONSTRAINT time
