@@ -1606,6 +1606,87 @@ async fn dispositioned_entries_are_excluded_from_the_consolidation_prompt() {
     fx.cleanup().await;
 }
 
+/// Acceptance (#712 item 1): a run whose only outcome is refusals reports its
+/// counts at info level, so it never reads as a quiet "no changes" night.
+///
+/// The level is pinned from both sides rather than claimed by the test name: at
+/// INFO the line is present, at WARN it is absent. A refusal is the guard
+/// working, which an operator must be able to see, and is not a fault, which a
+/// warning would say it was.
+#[tokio::test]
+async fn a_run_whose_only_outcome_is_refusals_reports_its_counts_at_info() {
+    let Some(fx) = support::DbFixture::try_new("dream712").await else {
+        return;
+    };
+    let pool = &fx.pool;
+
+    seed_kb_sourced(
+        pool,
+        "u1",
+        "kb-a",
+        "a fact the user entered",
+        SOURCE_EXPLICIT,
+    )
+    .await;
+
+    // The one proposal the run makes is the one disposition an explicit entry
+    // may never receive, so the run applies nothing and refuses once.
+    let plan =
+        r#"{"operations":[{"op":"disposition","id":"kb-a","as":"trivial","reason":"trivial"}]}"#;
+
+    let (stats, at_info) = support::capture_tracing_at(tracing::Level::INFO, || async {
+        run_consolidation_scan(
+            pool,
+            &llm_returning(plan),
+            KnowledgeDeletePolicy::default(),
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("consolidation scan succeeds")
+    })
+    .await;
+
+    assert_eq!(
+        stats.explicit_guard_refusals, 1,
+        "the run's only outcome is the one refusal"
+    );
+    assert_eq!(
+        stats.dispositioned + stats.updated + stats.merged_clusters + stats.scope_added,
+        0,
+        "nothing was applied, which is what makes this run look like a quiet one"
+    );
+    assert!(
+        at_info.contains("every proposal was refused"),
+        "the run must say what it was: {at_info}"
+    );
+    assert!(
+        at_info.contains("1 explicit-entry"),
+        "the counts must be named, not just their presence: {at_info}"
+    );
+
+    // The entry is untouched, so the same plan produces the same refusal.
+    let (_, at_warn) = support::capture_tracing_at(tracing::Level::WARN, || async {
+        run_consolidation_scan(
+            pool,
+            &llm_returning(plan),
+            KnowledgeDeletePolicy::default(),
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("consolidation scan succeeds")
+    })
+    .await;
+
+    assert!(
+        !at_warn.contains("every proposal was refused"),
+        "a guard doing its job is a normal outcome and must not be raised as a fault: {at_warn}"
+    );
+
+    fx.cleanup().await;
+}
+
 /// Acceptance (#712 item 3): the disposition budget is computed AFTER
 /// clustering. An id a merge already absorbs is excluded from the count
 /// before the cap is applied, so it does not spend the budget a genuinely

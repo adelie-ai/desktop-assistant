@@ -21,11 +21,12 @@ use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::{Message, Role};
 use desktop_assistant_core::ports::auth::UserId;
 use desktop_assistant_core::ports::embedding::EmbeddingClient;
-use desktop_assistant_core::ports::inbound::KnowledgeMaintenanceService;
+use desktop_assistant_core::ports::inbound::{ConsolidationOutcome, KnowledgeMaintenanceService};
 use desktop_assistant_core::ports::llm::{LlmClient, ReasoningConfig, with_cancellation_token};
 use desktop_assistant_storage::PgPool;
 use desktop_assistant_storage::dreaming::{
-    BackfillEmbedFn, DreamingLlmFn, KnowledgeChangeFn, run_consolidation_scan, run_dreaming_scan,
+    BackfillEmbedFn, ConsolidationStats, DreamingLlmFn, KnowledgeChangeFn, run_consolidation_scan,
+    run_dreaming_scan,
 };
 use desktop_assistant_storage::embedding_backfill::{
     backfill_knowledge_embeddings, invalidate_all_knowledge_embeddings,
@@ -175,7 +176,10 @@ impl KnowledgeMaintenanceService for DaemonKnowledgeMaintenanceService {
         .await
     }
 
-    async fn run_consolidation(&self, cancellation: CancellationToken) -> Result<usize, CoreError> {
+    async fn run_consolidation(
+        &self,
+        cancellation: CancellationToken,
+    ) -> Result<ConsolidationOutcome, CoreError> {
         let _guard = self
             .consolidation_lock
             .try_lock()
@@ -193,9 +197,9 @@ impl KnowledgeMaintenanceService for DaemonKnowledgeMaintenanceService {
             Some(&self.on_change),
         )
         .await?;
-        // Collapse the per-op-kind stats into a single "changes" count for the
-        // task log; the live panel refresh is driven by `on_change` per user.
-        Ok(stats.updated + stats.merged_clusters + stats.dispositioned + stats.scope_added)
+        // The live panel refresh is driven by `on_change` per user; what
+        // travels back here is what the task log states about the pass.
+        Ok(consolidation_outcome(&stats))
     }
 
     async fn recalculate_embeddings(
@@ -220,6 +224,23 @@ impl KnowledgeMaintenanceService for DaemonKnowledgeMaintenanceService {
         backfill_knowledge_embeddings(&self.pool, &embed_fn, &self.embedding_model, &cancellation)
             .await
             .map_err(CoreError::Storage)
+    }
+}
+
+/// Read one run's per-op-kind counters as the outcome the maintenance task
+/// reports.
+///
+/// Pure, and separate from the pass itself, because the distinction it draws
+/// is the whole point of it: a run that proposed nothing and a run whose every
+/// proposal was refused both apply zero changes, so a task log fed only the
+/// change count reads the same for both. The refusal count and its
+/// description travel with the change count so the two runs are told apart.
+fn consolidation_outcome(stats: &ConsolidationStats) -> ConsolidationOutcome {
+    let refusals = stats.refusal_count();
+    ConsolidationOutcome {
+        changes: stats.applied_count(),
+        refusals,
+        refusal_detail: (refusals > 0).then(|| stats.describe_refusals()),
     }
 }
 
@@ -311,5 +332,62 @@ mod tests {
             err.contains("timed out"),
             "expected a timeout error, got: {err}"
         );
+    }
+
+    /// Acceptance (#712 item 1): the outcome the maintenance task reports
+    /// tells a run that proposed nothing from a run whose every proposal was
+    /// refused. Both applied zero changes, so the change count on its own
+    /// cannot be what separates them.
+    #[test]
+    fn the_maintenance_task_distinguishes_nothing_proposed_from_everything_refused() {
+        let quiet = consolidation_outcome(&ConsolidationStats::default());
+        let refused = consolidation_outcome(&ConsolidationStats {
+            reviewed: 4,
+            explicit_guard_refusals: 3,
+            ..ConsolidationStats::default()
+        });
+
+        assert_eq!(
+            quiet.changes, refused.changes,
+            "both runs changed nothing, so the count alone cannot tell them apart"
+        );
+        assert_ne!(
+            quiet, refused,
+            "the two runs must not be reported the same way"
+        );
+        assert_eq!(refused.refusals, 3, "the refusals are carried, not dropped");
+        let detail = refused
+            .refusal_detail
+            .expect("a run that refused something says what it refused");
+        assert!(
+            detail.contains("3 explicit-entry"),
+            "the counts must be named, not just their presence: {detail}"
+        );
+        assert!(
+            quiet.refusal_detail.is_none(),
+            "a run with nothing to report adds nothing to its count"
+        );
+    }
+
+    /// The reported change count is every kind of applied change, so a run
+    /// that only added scope, or only merged, is not reported as a quiet one.
+    #[test]
+    fn the_reported_change_count_carries_every_kind_of_applied_change() {
+        let each: [fn(&mut ConsolidationStats); 4] = [
+            |s| s.updated = 1,
+            |s| s.merged_clusters = 1,
+            |s| s.dispositioned = 1,
+            |s| s.scope_added = 1,
+        ];
+        for set in each {
+            let mut stats = ConsolidationStats::default();
+            set(&mut stats);
+            let outcome = consolidation_outcome(&stats);
+            assert_eq!(
+                outcome.changes, 1,
+                "stats {stats:?} applied a change and must be counted as one"
+            );
+            assert_eq!(outcome.refusals, 0);
+        }
     }
 }

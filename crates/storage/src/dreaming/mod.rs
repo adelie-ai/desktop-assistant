@@ -214,7 +214,7 @@ pub async fn run_consolidation_scan(
             "consolidation: reviewed {} entr{}, changed nothing - every proposal was refused: {}",
             stats.reviewed,
             if stats.reviewed == 1 { "y" } else { "ies" },
-            describe_refusals(&stats),
+            stats.describe_refusals(),
         ),
         ConsolidationReport::Unreadable => {
             // A run that changed nothing because it could not read what the
@@ -259,47 +259,16 @@ enum ConsolidationReport {
     NoOp,
 }
 
-/// Sum of the counters that mean "at least one row changed".
-fn applied_count(stats: &ConsolidationStats) -> usize {
-    stats.merged_clusters + stats.updated + stats.dispositioned + stats.scope_added
-}
-
-/// Sum of the counters that mean "a proposal was understood and refused" -
-/// every guard, budget, and backstop this unit adds.
-fn refusal_count(stats: &ConsolidationStats) -> usize {
-    stats.explicit_guard_refusals
-        + stats.settled_unchanged
-        + stats.scope_guard_refusals
-        + stats.backstop_firings
-        + stats.dispositions_over_cap
-        + stats.rewrites_over_cap
-}
-
 fn report_for(stats: &ConsolidationStats) -> ConsolidationReport {
-    if applied_count(stats) > 0 {
+    if stats.applied_count() > 0 {
         ConsolidationReport::Applied
-    } else if refusal_count(stats) > 0 {
+    } else if stats.refusal_count() > 0 {
         ConsolidationReport::RefusalsOnly
     } else if stats.dropped_operations > 0 {
         ConsolidationReport::Unreadable
     } else {
         ConsolidationReport::NoOp
     }
-}
-
-/// One line naming every refusal counter this unit adds, for the
-/// [`ConsolidationReport::RefusalsOnly`] log line.
-fn describe_refusals(stats: &ConsolidationStats) -> String {
-    format!(
-        "{} explicit-entry, {} settled-entry, {} scope-guard, {} backstop, {} over the \
-         disposition share, {} over the rewrite share",
-        stats.explicit_guard_refusals,
-        stats.settled_unchanged,
-        stats.scope_guard_refusals,
-        stats.backstop_firings,
-        stats.dispositions_over_cap,
-        stats.rewrites_over_cap,
-    )
 }
 
 #[cfg(test)]
@@ -326,10 +295,12 @@ mod tests {
         assert_eq!(report_for(&stats), ConsolidationReport::Applied);
     }
 
-    /// #712 item 1, named: a run whose only outcome is refusals must not read
-    /// as "no changes" - it must be its own, distinct report.
+    /// A run whose only outcome is refusals is its own report, and its
+    /// description names the counts. What level that report is logged at is
+    /// not decided here, so this name does not claim it: the level is proved
+    /// through the real entry point in `dreaming_db_paths`.
     #[test]
-    fn a_refusal_only_run_logs_at_info_with_the_counts() {
+    fn a_refusal_only_run_is_its_own_report_and_names_the_counts() {
         let stats = stats_with(|s| {
             s.reviewed = 3;
             s.settled_unchanged = 1;
@@ -340,7 +311,7 @@ mod tests {
             ConsolidationReport::RefusalsOnly,
             "a run with a refusal and no applied change is its own report, not a no-op"
         );
-        let description = describe_refusals(&stats);
+        let description = stats.describe_refusals();
         assert!(
             description.contains("1 settled-entry"),
             "the counts must actually be named, not just their presence: {description}"
