@@ -131,6 +131,14 @@ async fn superseded_by(pool: &PgPool, id: &str) -> Option<String> {
         .expect("read superseded_by")
 }
 
+async fn is_tombstoned(pool: &PgPool, id: &str) -> bool {
+    sqlx::query_scalar::<_, bool>("SELECT deleted_at IS NOT NULL FROM knowledge_base WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("read deleted_at")
+}
+
 #[tokio::test]
 async fn migration_056_maps_merge_tombstones_to_superseded() {
     let Some(fx) = support::DbFixture::try_new("mig056_merge").await else {
@@ -165,6 +173,49 @@ async fn migration_056_maps_merge_tombstones_to_superseded() {
         superseded_by(&fx.pool, "kb-merge-member").await.as_deref(),
         Some("kb-canonical"),
         "the merge's successor link is carried forward unchanged"
+    );
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
+async fn migration_056_backfills_a_merge_tombstone_with_no_successor_to_active() {
+    // A merge tombstone whose successor id was never recorded cannot become
+    // 'superseded': that disposition asserts a link the row does not have,
+    // and the constraint the migration adds refuses it. This exercises the
+    // backfill's second merge arm, which nothing else in this suite seeds -
+    // every other merge fixture carries a successor id and only ever
+    // reaches the first arm.
+    let Some(fx) = support::DbFixture::try_new("mig056_merge_no_successor").await else {
+        eprintln!("skip: TEST_DATABASE_URL not set");
+        return;
+    };
+    rollback_to_pre_056(&fx.pool).await;
+    insert_row(
+        &fx.pool,
+        "kb-merge-orphan",
+        "u1",
+        "a near-duplicate fact whose successor was never recorded",
+        Tombstone {
+            days_ago: Some(1),
+            kind: Some("merge"),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    run_migrations(&fx.pool)
+        .await
+        .expect("migration 056 replays");
+
+    assert_eq!(
+        disposition(&fx.pool, "kb-merge-orphan").await,
+        "active",
+        "a merge tombstone with no successor id must not become superseded"
+    );
+    assert!(
+        is_tombstoned(&fx.pool, "kb-merge-orphan").await,
+        "the backfill must not touch deleted_at - the row stays in the trash"
     );
 
     fx.cleanup().await;
