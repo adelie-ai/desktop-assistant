@@ -300,11 +300,11 @@ async fn restore_clears_the_delete_provenance_columns() {
     .await;
     // A merge tombstone under migration 056's mapping: disposition
     // 'redundant' (or 'superseded'), a stated reason, and a successor id -
-    // the schema's own `knowledge_base_superseded_by_chk` requires exactly
-    // this pairing, so this is the shape a real merge tombstone has. It
-    // covers the case with the most to lose: restore must clear the
-    // successor link along with the disposition and the reason, not only the
-    // simpler prune shape (disposition alone, no successor).
+    // the schema's own `knowledge_base_superseded_by_chk` requires a
+    // successor for this disposition, so this is the shape a real merge
+    // tombstone has. It covers the case with the most to lose: restore must
+    // clear the successor link along with the disposition and the reason,
+    // not only the simpler prune shape (disposition alone, no successor).
     tombstone(
         pool,
         "merged-away",
@@ -358,6 +358,98 @@ async fn restore_clears_the_delete_provenance_columns() {
 }
 
 #[tokio::test]
+async fn restoring_an_entry_keeps_a_successor_link_that_does_not_resolve_through_it() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    let pool = &fx.pool;
+    let store = PgKnowledgeBaseStore::new(pool.clone(), KnowledgeDeletePolicy::default());
+
+    write_entry(
+        &store,
+        ALICE,
+        "kept-link",
+        "circumstantial detail, but linked anyway",
+    )
+    .await;
+    // A `trivial` tombstone naming a successor - the shape migration 056
+    // deliberately preserves (a prune tombstone that also names a
+    // successor). `knowledge_base_superseded_by_chk` permits this: it is a
+    // one-way implication, not a biconditional (#1345), so a disposition
+    // other than `superseded`/`redundant` is free to carry a link too.
+    // `trivial` does not resolve through the link the way those two do, so
+    // restore has no reason to touch it.
+    tombstone(
+        pool,
+        "kept-link",
+        "trivial",
+        Some("mattered only in the moment"),
+        Some("some-other-row-id"),
+    )
+    .await;
+
+    write_entry(
+        &store,
+        ALICE,
+        "cleared-link",
+        "absorbed into a merge synthesis",
+    )
+    .await;
+    // A `superseded` tombstone naming its successor - the pairing the
+    // constraint requires for this disposition. `superseded` resolves
+    // through the link, so restore must still clear it.
+    tombstone(
+        pool,
+        "cleared-link",
+        "superseded",
+        Some("absorbed into a merge synthesis"),
+        Some("some-other-row-id"),
+    )
+    .await;
+
+    with_user_id(UserId::new(ALICE), async {
+        assert_eq!(
+            restore_entry(pool, "kept-link")
+                .await
+                .expect("restore succeeds"),
+            RestoreOutcome::Restored
+        );
+        assert_eq!(
+            restore_entry(pool, "cleared-link")
+                .await
+                .expect("restore succeeds"),
+            RestoreOutcome::Restored
+        );
+    })
+    .await;
+
+    let kept: Option<String> =
+        sqlx::query_scalar("SELECT superseded_by FROM knowledge_base WHERE id = $1")
+            .bind("kept-link")
+            .fetch_one(pool)
+            .await
+            .expect("read restored row");
+    assert_eq!(
+        kept.as_deref(),
+        Some("some-other-row-id"),
+        "a link that does not resolve through the reset disposition must survive restore"
+    );
+
+    let cleared: Option<String> =
+        sqlx::query_scalar("SELECT superseded_by FROM knowledge_base WHERE id = $1")
+            .bind("cleared-link")
+            .fetch_one(pool)
+            .await
+            .expect("read restored row");
+    assert_eq!(
+        cleared, None,
+        "a link that resolves through the reset disposition must still be cleared"
+    );
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
 async fn restoring_a_refuted_entry_keeps_the_refutation() {
     let Some(fx) = fixture().await else {
         return;
@@ -369,9 +461,10 @@ async fn restoring_a_refuted_entry_keeps_the_refutation() {
     // A non-person soft delete only ever touches `deleted_at`
     // (`hard_delete_knowledge`'s `soft_delete_ids` path), so a `refuted`
     // entry can land in the trash with its refutation fully intact - this is
-    // exactly that shape. `refuted` never carries a `superseded_by` (the
-    // schema forbids it), so this only ever tests the disposition and its
-    // reason.
+    // exactly that shape. This tombstone names no successor, so it only
+    // exercises the disposition and its reason; a `refuted` entry naming a
+    // successor is permitted by the schema and covered separately by
+    // `the_constraint_permits_a_refuted_entry_naming_its_successor`.
     tombstone(
         pool,
         "corrected",
