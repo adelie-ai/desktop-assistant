@@ -155,9 +155,9 @@ fn close_unanswered_tool_calls(messages: &mut Vec<Message>) -> usize {
 /// the work stopped rather than simply ending. `executed` counts the tool
 /// results this turn already holds; `unanswered` the calls it never dispatched.
 fn cancelled_turn_notice(executed: usize, unanswered: usize) -> String {
-    // The opening comes from `FAILED_TURN_NOTICE_PREFIXES` for the same reason
-    // `user_visible_llm_error_message`'s does.
-    let opening = crate::turn_capture::FAILED_TURN_NOTICE_PREFIXES[7];
+    // The opening is a named constant for the same reason
+    // `user_visible_llm_error_message`'s arms are.
+    let opening = crate::turn_capture::CANCELLED_TURN_NOTICE;
     let mut notice = match executed {
         0 => format!("{opening}. No tool call had finished"),
         1 => format!("{opening} after 1 tool call, whose effects stand"),
@@ -461,27 +461,39 @@ fn cutoff_timestamp(max_age_days: u32) -> String {
 /// generic "I hit an LLM backend error..." line that includes the raw
 /// detail for debugging.
 fn user_visible_llm_error_message(error: &CoreError) -> String {
-    // Every arm's opening comes from `FAILED_TURN_NOTICE_PREFIXES` rather than
-    // from a literal here, because a reader reconstructing a finished turn from
-    // the transcript recognises this text by its opening - the rows record what
-    // was said and not how the turn ended. `[0]`..`[6]` are the seven arms
-    // below, in order; `[7]` is `cancelled_turn_notice`'s.
-    let prefix = |index: usize| crate::turn_capture::FAILED_TURN_NOTICE_PREFIXES[index];
+    // Every arm's opening is a named constant rather than a literal here,
+    // because a reader reconstructing a finished turn from the transcript
+    // recognises this text by its opening - the rows record what was said and
+    // not how the turn ended. Named, not indexed into
+    // `FAILED_TURN_NOTICE_PREFIXES`: a slice index compiles whatever the list
+    // holds, so a reordered or shortened list would panic here, inside the
+    // path that reports an error.
+    //
+    // A new arm that writes its own literal instead of adding a constant is
+    // not caught by the compiler. `every_listed_failure_notice_is_written_by_a_
+    // real_error` is what limits the damage: it holds the list to the
+    // producers in the one direction a test can.
+    use crate::turn_capture::{
+        CONTEXT_OVERFLOW_NOTICE, CONTEXT_RECOVERY_EXHAUSTED_NOTICE, LLM_BACKEND_ERROR_NOTICE,
+        MODEL_LOADING_NOTICE, QUOTA_EXCEEDED_NOTICE, RATE_LIMITED_NOTICE, TOOLS_UNSUPPORTED_NOTICE,
+    };
     match error {
-        CoreError::ContextOverflow { detail, .. } => format!("{}{detail}", prefix(0)),
-        CoreError::Llm(detail) if detail == CONTEXT_RECOVERY_EXHAUSTED => {
-            format!("{}{detail}", prefix(1))
+        CoreError::ContextOverflow { detail, .. } => {
+            format!("{CONTEXT_OVERFLOW_NOTICE}{detail}")
         }
-        CoreError::RateLimited { detail, .. } => format!("{}{detail}", prefix(2)),
-        CoreError::QuotaExceeded { detail } => format!("{}{detail}", prefix(3)),
-        CoreError::ModelLoading { detail } => format!("{}{detail}", prefix(4)),
-        CoreError::ToolsUnsupported { detail } => format!("{}{detail}", prefix(5)),
+        CoreError::Llm(detail) if detail == CONTEXT_RECOVERY_EXHAUSTED => {
+            format!("{CONTEXT_RECOVERY_EXHAUSTED_NOTICE}{detail}")
+        }
+        CoreError::RateLimited { detail, .. } => format!("{RATE_LIMITED_NOTICE}{detail}"),
+        CoreError::QuotaExceeded { detail } => format!("{QUOTA_EXCEEDED_NOTICE}{detail}"),
+        CoreError::ModelLoading { detail } => format!("{MODEL_LOADING_NOTICE}{detail}"),
+        CoreError::ToolsUnsupported { detail } => format!("{TOOLS_UNSUPPORTED_NOTICE}{detail}"),
         // Bare LLM error and any non-LLM variant share the generic
         // fallback. This intentionally does NOT enumerate every
         // CoreError variant — `Display` already produces a readable
         // string and the surrounding service layer is the right place
         // to add tailored messages for non-LLM domains.
-        _ => format!("{}{error}", prefix(6)),
+        _ => format!("{LLM_BACKEND_ERROR_NOTICE}{error}"),
     }
 }
 
@@ -20797,17 +20809,11 @@ mod tests {
         );
     }
 
-    /// A backfill reading a finished turn out of the transcript recognises the
-    /// harness's own failure text by its opening, because the rows record what
-    /// was said and not how the turn ended. This holds the recogniser to the
-    /// producers: every message either one can write is read back as
-    /// `Unanswered`, so a reworded notice fails here rather than quietly
-    /// becoming a recallable "answer" whose content is an outage (#1351).
-    #[test]
-    fn every_failure_notice_the_harness_writes_is_recognised() {
-        use crate::turn_capture::{TurnEnding, derive_turn_ending};
-
-        let mut notices: Vec<String> = vec![
+    /// Every message the two failure-notice producers can write, for the two
+    /// tests below. Hand-enumerated, which is this pair's known limit: see
+    /// `every_failure_notice_these_producers_write_is_recognised`.
+    fn every_failure_notice_written() -> Vec<String> {
+        let mut notices = vec![
             cancelled_turn_notice(0, 0),
             cancelled_turn_notice(1, 0),
             cancelled_turn_notice(3, 2),
@@ -20836,11 +20842,48 @@ mod tests {
         ] {
             notices.push(user_visible_llm_error_message(&error));
         }
+        notices
+    }
 
-        for notice in &notices {
+    /// The list and the producers are coupled in the one direction a test can
+    /// hold: nothing may sit in `FAILED_TURN_NOTICE_PREFIXES` that no error
+    /// actually writes. A renamed, reordered or dead entry fails here.
+    ///
+    /// **The reverse direction is not held, and cannot be.** A new match arm
+    /// in `user_visible_llm_error_message` that writes its own literal instead
+    /// of adding a constant compiles, ships, and is read back as an answer by
+    /// `derive_turn_ending`. The enumeration in `every_failure_notice_written`
+    /// is maintained by hand for the same reason. Adding an arm means adding
+    /// its constant and its case here.
+    #[test]
+    fn every_listed_failure_notice_is_written_by_a_real_error() {
+        let written = every_failure_notice_written();
+        for prefix in crate::turn_capture::FAILED_TURN_NOTICE_PREFIXES {
+            assert!(
+                written.iter().any(|notice| notice.starts_with(prefix)),
+                "no error writes a message opening with this, so nothing in a \
+                 transcript can carry it: {prefix:?}"
+            );
+        }
+    }
+
+    /// Every message these two producers write is read back as a failed turn,
+    /// so a backfill does not file it as an answer (#1351).
+    ///
+    /// This proves the producers and the recogniser agree with each other. It
+    /// does NOT prove either agrees with what is already in a transcript -
+    /// both could have drifted together - and
+    /// `the_recogniser_matches_the_wording_already_in_transcripts`
+    /// (`crate::turn_capture`) is what holds that, by spelling the stored
+    /// wording out by hand.
+    #[test]
+    fn every_failure_notice_these_producers_write_is_recognised() {
+        use crate::turn_capture::{TurnEnding, derive_turn_ending};
+
+        for notice in every_failure_notice_written() {
             let turn = vec![
                 Message::new(Role::User, "the question"),
-                Message::new(Role::Assistant, notice),
+                Message::new(Role::Assistant, &notice),
             ];
             assert_eq!(
                 derive_turn_ending(&turn),

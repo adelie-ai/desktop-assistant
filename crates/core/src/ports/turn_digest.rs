@@ -16,8 +16,21 @@
 //! across the whole account, which is what recognition needs and what the
 //! transcript, the rolling summary and a lexical search each fail to give.
 //!
-//! The store holds the home conversation too, so within-conversation recall
-//! survives the move. One row, one home: nothing is copied onto the pad.
+//! The store holds the home conversation's turns too, so a later read has the
+//! material for within-conversation recall as well as cross-conversation.
+//!
+//! ## This store is written and not yet read
+//!
+//! Nothing reads a digest back today. [`TurnDigestStore::recent`],
+//! [`TurnDigestStore::get`] and [`TurnDigestStore::set_disposition`] exist and
+//! are tested, and no production caller reaches them: the past-turns arm of
+//! `[Recall]` is #1350, and it is what makes a digest reachable by a turn.
+//!
+//! So this change moves the digest OUT of the scratchpad's read paths and does
+//! not yet put it into another one. Until #1350 lands, a turn's record is
+//! reachable through the transcript, the `[Earlier turns]` index and the
+//! rolling summary, and not by relevance. That is a deliberate gap of one
+//! ticket, not a capability this module already has.
 //!
 //! ## Disposition, and what it is for
 //!
@@ -25,8 +38,10 @@
 //! the machinery that withholds and retires a claim can reach it. A digest
 //! that outlives its conversation needs the same hooks, or that machinery
 //! cannot reach episodes at all. [`TurnDigest::marked_text`] is how a reader
-//! meets a dispositioned digest: the disposition's own marker is joined to the
-//! text at one call site, so no render path can show the words without it.
+//! should meet a dispositioned digest: the disposition's own marker is joined
+//! to the text there, in one place, so a render path has one call to make
+//! rather than a rule to remember. [`TurnDigest::content`] is still public and
+//! still reachable, so this is a convention and not an enforced property.
 //!
 //! ## Deletion
 //!
@@ -111,8 +126,15 @@ pub struct TurnDigest {
     /// The message that opened the turn - the handle a reader follows back
     /// into the transcript.
     pub opening_message_id: String,
-    /// The digest text as stored. Read it through [`Self::marked_text`], never
-    /// directly, so a dispositioned digest cannot be shown unmarked.
+    /// The digest text as stored, WITHOUT this digest's disposition marker.
+    ///
+    /// A render path wants [`Self::marked_text`] instead, which joins the
+    /// marker on: a `refuted` or `superseded` digest shown from this field
+    /// alone reads as a current record of what happened. Nothing enforces
+    /// that - the field is public, like
+    /// [`crate::domain::KnowledgeEntry::content`], which pairs with its own
+    /// `marked_text` the same way. Treat this sentence as a convention the
+    /// reader has to keep, not a guarantee the type makes.
     pub content: String,
     /// Whether the turn that produced this text had already read outside
     /// content.
@@ -129,13 +151,14 @@ pub struct TurnDigest {
 }
 
 impl TurnDigest {
-    /// [`Self::content`] as a reader must see it: carrying this digest's own
+    /// [`Self::content`] as a reader should see it: carrying this digest's own
     /// [`Disposition::marker`].
     ///
     /// The one place the marker is joined, for the same reason
     /// [`crate::domain::KnowledgeEntry::marked_text`] is: two call sites
     /// agreeing to remember the rule is the shape that lets one of them go out
-    /// unmarked.
+    /// unmarked. It is the one place, not the only reachable one - see
+    /// [`Self::content`].
     #[must_use]
     pub fn marked_text(&self) -> String {
         format!("{}{}", self.disposition.marker(), self.content)

@@ -203,10 +203,25 @@ pub enum TurnEnding {
 /// what it recognises instead: the fixed opening of each message
 /// `crate::service`'s `user_visible_llm_error_message` can write, plus the
 /// opening of its cancellation notice. Both producers build their text from
-/// this list rather than from literals of their own, and
-/// `every_failure_notice_the_harness_writes_is_recognised` (in
-/// `crate::service`) holds the two together so a reworded notice cannot drift
-/// out of recognition silently.
+/// these constants rather than from literals of their own.
+///
+/// # The wording is historical data, not prose
+///
+/// Every failure notice already sitting in a transcript was written under the
+/// wording below. Change a character and `derive_turn_ending` stops
+/// recognising every row already written, and the backfill files that outage
+/// text as a durable, embedded `Answered:` half - which is the failure this
+/// whole mechanism exists to prevent. So
+/// `the_recogniser_matches_the_wording_already_in_transcripts`
+/// (`crate::turn_capture`) spells the wording out again, by hand, rather than
+/// reading it from here: a test fed by the code under test can only ever prove
+/// self-consistency, and producer and recogniser agreeing with each other
+/// while both disagree with the stored rows is exactly the shape of that
+/// failure.
+///
+/// Each notice is one physical literal with no line continuation. A `\\`
+/// continuation strips the next line's leading whitespace, so re-wrapping one
+/// of these to fit a column silently rewrites the constant.
 ///
 /// This recognises the harness's own text and nothing else. A model that
 /// opened a genuine reply with one of these sentences would have its answer
@@ -215,15 +230,68 @@ pub enum TurnEnding {
 /// listed here is read as an answer, which is what every such row already is
 /// today.
 pub const FAILED_TURN_NOTICE_PREFIXES: &[&str] = &[
-    "The conversation exceeded the model's context window. We'll truncate older content and      retry. Details: ",
-    "The conversation is too large for this model's context window, and shortening it further      would leave nothing to work from. Start a new conversation, or switch to a model with a      larger window. Details: ",
-    "The API rate limit was exceeded. Please wait a moment and try again. Details: ",
-    "Your API quota is exhausted. Top up the account or switch to a different API key.      Details: ",
-    "The model is still downloading or loading. Please wait a moment and try again. Details: ",
-    "This model does not support tool use. Please switch to a tool-capable model or disable      tools for this chat. Details: ",
-    "I hit an LLM backend error and could not complete this request. Details: ",
-    "[Turn cancelled",
+    CONTEXT_OVERFLOW_NOTICE,
+    CONTEXT_RECOVERY_EXHAUSTED_NOTICE,
+    RATE_LIMITED_NOTICE,
+    QUOTA_EXCEEDED_NOTICE,
+    MODEL_LOADING_NOTICE,
+    TOOLS_UNSUPPORTED_NOTICE,
+    LLM_BACKEND_ERROR_NOTICE,
+    CANCELLED_TURN_NOTICE,
 ];
+
+/// What `CoreError::ContextOverflow` reads as.
+///
+/// One of [`FAILED_TURN_NOTICE_PREFIXES`]; see there for why the exact
+/// wording is data rather than prose.
+pub const CONTEXT_OVERFLOW_NOTICE: &str = "The conversation exceeded the model's context window. We'll truncate older content and retry. Details: ";
+
+/// What an overflow the recovery ladder cannot act on reads as.
+///
+/// One of [`FAILED_TURN_NOTICE_PREFIXES`]; see there for why the exact
+/// wording is data rather than prose.
+pub const CONTEXT_RECOVERY_EXHAUSTED_NOTICE: &str = "The conversation is too large for this model's context window, and shortening it further would leave nothing to work from. Start a new conversation, or switch to a model with a larger window. Details: ";
+
+/// What `CoreError::RateLimited` reads as.
+///
+/// One of [`FAILED_TURN_NOTICE_PREFIXES`]; see there for why the exact
+/// wording is data rather than prose.
+pub const RATE_LIMITED_NOTICE: &str =
+    "The API rate limit was exceeded. Please wait a moment and try again. Details: ";
+
+/// What `CoreError::QuotaExceeded` reads as.
+///
+/// One of [`FAILED_TURN_NOTICE_PREFIXES`]; see there for why the exact
+/// wording is data rather than prose.
+pub const QUOTA_EXCEEDED_NOTICE: &str =
+    "Your API quota is exhausted. Top up the account or switch to a different API key. Details: ";
+
+/// What `CoreError::ModelLoading` reads as.
+///
+/// One of [`FAILED_TURN_NOTICE_PREFIXES`]; see there for why the exact
+/// wording is data rather than prose.
+pub const MODEL_LOADING_NOTICE: &str =
+    "The model is still downloading or loading. Please wait a moment and try again. Details: ";
+
+/// What `CoreError::ToolsUnsupported` reads as.
+///
+/// One of [`FAILED_TURN_NOTICE_PREFIXES`]; see there for why the exact
+/// wording is data rather than prose.
+pub const TOOLS_UNSUPPORTED_NOTICE: &str = "This model does not support tool use. Please switch to a tool-capable model or disable tools for this chat. Details: ";
+
+/// What every other error reads as - the generic fallback.
+///
+/// One of [`FAILED_TURN_NOTICE_PREFIXES`]; see there for why the exact
+/// wording is data rather than prose.
+pub const LLM_BACKEND_ERROR_NOTICE: &str =
+    "I hit an LLM backend error and could not complete this request. Details: ";
+
+/// What a turn the user stopped reads as. Only the opening is fixed; the
+/// rest of the notice names what ran and what did not.
+///
+/// One of [`FAILED_TURN_NOTICE_PREFIXES`]; see there for why the exact
+/// wording is data rather than prose.
+pub const CANCELLED_TURN_NOTICE: &str = "[Turn cancelled";
 
 /// How a stored turn ended, as far as its own transcript can say.
 ///
@@ -838,6 +906,57 @@ mod tests {
             "an empty answer is not the same fact: {}",
             empty_answer.content
         );
+    }
+
+    /// The recogniser reads what is ALREADY in transcripts, so its input here
+    /// is the historical wording written out by hand rather than read back
+    /// from the constants the recogniser itself uses.
+    ///
+    /// That distinction is the whole test. Feeding it
+    /// `FAILED_TURN_NOTICE_PREFIXES` would prove only that the producer and
+    /// the recogniser agree with each other - which they do even when both
+    /// have drifted away from every row already stored, and a drifted
+    /// recogniser reads a stored outage as an answer and files it as a
+    /// durable, embedded `Answered:` half (#1349, #1351).
+    ///
+    /// A failure here means the wording changed. Restore it, or accept that
+    /// every failure notice written before the change is now unrecognisable.
+    #[test]
+    fn the_recogniser_matches_the_wording_already_in_transcripts() {
+        let stored_notices = [
+            "The conversation exceeded the model's context window. We'll truncate older content and retry. Details: the prompt was too long",
+            "The conversation is too large for this model's context window, and shortening it further would leave nothing to work from. Start a new conversation, or switch to a model with a larger window. Details: context recovery exhausted",
+            "The API rate limit was exceeded. Please wait a moment and try again. Details: slow down",
+            "Your API quota is exhausted. Top up the account or switch to a different API key. Details: out of credit",
+            "The model is still downloading or loading. Please wait a moment and try again. Details: still loading",
+            "This model does not support tool use. Please switch to a tool-capable model or disable tools for this chat. Details: no tools",
+            "I hit an LLM backend error and could not complete this request. Details: the endpoint was unreachable",
+            "[Turn cancelled. No tool call had finished.]",
+            "[Turn cancelled after 3 tool calls, whose effects stand; 2 further calls were requested and never ran.]",
+        ];
+
+        for notice in stored_notices {
+            let turn = vec![user("the question"), assistant(notice)];
+            assert_eq!(
+                derive_turn_ending(&turn),
+                TurnEnding::Unanswered,
+                "this wording is in stored transcripts and must stay recognisable: \
+                 {notice}"
+            );
+        }
+
+        // The refusal: an ordinary reply is still an answer. Without it a
+        // recogniser that answered `Unanswered` to everything would pass.
+        let answered = vec![
+            user("the question"),
+            assistant("use the sealed secret for that"),
+        ];
+        assert_eq!(derive_turn_ending(&answered), TurnEnding::Answered);
+
+        // And a turn with no closing prose at all: nothing to drop, so nothing
+        // may claim an answer half was withheld.
+        let silent = vec![user("the question")];
+        assert_eq!(derive_turn_ending(&silent), TurnEnding::Answered);
     }
 
     /// Acceptance (#1349): a subagent's conversation is mechanism, not the

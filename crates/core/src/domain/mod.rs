@@ -25,7 +25,7 @@ pub use negative_memory::{
 };
 pub use replay::replay_priority;
 pub use salience::{SalienceReading, SalienceSignal, SalienceSource};
-pub use scratchpad::{DEFAULT_NOTE_TYPE, ScratchpadNote};
+pub use scratchpad::{DEFAULT_NOTE_TYPE, LEGACY_TURN_NOTE_TYPE, ScratchpadNote};
 pub use situation::{
     FieldFan, MAX_SITUATION_VALUE_CHARS, MAX_SITUATION_VALUES_PER_FIELD, SITUATION_MIN_POPULATION,
     Situation, SituationCue, SituationField, SituationRecord, SituationSources, TimeOfDay,

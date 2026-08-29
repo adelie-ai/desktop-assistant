@@ -233,6 +233,68 @@ async fn a_turn_digest_is_never_readable_by_a_different_user() {
     fx.cleanup().await;
 }
 
+/// A second tenant cannot squat a digest's key and make the rightful owner's
+/// write vanish.
+///
+/// The foreign key only requires the conversation to EXIST, not to belong to
+/// the writer. With a key of (conversation_id, opening_message_id) a second
+/// user could insert against another person's conversation first; the owner's
+/// upsert would then conflict, be refused by the `EXCLUDED.user_id` guard on
+/// the DO UPDATE, and return no rows - a silently dropped write. Carrying
+/// `user_id` in the key makes the two rows separate by construction.
+///
+/// Not reachable through today's handler, which resolves the conversation for
+/// the caller. Held here because 062 has not shipped, so the structural fix
+/// costs nothing now and a migration later.
+#[tokio::test]
+async fn a_second_user_cannot_squat_a_digests_key() {
+    let Some(fx) = DbFixture::try_new("td_squat").await else {
+        return;
+    };
+    let store = PgTurnDigestStore::new(fx.pool.clone());
+
+    seed_conversation(&fx.pool, "alice", "conv-a", &[]).await;
+
+    // Bob gets there first, against a conversation that is not his.
+    with_user_id(UserId::new("bob"), async {
+        store
+            .write("conv-a", &[digest("m-a", "bob's squatted row")])
+            .await
+            .expect("bob writes");
+    })
+    .await;
+
+    // Alice's own write still lands, and answers with her row.
+    let written = with_user_id(UserId::new("alice"), async {
+        store
+            .write("conv-a", &[digest("m-a", "alice's own words")])
+            .await
+            .expect("alice writes")
+    })
+    .await;
+    assert_eq!(
+        written.len(),
+        1,
+        "the owner's write must not be silently dropped: {written:?}"
+    );
+    assert_eq!(written[0].content, "alice's own words");
+
+    // And each reads only their own.
+    for (user, expected) in [
+        ("alice", "alice's own words"),
+        ("bob", "bob's squatted row"),
+    ] {
+        let index = with_user_id(UserId::new(user), async {
+            store.recent(50, false).await.expect("read the index")
+        })
+        .await;
+        assert_eq!(index.len(), 1, "{user}: {index:?}");
+        assert_eq!(index[0].content, expected, "{user}");
+    }
+
+    fx.cleanup().await;
+}
+
 /// Acceptance 3 (#1349): once the store is user-scoped a digest's lifecycle is
 /// no longer the conversation's, so the cascade has to be proven rather than
 /// assumed - and proven on the path the application actually uses, which is

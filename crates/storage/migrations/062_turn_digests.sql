@@ -20,19 +20,30 @@
 --   deleting a conversation would be a promise the product does not keep.
 --   `user_id` is carried on the row as well, the same way `messages` carries
 --   it, so every read scopes without a join.
--- * **One digest per turn.** The identity is (conversation_id,
---   opening_message_id) - the message that opened the turn - so a re-run of
---   the capture, a redelivery, or a backfill pass over a turn the harness
---   already captured leaves one row rather than a second copy of somebody's
---   conversation (AGENTS.md 8.4).
+-- * **One digest per turn, per person.** The identity is (user_id,
+--   conversation_id, opening_message_id) - the message that opened the turn -
+--   so a re-run of the capture, a redelivery, or a backfill pass over a turn
+--   the harness already captured leaves one row rather than a second copy of
+--   somebody's conversation (AGENTS.md 8.4).
+--
+--   `user_id` leads the key so the conflict target cannot cross tenants by
+--   construction. Without it the key is (conversation_id, opening_message_id)
+--   and the foreign key only requires the conversation to EXIST, not to
+--   belong to the writer - so a second tenant could insert against another
+--   person's conversation and squat the row, after which the rightful
+--   owner's upsert conflicts, is refused by the `EXCLUDED.user_id` guard on
+--   the DO UPDATE, and returns nothing. The write would be silently dropped.
+--   With `user_id` in the key the guard becomes defence in depth rather than
+--   the only thing standing there.
 -- * **A digest can be dispositioned.** A knowledge entry carries a
 --   disposition and a soft-deletion story so the machinery that withholds and
 --   retires a claim can reach it; an episode that outlives its conversation
 --   needs the same hooks, with the same vocabulary and the same rule that
 --   'superseded' and 'redundant' must name their successor. Migration 056
 --   holds the reasoning for both, and this table follows it rather than
---   inventing a second vocabulary. `deleted_at` keeps exactly one meaning:
---   the row is in the trash. Disposition is orthogonal to it.
+--   inventing a second vocabulary. Disposition is what this change delivers;
+--   `deleted_at` is reserved for a trash path a later ticket adds, and is
+--   written by nothing today - see the column's own comment below.
 -- * **A digest is embedded.** `embedding` / `embedding_model` take the same
 --   shape as every other embedded table (migration 040), so the stale sweep
 --   and the backfill in `crates/storage/src/embedding_backfill.rs` reach it
@@ -73,8 +84,15 @@ CREATE TABLE IF NOT EXISTS turn_digests (
     embedding_model    TEXT,
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- RESERVED, and written by nothing today. There is no trash or restore
+    -- path for a digest yet; the three reads in
+    -- `crates/storage/src/turn_digest.rs` already filter on this column so
+    -- that the ticket which adds one changes a writer and not every reader.
+    -- Until then every row has it NULL, and `deleted_at` keeps exactly one
+    -- meaning when it arrives: the row is in the trash. Disposition is
+    -- orthogonal to it, so a dispositioned row is normally live.
     deleted_at         TIMESTAMPTZ,
-    UNIQUE (conversation_id, opening_message_id)
+    UNIQUE (user_id, conversation_id, opening_message_id)
 );
 
 -- The person's own episodes, newest first, across every conversation they
@@ -83,9 +101,14 @@ CREATE INDEX IF NOT EXISTS turn_digests_user_created_idx
     ON turn_digests (user_id, created_at DESC)
     WHERE deleted_at IS NULL;
 
--- One conversation's own episodes, for a within-conversation read.
-CREATE INDEX IF NOT EXISTS turn_digests_user_conv_idx
-    ON turn_digests (user_id, conversation_id, created_at DESC);
+-- The cascade's own index. Deleting a conversation runs
+-- `DELETE FROM turn_digests WHERE conversation_id = ...`, and no other index
+-- here leads with that column: the unique key leads with `user_id` and the
+-- index above leads with `user_id` too, so without this every conversation
+-- delete is a full scan of the table. It carries no `deleted_at` predicate
+-- because the cascade removes rows whatever their state.
+CREATE INDEX IF NOT EXISTS turn_digests_conversation_idx
+    ON turn_digests (conversation_id);
 
 -- The same vocabulary migration 056 pins for knowledge_base. ADD CONSTRAINT
 -- has no IF NOT EXISTS form, hence the catalog guard.

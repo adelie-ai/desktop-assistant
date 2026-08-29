@@ -21,10 +21,16 @@
 //!   question from `search` - "what is near this whole user sentence", not
 //!   "find what I asked for" - so they rank differently, and neither replaces
 //!   the other. Both leave out the reserved `goal` note, which every turn
-//!   already renders as `[Current task]`.
+//!   already renders as `[Current task]`, and both leave out
+//!   [`LEGACY_TURN_NOTE_TYPE`] - the per-turn captures written before the
+//!   episodic turn index existed (#1349). Those rows stay on the pad, because
+//!   until the transcript backfill has run they are the only copy of that
+//!   capture; what they must not do is arrive in a `[Recall]` block beside the
+//!   digest of the same turn, under a different key, where the
+//!   already-in-view dedup cannot see that the two are one turn.
 
 use desktop_assistant_core::CoreError;
-use desktop_assistant_core::domain::ScratchpadNote;
+use desktop_assistant_core::domain::{LEGACY_TURN_NOTE_TYPE, ScratchpadNote};
 use desktop_assistant_core::ports::auth::current_user_id;
 use desktop_assistant_core::ports::recall::RecallDispersion;
 use desktop_assistant_core::ports::scratchpad::{
@@ -160,6 +166,7 @@ const NEAREST_NOTES_BY_EMBEDDING_SQL: &str = "\
            AND ($4::text IS NULL OR (owner_todo = $5 OR owner_todo LIKE $5 || '.%'
                 OR (id COLLATE \"C\" < $4 AND owner_todo = ANY($6::text[]))))
            AND note_key <> $9
+           AND note_type <> $10
            AND embedding IS NOT NULL
            AND embedding_model IS NOT NULL
            AND (embedding_model = $7
@@ -298,6 +305,7 @@ const SEARCH_TEXT_ANY_TERM_SQL: &str = "WITH q AS (
            AND ($4::text IS NULL OR (owner_todo = $5 OR owner_todo LIKE $5 || '.%'
                 OR (id COLLATE \"C\" < $4 AND owner_todo = ANY($6::text[]))))
            AND note_key <> $8
+           AND note_type <> $9
          ORDER BY ts_rank_cd(tsv, q.query) DESC, updated_at DESC, id DESC
          LIMIT $7";
 
@@ -984,6 +992,7 @@ impl PgScratchpadStore {
             .bind(embedding_model)
             .bind(limit as i64)
             .bind(SCRATCHPAD_GOAL_KEY)
+            .bind(LEGACY_TURN_NOTE_TYPE)
             .fetch_all(&mut *scan)
             .await
             .map_err(|e| CoreError::Storage(e.to_string()))?;
@@ -1050,6 +1059,7 @@ impl PgScratchpadStore {
             .bind(ancestors)
             .bind(limit as i64)
             .bind(SCRATCHPAD_GOAL_KEY)
+            .bind(LEGACY_TURN_NOTE_TYPE)
             .fetch_all(&mut *scan)
             .await
             .map_err(|e| CoreError::Storage(e.to_string()))?;
@@ -1263,6 +1273,16 @@ mod tests {
     /// Acceptance (#1167): the pass that measures the pad's spread reads the
     /// geometry and none of the content - one distance per note, and no column
     /// of the note itself. Only the notes the block may show are read whole.
+    ///
+    /// `note_type` used to be on this list and is not any more (#1349). It
+    /// names which rows are in the population rather than what any row says,
+    /// which is what `note_key` has always done here - `note_key <> $9` keeps
+    /// the goal note out of the spread, and sits in the same WHERE. A column
+    /// used that way has to be readable by the measuring pass or the row it
+    /// excludes is excluded from the candidates and counted in the geometry,
+    /// which is the mismatch `the_pad_scan_leaves_the_goal_note_out_of_the_
+    /// spread` exists to prevent. The columns left are the ones that carry
+    /// what a note SAYS, which the measuring pass still has no use for.
     #[test]
     fn the_pad_scan_measures_before_it_reads_any_note() {
         let measured = NEAREST_NOTES_BY_EMBEDDING_SQL
@@ -1270,7 +1290,7 @@ mod tests {
             .next()
             .expect("the scan selects the notes it will show after it measures the spread");
 
-        for column in ["content", "note_type", "knowledge_entry_id"] {
+        for column in ["content", "knowledge_entry_id"] {
             assert!(
                 !measured.contains(column),
                 "the pass that measures the spread reads {column}, which it has no use for"
@@ -1311,6 +1331,29 @@ mod tests {
             measured.contains("note_key <> $9"),
             "the goal note must be absent from the spread as well as from the candidates: \
              \n{NEAREST_NOTES_BY_EMBEDDING_SQL}"
+        );
+    }
+
+    /// A per-turn capture written before the episodic turn index existed
+    /// (#1349) is out of the spread as well as out of the candidates, for the
+    /// same reason the goal note is.
+    ///
+    /// It matters more here than it does for the goal note, which is one row.
+    /// An instance that ran the old capture has one legacy row per turn, so
+    /// they can outnumber the notes a person or the model wrote on purpose -
+    /// and a median measured over a population dominated by rows the arm can
+    /// never offer sets the relevance floor for the rows it can.
+    #[test]
+    fn the_pad_scan_leaves_a_legacy_turn_capture_out_of_the_spread() {
+        let measured = NEAREST_NOTES_BY_EMBEDDING_SQL
+            .split("     SELECT sp.id")
+            .next()
+            .expect("the scan measures the spread before it reads the notes");
+
+        assert!(
+            measured.contains("note_type <> $10"),
+            "a legacy turn capture must be absent from the spread as well as from the \
+             candidates: \n{NEAREST_NOTES_BY_EMBEDDING_SQL}"
         );
     }
 }

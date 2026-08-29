@@ -50,6 +50,11 @@ const DIGEST_COLUMNS: &[&str] = &[
 
 /// Batch upsert, keyed on the turn rather than on the row id.
 ///
+/// The conflict target carries `user_id`, so it cannot cross tenants at all -
+/// see migration 062. The `WHERE turn_digests.user_id = EXCLUDED.user_id`
+/// guard below is kept as defence in depth rather than removed with the
+/// hazard it used to be the only answer to.
+///
 /// The vector is CLEARED on every update and written back by the statement
 /// after it. Clearing is what keeps a vector honest: an upsert replaces the
 /// content, so a vector left in place would describe text that is no longer
@@ -60,7 +65,7 @@ const WRITE_UPSERT_SQL: &str = "\
     INSERT INTO turn_digests \
         (id, user_id, conversation_id, opening_message_id, content, after_outside_read) \
     SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::bool[]) \
-    ON CONFLICT (conversation_id, opening_message_id) DO UPDATE \
+    ON CONFLICT (user_id, conversation_id, opening_message_id) DO UPDATE \
        SET content = EXCLUDED.content, \
            after_outside_read = EXCLUDED.after_outside_read, \
            embedding = NULL, \
@@ -315,9 +320,41 @@ impl TurnDigestStore for PgTurnDigestStore {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{DIGEST_COLUMNS, DIGEST_ROW_QUERIES};
 
-    /// Every query answering a `DigestRow` selects every column the row reads.
+    /// The columns `sql` actually projects, as whole names.
+    ///
+    /// Reads the `RETURNING` list where there is one and the `SELECT` list
+    /// otherwise, then splits on commas and strips any `alias.` prefix and
+    /// ` AS name` suffix. Whole names, not substrings: `contains("id")` is
+    /// satisfied by `conversation_id`, and `contains("disposition")` by
+    /// `disposition_reason`, so a substring check passes on a projection that
+    /// is missing the very column it claims to be checking.
+    fn projected_columns(sql: &str) -> BTreeSet<String> {
+        let projection = match sql.rfind("RETURNING ") {
+            Some(at) => &sql[at + "RETURNING ".len()..],
+            None => {
+                let from = sql.find("SELECT ").expect("a SELECT or a RETURNING") + "SELECT ".len();
+                let to = sql[from..].find(" FROM ").expect("a FROM") + from;
+                &sql[from..to]
+            }
+        };
+        projection
+            .split(',')
+            .map(|column| {
+                let column = column.trim();
+                let column = column.rsplit(" AS ").next().unwrap_or(column);
+                let column = column.rsplit('.').next().unwrap_or(column);
+                column.trim().to_string()
+            })
+            .filter(|column| !column.is_empty())
+            .collect()
+    }
+
+    /// Every query answering a `DigestRow` projects every column the row
+    /// reads, and no others.
     ///
     /// A column added to the row and missed by one statement compiles, and
     /// fails only when that statement reaches Postgres - which is how
@@ -325,13 +362,37 @@ mod tests {
     /// ordinary gate green (#1277).
     #[test]
     fn every_digest_query_selects_every_column_the_row_reads() {
+        let expected: BTreeSet<String> = DIGEST_COLUMNS.iter().map(|c| (*c).to_string()).collect();
         for (name, sql) in DIGEST_ROW_QUERIES {
-            for column in DIGEST_COLUMNS {
-                assert!(
-                    sql.contains(column),
-                    "{name} does not select `{column}`, which DigestRow reads"
-                );
-            }
+            let projected = projected_columns(sql);
+            let missing: Vec<&String> = expected.difference(&projected).collect();
+            assert!(
+                missing.is_empty(),
+                "{name} does not project {missing:?}, which DigestRow reads"
+            );
+            let extra: Vec<&String> = projected.difference(&expected).collect();
+            assert!(
+                extra.is_empty(),
+                "{name} projects {extra:?}, which DigestRow does not read"
+            );
         }
+    }
+
+    /// The reader above is what makes the check whole-name rather than
+    /// substring, so it is held to the two collisions that actually exist in
+    /// this table: `id` inside `conversation_id`, and `disposition` inside
+    /// `disposition_reason`.
+    #[test]
+    fn the_projection_reader_returns_whole_column_names() {
+        let projected = projected_columns(
+            "SELECT conversation_id, disposition_reason, td.content, now() AS updated_at \
+             FROM turn_digests WHERE user_id = $1",
+        );
+        assert!(!projected.contains("id"), "{projected:?}");
+        assert!(!projected.contains("disposition"), "{projected:?}");
+        assert!(projected.contains("conversation_id"), "{projected:?}");
+        assert!(projected.contains("disposition_reason"), "{projected:?}");
+        assert!(projected.contains("content"), "an alias prefix is stripped");
+        assert!(projected.contains("updated_at"), "an AS alias is the name");
     }
 }

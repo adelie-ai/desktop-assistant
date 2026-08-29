@@ -256,7 +256,8 @@ pub async fn backfill_turn_digests(
                          (id, user_id, conversation_id, opening_message_id, content, \
                           after_outside_read) \
                      VALUES ($1, $2, $3, $4, $5, $6) \
-                     ON CONFLICT (conversation_id, opening_message_id) DO NOTHING",
+                     ON CONFLICT (user_id, conversation_id, opening_message_id) \
+                     DO NOTHING",
                 )
                 .bind(uuid::Uuid::now_v7().to_string())
                 .bind(&candidate.user_id)
