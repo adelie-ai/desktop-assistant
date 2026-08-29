@@ -43,6 +43,7 @@ pub const EMBEDDED_TABLES: &[&str] = &[
     "skill_index",
     "tag_registry",
     "scratchpads",
+    "turn_digests",
 ];
 
 /// Tables that hold a vector column but must never be swept by

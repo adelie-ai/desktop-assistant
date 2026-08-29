@@ -3,25 +3,15 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::CoreError;
-use crate::chunking::{CHUNK_MAX_CHARS, CHUNK_OVERLAP, chunk_text};
 use crate::domain::{DEFAULT_NOTE_TYPE, ScratchpadNote};
-use crate::ports::embedding::{EMBED_TIMEOUT, EmbedFn};
+use crate::ports::embedding::{ChunkEmbeddable, EmbedFn, embed_chunked};
 
 /// One note's vectors and the model that produced them (#717).
 ///
-/// One type rather than two loose fields because a search scopes its vector arm
-/// to the model that produced the stored vector. A vector paired with another
-/// model's name is compared against rows of another dimension, which pgvector
-/// answers with an error rather than a miss -- so the two may only ever be set,
-/// carried and replaced together.
-#[derive(Debug, Clone, PartialEq)]
-pub struct NoteEmbedding {
-    /// One vector per content chunk, in chunk order. A note is usually a single
-    /// chunk; [`MAX_NOTE_BYTES`] is what makes more than one possible.
-    pub chunks: Vec<Vec<f32>>,
-    /// Identifier of the model that produced `chunks`.
-    pub model: String,
-}
+/// The shared "chunks plus the model that produced them" pair, which every
+/// inline-embedding write path stores. Kept under this name here because the
+/// scratchpad's callers and its tests already spell it this way.
+pub use crate::ports::embedding::ChunkedEmbedding as NoteEmbedding;
 
 /// A note to upsert into the scratchpad. Carries the structured fields that
 /// don't fit a bare `(key, content)` pair: a free-text `note_type`
@@ -87,76 +77,24 @@ impl NewScratchpadNote {
     }
 }
 
+impl ChunkEmbeddable for NewScratchpadNote {
+    fn embed_text(&self) -> String {
+        NewScratchpadNote::embed_text(self)
+    }
+
+    fn set_embedding(&mut self, embedding: crate::ports::embedding::ChunkedEmbedding) {
+        self.embedding = Some(embedding);
+    }
+}
+
 /// Embed a batch of notes in place, so a note written now is semantically
 /// findable now (#717).
 ///
-/// The background backfill runs on a several-minute cadence, and the case that
-/// matters for a scratchpad is the agent looking for what it wrote moments ago
-/// -- exactly the window that cadence leaves open. So the write path embeds,
-/// and the backfill is the safety net rather than the only path.
-///
-/// Bounded by [`EMBED_TIMEOUT`]: a wedged backend must not hang the turn. On a
-/// timeout, an error, or an answer that does not carry one vector per chunk,
-/// every note is left unembedded and the write still lands. Those rows carry a
-/// NULL vector, stay reachable through the full-text arm, and are picked up by
-/// the next backfill pass.
-///
-/// All-or-nothing on purpose: a short answer from the embedder would otherwise
-/// be zipped chunk-to-note out of step, pairing a note with another note's
-/// vector. A wrong vector is worse than no vector, because nothing later
-/// detects it.
+/// A thin name over [`embed_chunked`], which holds the timeout, the
+/// all-or-nothing rule and the chunk-to-record zip for every store that
+/// embeds on its write path.
 pub async fn embed_notes(embed: &EmbedFn, model: &str, notes: &mut [NewScratchpadNote]) {
-    if notes.is_empty() {
-        return;
-    }
-
-    // Chunk every note, remembering which note each chunk belongs to, so one
-    // backend round trip covers the whole batch.
-    let mut owners: Vec<usize> = Vec::new();
-    let mut texts: Vec<String> = Vec::new();
-    for (index, note) in notes.iter().enumerate() {
-        for chunk in chunk_text(&note.embed_text(), CHUNK_MAX_CHARS, CHUNK_OVERLAP) {
-            owners.push(index);
-            texts.push(chunk);
-        }
-    }
-
-    let expected = texts.len();
-    let vectors = match tokio::time::timeout(EMBED_TIMEOUT, embed(texts)).await {
-        Ok(Ok(vectors)) if vectors.len() == expected => vectors,
-        Ok(Ok(vectors)) => {
-            tracing::warn!(
-                returned = vectors.len(),
-                expected,
-                "embedder answered with the wrong number of vectors; \
-                 writing the notes unembedded for the backfill"
-            );
-            return;
-        }
-        Ok(Err(e)) => {
-            tracing::warn!("failed to embed scratchpad notes: {e}");
-            return;
-        }
-        Err(_) => {
-            tracing::warn!(
-                timeout = ?EMBED_TIMEOUT,
-                "embedding scratchpad notes timed out; writing them unembedded for the backfill"
-            );
-            return;
-        }
-    };
-
-    for note in notes.iter_mut() {
-        note.embedding = Some(NoteEmbedding {
-            chunks: Vec::new(),
-            model: model.to_string(),
-        });
-    }
-    for (index, vector) in owners.into_iter().zip(vectors) {
-        if let Some(embedding) = notes[index].embedding.as_mut() {
-            embedding.chunks.push(vector);
-        }
-    }
+    embed_chunked(embed, model, notes).await;
 }
 
 /// Reserved note key whose content the service auto-surfaces as the

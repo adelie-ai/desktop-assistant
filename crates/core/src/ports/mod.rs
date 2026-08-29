@@ -66,6 +66,7 @@ pub mod context_plan;
 pub mod transcript;
 pub mod transport;
 pub mod turn_capability;
+pub mod turn_digest;
 pub mod turn_interactivity;
 pub mod turn_record;
 pub mod turn_telemetry;

@@ -1862,6 +1862,13 @@ async fn main() -> Result<()> {
     let mut scratchpad_write_fn: Option<
         desktop_assistant_core::ports::scratchpad::ScratchpadWriteFn,
     > = None;
+    // #1349: the episodic turn index. Every ordinary turn exit keeps one
+    // bounded digest of the turn here, scoped to the person rather than to the
+    // conversation, so a past turn is reachable by relevance from anywhere in
+    // the account. None without a Postgres pool.
+    let mut turn_digest_write_fn: Option<
+        desktop_assistant_core::ports::turn_digest::TurnDigestWriteFn,
+    > = None;
     // Session-scratchpad handles for the subagent result-handoff (#607/#608):
     // a subagent's final answer is auto-written to the session pad on
     // completion and read back by get_subagent_status. Threaded into the
@@ -2167,6 +2174,37 @@ async fn main() -> Result<()> {
             });
         descendant_task_probe = Some(probe);
 
+        // #1349: the episodic turn index's write path. It embeds inline for
+        // the same reason the pad does - the background backfill runs on a
+        // several-minute cadence, and a digest written now has to be findable
+        // now - and `embed_chunked` is bounded by EMBED_TIMEOUT, so a wedged
+        // backend leaves the digest unembedded and the write still lands.
+        let digest_store = Arc::new(desktop_assistant_storage::PgTurnDigestStore::new(
+            pool.clone(),
+        ));
+        let digest_embed = embedding_fn
+            .clone()
+            .map(|embed| (embed, embedding_model_id.clone()));
+        let digest_write: desktop_assistant_core::ports::turn_digest::TurnDigestWriteFn =
+            Arc::new(move |conv: String, digests| {
+                let store = Arc::clone(&digest_store);
+                let embedding = digest_embed.clone();
+                Box::pin(async move {
+                    use desktop_assistant_core::ports::turn_digest::TurnDigestStore;
+                    let mut digests = digests;
+                    if let Some((embed, model)) = &embedding {
+                        desktop_assistant_core::ports::embedding::embed_chunked(
+                            embed,
+                            model,
+                            &mut digests,
+                        )
+                        .await;
+                    }
+                    store.write(&conv, &digests).await
+                })
+            });
+        turn_digest_write_fn = Some(digest_write);
+
         // Capture the same event-emitting write + list closures for the
         // conversation handler's planning/compaction tools (#240) before they
         // are moved into the API-handler tuple below.
@@ -2352,6 +2390,44 @@ async fn main() -> Result<()> {
         .as_ref()
         .map(|c| c.backend_tasks.embedding_backfill_interval_secs)
         .unwrap_or(300);
+    // #1349: rebuild the episodic turn index from the stored transcript, once.
+    // Without it the index holds only the turns captured since this binary
+    // shipped, which is too few to measure anything against. It runs whether
+    // or not an embedding backend is configured: the rows land unembedded and
+    // the embedding backfill above picks them up.
+    //
+    // One pass, at boot, and then never again: the pass asks only for turns
+    // with no digest, so a second run finds nothing. It settles first so it is
+    // never competing with the turn a person is waiting on.
+    let (digest_backfill_shutdown_tx, digest_backfill_shutdown_rx) =
+        tokio::sync::oneshot::channel::<()>();
+    let digest_backfill_task = if let Some(pool) = &pg_pool {
+        let pool = pool.clone();
+        Some(tokio::spawn(async move {
+            let mut shutdown_rx = digest_backfill_shutdown_rx;
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
+                _ = &mut shutdown_rx => {
+                    tracing::info!("turn-digest backfill cancelled before start");
+                    return;
+                }
+            }
+            match desktop_assistant_storage::backfill_turn_digests(&pool, hard_withhold).await {
+                Ok(outcome) if !outcome.is_empty() => tracing::info!(
+                    conversations = outcome.conversations_scanned,
+                    written = outcome.digests_written,
+                    provenance_underivable = outcome.provenance_underivable,
+                    "rebuilt the episodic turn index from the transcript"
+                ),
+                Ok(_) => tracing::debug!("no turns to backfill into the episodic turn index"),
+                Err(e) => tracing::warn!("turn-digest backfill failed: {e}"),
+            }
+        }))
+    } else {
+        drop(digest_backfill_shutdown_rx);
+        None
+    };
+
     let (backfill_shutdown_tx, backfill_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let backfill_task = if let (Some(pool), Some(client)) = (&pg_pool, &embedding_client) {
         let pool = pool.clone();
@@ -2437,6 +2513,20 @@ async fn main() -> Result<()> {
                     Ok(n) if n > 0 => tracing::info!("backfilled {n} scratchpad embedding(s)"),
                     Ok(_) => tracing::debug!("no scratchpad embeddings to backfill"),
                     Err(e) => tracing::warn!("scratchpad embedding backfill failed: {e}"),
+                }
+
+                // The digest write path embeds as it writes, so this pass
+                // exists for the digests it could not embed, the ones a model
+                // change cleared, and every digest the transcript backfill
+                // wrote (#1349).
+                match desktop_assistant_storage::embedding_backfill::backfill_turn_digest_embeddings(
+                    &pool, &embed_fn, &model,
+                )
+                .await
+                {
+                    Ok(n) if n > 0 => tracing::info!("backfilled {n} turn-digest embedding(s)"),
+                    Ok(_) => tracing::debug!("no turn-digest embeddings to backfill"),
+                    Err(e) => tracing::warn!("turn-digest embedding backfill failed: {e}"),
                 }
 
                 tokio::select! {
@@ -3261,6 +3351,12 @@ async fn main() -> Result<()> {
     if let Some(write_fn) = scratchpad_write_fn {
         handler = handler.with_scratchpad_write(write_fn);
     }
+    // #1349: keep one digest of every turn in the person's episodic turn
+    // index. No-op without a Postgres pool, in which case the transcript is
+    // still the record and only the recognition surface is missing.
+    if let Some(write_fn) = turn_digest_write_fn {
+        handler = handler.with_turn_digest_write(write_fn);
+    }
     if let Some(list_fn) = scratchpad_list_fn {
         handler = handler.with_scratchpad_list(list_fn);
     }
@@ -4057,6 +4153,13 @@ async fn main() -> Result<()> {
         && let Err(e) = task.await
     {
         tracing::warn!("backfill task join error during shutdown: {e}");
+    }
+
+    let _ = digest_backfill_shutdown_tx.send(());
+    if let Some(task) = digest_backfill_task
+        && let Err(e) = task.await
+    {
+        tracing::warn!("turn-digest backfill join error during shutdown: {e}");
     }
 
     let _ = embed_recheck_shutdown_tx.send(());

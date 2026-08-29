@@ -1,0 +1,199 @@
+//! The episodic turn index: one digest per turn, scoped to the person (#1349).
+//!
+//! ## What a digest is
+//!
+//! What the harness kept of one turn, built by [`crate::turn_capture`] with no
+//! model call: the user's own words, what the assistant answered, and the tool
+//! calls with their outcomes. The construction and its rules live there. This
+//! module is the store the digest lands in and the shape it is stored as.
+//!
+//! ## Why the person and not the conversation
+//!
+//! A digest on the conversation's own scratchpad duplicates the transcript
+//! sitting beside it, and it can never answer "when did I last deal with
+//! this": a turn in one conversation is invisible from every other. Scoping
+//! the store to the person makes the episodic record reachable by relevance
+//! across the whole account, which is what recognition needs and what the
+//! transcript, the rolling summary and a lexical search each fail to give.
+//!
+//! The store holds the home conversation too, so within-conversation recall
+//! survives the move. One row, one home: nothing is copied onto the pad.
+//!
+//! ## Disposition, and what it is for
+//!
+//! A knowledge entry carries a [`Disposition`] and a soft-deletion story, so
+//! the machinery that withholds and retires a claim can reach it. A digest
+//! that outlives its conversation needs the same hooks, or that machinery
+//! cannot reach episodes at all. [`TurnDigest::marked_text`] is how a reader
+//! meets a dispositioned digest: the disposition's own marker is joined to the
+//! text at one call site, so no render path can show the words without it.
+//!
+//! ## Deletion
+//!
+//! A digest's lifecycle is no longer its conversation's, so the cascade is
+//! stated in the schema rather than left to a caller: deleting a conversation
+//! deletes its digests. Without it, deleting a conversation would be a promise
+//! the product does not keep.
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use crate::CoreError;
+use crate::domain::Disposition;
+use crate::ports::embedding::{ChunkEmbeddable, ChunkedEmbedding};
+
+/// Maximum byte length of one digest's content.
+///
+/// The digest is a bounded record, not a second transcript: a turn can carry a
+/// megabyte of tool output, and every byte of it is already in `messages`.
+/// [`crate::turn_capture`] spends this budget in priority order and says so
+/// when it cut.
+pub const MAX_DIGEST_BYTES: usize = 8 * 1024;
+
+/// A digest to upsert, identified by the message that opened its turn.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewTurnDigest {
+    /// The id of the message that opened the turn. The digest's identity
+    /// within its conversation, so re-running the capture for the same turn
+    /// writes the same row rather than a second one.
+    pub opening_message_id: String,
+    /// The digest text, as [`crate::turn_capture::capture_turn`] built it.
+    pub content: String,
+    /// Whether the turn that produced this text had already read content from
+    /// outside the trust boundary (#1247). Carried from the writing turn, and
+    /// re-derived from the stored tool traffic when a digest is backfilled.
+    pub after_outside_read: bool,
+    /// The digest's vector, when the writer embedded it before the write.
+    /// `None` stores it unembedded and leaves it for the background backfill,
+    /// which is the normal degraded state when no embedding backend is
+    /// configured or the backend stalled.
+    pub embedding: Option<ChunkedEmbedding>,
+}
+
+impl NewTurnDigest {
+    /// A digest for `opening_message_id`, unembedded and unstamped.
+    pub fn new(opening_message_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            opening_message_id: opening_message_id.into(),
+            content: content.into(),
+            after_outside_read: false,
+            embedding: None,
+        }
+    }
+}
+
+impl ChunkEmbeddable for NewTurnDigest {
+    /// The digest's own text, and nothing else.
+    ///
+    /// The opening message id is deliberately left out: it is a UUID, it says
+    /// nothing about what the turn was about, and a store's backfill has to
+    /// build the same string as its write path or the two produce vectors that
+    /// are not comparable. `crate::storage`'s backfill selects `content` for
+    /// exactly this reason.
+    fn embed_text(&self) -> String {
+        self.content.clone()
+    }
+
+    fn set_embedding(&mut self, embedding: ChunkedEmbedding) {
+        self.embedding = Some(embedding);
+    }
+}
+
+/// A stored turn digest.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnDigest {
+    /// The row's own id.
+    pub id: String,
+    /// The conversation the turn happened in. A digest is readable from every
+    /// conversation the person owns; this says where it came from.
+    pub conversation_id: String,
+    /// The message that opened the turn - the handle a reader follows back
+    /// into the transcript.
+    pub opening_message_id: String,
+    /// The digest text as stored. Read it through [`Self::marked_text`], never
+    /// directly, so a dispositioned digest cannot be shown unmarked.
+    pub content: String,
+    /// Whether the turn that produced this text had already read outside
+    /// content.
+    pub after_outside_read: bool,
+    /// What a person or the consolidation machinery has judged this episode to
+    /// be.
+    pub disposition: Disposition,
+    /// The stated reason for a non-default disposition.
+    pub disposition_reason: Option<String>,
+    /// The digest that replaced this one, where one did.
+    pub superseded_by: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl TurnDigest {
+    /// [`Self::content`] as a reader must see it: carrying this digest's own
+    /// [`Disposition::marker`].
+    ///
+    /// The one place the marker is joined, for the same reason
+    /// [`crate::domain::KnowledgeEntry::marked_text`] is: two call sites
+    /// agreeing to remember the rule is the shape that lets one of them go out
+    /// unmarked.
+    #[must_use]
+    pub fn marked_text(&self) -> String {
+        format!("{}{}", self.disposition.marker(), self.content)
+    }
+}
+
+/// The episodic turn index, scoped to the person.
+///
+/// Every method reads the caller's own user id from the ambient scope, the
+/// same way every other personal-data store does; nothing here takes a user as
+/// a parameter, and a read for one person never answers with another's rows.
+#[async_trait::async_trait]
+pub trait TurnDigestStore: Send + Sync {
+    /// Upsert `digests` for `conversation_id`, returning the stored rows.
+    ///
+    /// Keyed on `(conversation_id, opening_message_id)`, so capturing the same
+    /// turn twice leaves one row (AGENTS.md 8.4).
+    async fn write(
+        &self,
+        conversation_id: &str,
+        digests: &[NewTurnDigest],
+    ) -> Result<Vec<TurnDigest>, CoreError>;
+
+    /// The person's most recent digests, newest first, across every
+    /// conversation they own.
+    ///
+    /// `include_dispositioned` admits the digests an ordinary read leaves out
+    /// - see [`Disposition::Obsolete`], which no longer applies and is not
+    /// offered unless it is asked for.
+    async fn recent(
+        &self,
+        limit: usize,
+        include_dispositioned: bool,
+    ) -> Result<Vec<TurnDigest>, CoreError>;
+
+    /// One digest by its row id, or `None` when this person owns no such row.
+    async fn get(&self, id: &str) -> Result<Option<TurnDigest>, CoreError>;
+
+    /// Record what this digest is judged to be.
+    ///
+    /// `superseded_by` is required for [`Disposition::Superseded`] and
+    /// [`Disposition::Redundant`], which resolve through the link and cannot
+    /// be carried without one. Answers whether a row changed.
+    async fn set_disposition(
+        &self,
+        id: &str,
+        disposition: Disposition,
+        reason: Option<&str>,
+        superseded_by: Option<&str>,
+    ) -> Result<bool, CoreError>;
+}
+
+/// Boxed async closure for writing digests through non-generic boundaries.
+pub type TurnDigestWriteFn = Arc<
+    dyn Fn(
+            String,
+            Vec<NewTurnDigest>,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<TurnDigest>, CoreError>> + Send>>
+        + Send
+        + Sync,
+>;
