@@ -1274,26 +1274,27 @@ mod tests {
     /// geometry and none of the content - one distance per note, and no column
     /// of the note itself. Only the notes the block may show are read whole.
     ///
-    /// `note_type` used to be on this list and is not any more (#1349). It
-    /// names which rows are in the population rather than what any row says,
-    /// which is what `note_key` has always done here - `note_key <> $9` keeps
-    /// the goal note out of the spread, and sits in the same WHERE. A column
-    /// used that way has to be readable by the measuring pass or the row it
-    /// excludes is excluded from the candidates and counted in the geometry,
-    /// which is the mismatch `the_pad_scan_leaves_the_goal_note_out_of_the_
-    /// spread` exists to prevent. The columns left are the ones that carry
-    /// what a note SAYS, which the measuring pass still has no use for.
+    /// Cut at `FROM scratchpads`, so what is checked is the measuring CTE's
+    /// SELECT LIST and not its WHERE clause. Those two are different claims,
+    /// and cutting at the outer select conflates them: a column named only in
+    /// the WHERE is a bound on which rows are in the population - which is
+    /// what `note_key <> $9` and `note_type <> $10` are, and both have to be
+    /// readable there or the row they exclude is missing from the candidates
+    /// and counted in the geometry. A column named in the select LIST is the
+    /// pass reading the note itself, which is the thing #1167 forbids, and
+    /// `note_type` belongs on this list for that half.
     #[test]
     fn the_pad_scan_measures_before_it_reads_any_note() {
         let measured = NEAREST_NOTES_BY_EMBEDDING_SQL
-            .split("     SELECT sp.id")
+            .split("FROM scratchpads")
             .next()
-            .expect("the scan selects the notes it will show after it measures the spread");
+            .expect("the measuring pass selects from scratchpads");
 
-        for column in ["content", "knowledge_entry_id"] {
+        for column in ["content", "note_type", "knowledge_entry_id"] {
             assert!(
                 !measured.contains(column),
-                "the pass that measures the spread reads {column}, which it has no use for"
+                "the pass that measures the spread projects {column}, which it has no \
+                 use for:\n{NEAREST_NOTES_BY_EMBEDDING_SQL}"
             );
         }
     }

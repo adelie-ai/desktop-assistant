@@ -8,10 +8,15 @@
 //! Follows the patterns the other personal-data adapters set:
 //! - `user_id`-scoped queries throughout, with `current_user_id()` read from
 //!   the task-local - nothing here takes a `UserId` parameter.
-//! - Cross-user reads answer empty rather than erroring, and the upsert's
-//!   `WHERE turn_digests.user_id = EXCLUDED.user_id` guard fails closed: the
-//!   conflict target is not user-scoped, so that guard is the only thing
-//!   standing between a colliding key and another tenant's row (#809).
+//! - Cross-user reads answer empty rather than erroring. A cross-user WRITE
+//!   does not reach a guard at all: migration 062's foreign key references
+//!   `conversations (user_id, id)`, so a digest naming a conversation somebody
+//!   else owns is refused by the database. Two further layers sit behind that
+//!   and are deliberately kept - the conflict target carries `user_id`, so it
+//!   cannot cross tenants even if the reference were relaxed, and the upsert's
+//!   `WHERE turn_digests.user_id = EXCLUDED.user_id` guard fails closed the way
+//!   `PgKnowledgeBaseStore::write` does (#809). Neither is load-bearing while
+//!   the composite reference stands.
 //! - Disposition is honoured on the read rather than at each call site.
 //!   `obsolete` is left out unless a caller asks for it, exactly as
 //!   `knowledge_search` does, and every other value comes back carrying
@@ -50,10 +55,12 @@ const DIGEST_COLUMNS: &[&str] = &[
 
 /// Batch upsert, keyed on the turn rather than on the row id.
 ///
-/// The conflict target carries `user_id`, so it cannot cross tenants at all -
-/// see migration 062. The `WHERE turn_digests.user_id = EXCLUDED.user_id`
-/// guard below is kept as defence in depth rather than removed with the
-/// hazard it used to be the only answer to.
+/// Three things stop a write reaching another tenant's row, and the outermost
+/// is the one that fires: migration 062's composite foreign key refuses a
+/// digest that names a conversation somebody else owns, so the collision this
+/// upsert would have to resolve is not constructible. The conflict target
+/// carrying `user_id`, and the `WHERE turn_digests.user_id = EXCLUDED.user_id`
+/// guard below, are kept behind it rather than removed with the hazard.
 ///
 /// The vector is CLEARED on every update and written back by the statement
 /// after it. Clearing is what keeps a vector honest: an upsert replaces the
@@ -332,11 +339,24 @@ mod tests {
     /// satisfied by `conversation_id`, and `contains("disposition")` by
     /// `disposition_reason`, so a substring check passes on a projection that
     /// is missing the very column it claims to be checking.
+    ///
+    /// The LAST `SELECT`, not the first, because a CTE's inner select comes
+    /// first in the text and the row is built from the outer one. No query
+    /// here is a CTE yet; the recall read that #1350 adds will be, since every
+    /// sibling adapter writes a vector or hybrid query that way. Reading the
+    /// inner list would then pass a query whose outer list drops a column,
+    /// which is exactly the runtime failure this check exists to catch, and it
+    /// would pass silently.
+    ///
+    /// Other shapes fail loudly through the `extra` assertion rather than
+    /// silently: lowercase ` as `, `coalesce(a, b) AS x`,
+    /// `extract(epoch FROM x)` and `SELECT DISTINCT` all produce a name that
+    /// is not a column and are named as such. Only the CTE case was silent.
     fn projected_columns(sql: &str) -> BTreeSet<String> {
         let projection = match sql.rfind("RETURNING ") {
             Some(at) => &sql[at + "RETURNING ".len()..],
             None => {
-                let from = sql.find("SELECT ").expect("a SELECT or a RETURNING") + "SELECT ".len();
+                let from = sql.rfind("SELECT ").expect("a SELECT or a RETURNING") + "SELECT ".len();
                 let to = sql[from..].find(" FROM ").expect("a FROM") + from;
                 &sql[from..to]
             }
@@ -394,5 +414,27 @@ mod tests {
         assert!(projected.contains("disposition_reason"), "{projected:?}");
         assert!(projected.contains("content"), "an alias prefix is stripped");
         assert!(projected.contains("updated_at"), "an AS alias is the name");
+    }
+
+    /// A CTE's OUTER select list is what builds the row, so that is the list
+    /// read.
+    ///
+    /// The inner list here carries a column the outer one drops. Reading the
+    /// inner one would report the query as complete while sqlx fails on it at
+    /// runtime - the silent pass this whole check exists to prevent, and the
+    /// shape #1350's recall read will have.
+    #[test]
+    fn the_projection_reader_reads_a_ctes_outer_select_list() {
+        let projected = projected_columns(
+            "WITH d AS (SELECT id, content, disposition FROM turn_digests WHERE user_id = $1) \
+             SELECT id, content FROM d",
+        );
+        assert_eq!(
+            projected,
+            ["content".to_string(), "id".to_string()]
+                .into_iter()
+                .collect::<BTreeSet<String>>(),
+            "the outer list is the row, so `disposition` must not be counted as projected"
+        );
     }
 }

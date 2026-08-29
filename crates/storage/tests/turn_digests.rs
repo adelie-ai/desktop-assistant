@@ -160,10 +160,19 @@ async fn a_turn_digest_is_readable_from_a_different_conversation_by_the_same_use
 }
 
 /// Acceptance 2 (#1349): the index is one person's, and never another's. The
-/// permit is paired with the refusal, and the cross-tenant UPSERT guard is
-/// checked as well as the reads - the conflict target is not user-scoped, so
-/// that guard is the only thing standing between a colliding key and another
-/// tenant's row.
+/// permit is paired with the refusal, and the write path is checked as well as
+/// the reads.
+///
+/// What the write does has changed twice, so it is stated exactly. Bob's write
+/// names a conversation alice owns, and migration 062's composite foreign key
+/// refuses it at the database - it is an error, not a decline. Two earlier
+/// shapes are worth naming so nobody reads this test as covering them: with a
+/// key of (conversation_id, opening_message_id) bob's row would have collided
+/// with alice's and been silently dropped by the `EXCLUDED.user_id` guard, and
+/// with `user_id` in the key but a single-column reference bob would have got
+/// his own row carrying alice's `conversation_id`. Neither is reachable now,
+/// and `a_write_naming_another_users_conversation_is_refused_by_the_database`
+/// holds the refusal on its own.
 #[tokio::test]
 async fn a_turn_digest_is_never_readable_by_a_different_user() {
     let Some(fx) = DbFixture::try_new("td_tenant").await else {
@@ -202,12 +211,16 @@ async fn a_turn_digest_is_never_readable_by_a_different_user() {
             "bob must not be able to disposition alice's digest"
         );
 
-        // And the write path: a colliding key from another tenant must not
-        // overwrite the row in place.
-        store
+        // And the write path: bob cannot store a digest against a conversation
+        // he does not own. The database refuses it, so this is an error rather
+        // than an empty answer.
+        let refused = store
             .write("conv-a", &[digest("m-a", "bob's overwrite")])
-            .await
-            .expect("bob's write is declined, not errored");
+            .await;
+        assert!(
+            refused.is_err(),
+            "a digest naming another person's conversation must be refused: {refused:?}"
+        );
     })
     .await;
 
@@ -233,38 +246,44 @@ async fn a_turn_digest_is_never_readable_by_a_different_user() {
     fx.cleanup().await;
 }
 
-/// A second tenant cannot squat a digest's key and make the rightful owner's
-/// write vanish.
+/// A write naming another person's conversation is refused by the DATABASE,
+/// not merely unreachable through the handler (#1349).
 ///
-/// The foreign key only requires the conversation to EXIST, not to belong to
-/// the writer. With a key of (conversation_id, opening_message_id) a second
-/// user could insert against another person's conversation first; the owner's
-/// upsert would then conflict, be refused by the `EXCLUDED.user_id` guard on
-/// the DO UPDATE, and return no rows - a silently dropped write. Carrying
-/// `user_id` in the key makes the two rows separate by construction.
+/// The foreign key is composite - `(user_id, conversation_id)` references
+/// `conversations (user_id, id)` - so the pair itself has to exist. A
+/// single-column reference asks only whether the conversation exists, which
+/// makes a cross-tenant digest storable and leaves the refusal to whatever the
+/// application remembers to check.
 ///
-/// Not reachable through today's handler, which resolves the conversation for
-/// the caller. Held here because 062 has not shipped, so the structural fix
-/// costs nothing now and a migration later.
+/// Paired with the permit: the owner's own write still lands, and still lands
+/// after the refused one, so the refusal cannot be the store simply failing.
 #[tokio::test]
-async fn a_second_user_cannot_squat_a_digests_key() {
-    let Some(fx) = DbFixture::try_new("td_squat").await else {
+async fn a_write_naming_another_users_conversation_is_refused_by_the_database() {
+    let Some(fx) = DbFixture::try_new("td_fk").await else {
         return;
     };
     let store = PgTurnDigestStore::new(fx.pool.clone());
 
     seed_conversation(&fx.pool, "alice", "conv-a", &[]).await;
 
-    // Bob gets there first, against a conversation that is not his.
-    with_user_id(UserId::new("bob"), async {
+    let refused = with_user_id(UserId::new("bob"), async {
         store
             .write("conv-a", &[digest("m-a", "bob's squatted row")])
             .await
-            .expect("bob writes");
     })
     .await;
+    assert!(
+        refused.is_err(),
+        "the database must refuse a digest naming another person's conversation, \
+         got {refused:?}"
+    );
+    assert_eq!(
+        digest_count(&fx.pool, "conv-a").await,
+        0,
+        "and must store nothing"
+    );
 
-    // Alice's own write still lands, and answers with her row.
+    // The permit: the owner's own write lands.
     let written = with_user_id(UserId::new("alice"), async {
         store
             .write("conv-a", &[digest("m-a", "alice's own words")])
@@ -272,25 +291,47 @@ async fn a_second_user_cannot_squat_a_digests_key() {
             .expect("alice writes")
     })
     .await;
-    assert_eq!(
-        written.len(),
-        1,
-        "the owner's write must not be silently dropped: {written:?}"
-    );
+    assert_eq!(written.len(), 1, "{written:?}");
     assert_eq!(written[0].content, "alice's own words");
 
-    // And each reads only their own.
-    for (user, expected) in [
-        ("alice", "alice's own words"),
-        ("bob", "bob's squatted row"),
-    ] {
-        let index = with_user_id(UserId::new(user), async {
-            store.recent(50, false).await.expect("read the index")
-        })
-        .await;
-        assert_eq!(index.len(), 1, "{user}: {index:?}");
-        assert_eq!(index[0].content, expected, "{user}");
-    }
+    fx.cleanup().await;
+}
+
+/// The digest key carries the tenant.
+///
+/// This is a schema assertion rather than a behavioural one, and deliberately
+/// so: the composite foreign key above makes a cross-tenant collision
+/// unconstructible through the store, so nothing observable is left to drive.
+/// The key still carries `user_id` as the layer behind that reference, and
+/// this is what stops the layer being dropped as dead weight by someone who
+/// cannot see what it is for.
+#[tokio::test]
+async fn the_digest_key_carries_the_tenant() {
+    let Some(fx) = DbFixture::try_new("td_key").await else {
+        return;
+    };
+
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT a.attname \
+           FROM pg_constraint c \
+           JOIN unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE \
+           JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum \
+          WHERE c.conrelid = 'turn_digests'::regclass AND c.contype = 'u' \
+          ORDER BY k.ord",
+    )
+    .fetch_all(&fx.pool)
+    .await
+    .expect("read the unique constraint's columns");
+
+    assert_eq!(
+        columns,
+        vec![
+            "user_id".to_string(),
+            "conversation_id".to_string(),
+            "opening_message_id".to_string()
+        ],
+        "the digest's identity must carry the tenant"
+    );
 
     fx.cleanup().await;
 }

@@ -65,10 +65,36 @@
 -- here must still be idempotent: a database migrated before that ledger
 -- existed replays the whole set once on its first boot under it.
 
+-- The key `turn_digests`'s foreign key points at. `conversations` has only
+-- `id` as its primary key, and a foreign key can reference a unique
+-- constraint only - so pointing at (user_id, id) needs that pair declared
+-- unique first.
+--
+-- It cannot fail on existing data. `id` is already the primary key, so it is
+-- unique on its own, and a pair whose second column is unique is unique
+-- whatever the first column holds. No duplicate is constructible, and the
+-- statement adds an index rather than rejecting a row.
+--
+-- ADD CONSTRAINT has no IF NOT EXISTS form, hence the catalog guard. The
+-- owner of `conversations` can add this, so it stays inside the owner-only
+-- migration set that migration 029 established (see
+-- `run_migrations_succeeds_as_unprivileged_table_owner`).
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'conversations'::regclass
+          AND conname = 'conversations_user_id_id_key'
+    ) THEN
+        ALTER TABLE conversations
+            ADD CONSTRAINT conversations_user_id_id_key UNIQUE (user_id, id);
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS turn_digests (
     id                 TEXT PRIMARY KEY,
     user_id            TEXT NOT NULL,
-    conversation_id    TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    conversation_id    TEXT NOT NULL,
     -- The message that opened the turn: the digest's identity, and the handle
     -- a reader follows back into the transcript.
     opening_message_id TEXT NOT NULL,
@@ -92,7 +118,20 @@ CREATE TABLE IF NOT EXISTS turn_digests (
     -- meaning when it arrives: the row is in the trash. Disposition is
     -- orthogonal to it, so a dispositioned row is normally live.
     deleted_at         TIMESTAMPTZ,
-    UNIQUE (user_id, conversation_id, opening_message_id)
+    UNIQUE (user_id, conversation_id, opening_message_id),
+    -- Composite on purpose. A single-column reference to `conversations(id)`
+    -- asks only whether the conversation EXISTS, not who owns it, so a write
+    -- naming another person's conversation is accepted by the database and
+    -- refused only by whatever the application remembers to check. Referencing
+    -- (user_id, id) makes the pair itself the thing that must exist, so a
+    -- cross-tenant digest cannot be stored at all - by the schema, not by a
+    -- caller's care.
+    --
+    -- No ON UPDATE clause, so it defaults to NO ACTION: moving a conversation
+    -- to another owner is refused while it holds digests, rather than silently
+    -- carrying somebody's episodes across to a different person.
+    FOREIGN KEY (user_id, conversation_id)
+        REFERENCES conversations (user_id, id) ON DELETE CASCADE
 );
 
 -- The person's own episodes, newest first, across every conversation they
@@ -101,14 +140,15 @@ CREATE INDEX IF NOT EXISTS turn_digests_user_created_idx
     ON turn_digests (user_id, created_at DESC)
     WHERE deleted_at IS NULL;
 
--- The cascade's own index. Deleting a conversation runs
--- `DELETE FROM turn_digests WHERE conversation_id = ...`, and no other index
--- here leads with that column: the unique key leads with `user_id` and the
--- index above leads with `user_id` too, so without this every conversation
--- delete is a full scan of the table. It carries no `deleted_at` predicate
--- because the cascade removes rows whatever their state.
-CREATE INDEX IF NOT EXISTS turn_digests_conversation_idx
-    ON turn_digests (conversation_id);
+-- The cascade needs no index of its own. Because the foreign key is composite,
+-- deleting a conversation runs
+-- `DELETE FROM turn_digests WHERE user_id = ... AND conversation_id = ...`,
+-- and the unique key above leads with exactly those two columns - measured,
+-- not assumed: the planner uses
+-- `turn_digests_user_id_conversation_id_opening_message_id_key` with both
+-- columns as index conditions. A single-column index on `conversation_id`
+-- would be used with `user_id` demoted to a filter, which is a worse plan for
+-- the same work, so there is deliberately no second index here.
 
 -- The same vocabulary migration 056 pins for knowledge_base. ADD CONSTRAINT
 -- has no IF NOT EXISTS form, hence the catalog guard.
