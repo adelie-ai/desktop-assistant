@@ -10,6 +10,7 @@ pub mod database;
 pub mod dreaming;
 pub mod embedded_tables;
 pub mod embedding_backfill;
+pub mod episode_use;
 pub mod error_classifications;
 pub mod idempotency_keys;
 pub mod kb_metadata;
@@ -53,6 +54,7 @@ pub use conversation_search::PgConversationSearchStore;
 pub use database::{
     TOOL_QUERY_ROLE, WRITE_SANDBOX_SCHEMA, execute_database_query, personal_data_tables,
 };
+pub use episode_use::PgEpisodeUseLog;
 pub use error_classifications::PgErrorClassificationStore;
 pub use idempotency_keys::PgIdempotencyKeyStore;
 pub use knowledge::{NearestEntries, PgKnowledgeBaseStore, RECALL_SCAN_STATEMENT_TIMEOUT};
@@ -79,7 +81,7 @@ pub use skill_use::PgSkillUseLog;
 /// knowledge-maintenance service) without taking a direct `sqlx` dependency.
 pub use sqlx::PgPool;
 pub use tool_registry::{PROVIDER_BOOST_WEIGHT, PgToolRegistryStore, ToolRegisterBatch};
-pub use turn_digest::PgTurnDigestStore;
+pub use turn_digest::{NearestDigests, PgTurnDigestStore};
 pub use turn_digest_backfill::{TurnDigestBackfill, backfill_turn_digests};
 pub use turn_records::{PgTurnRecordStore, sweep_expired_turn_records};
 pub use turn_state::PgTurnStateStore;

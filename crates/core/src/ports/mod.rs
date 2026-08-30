@@ -40,6 +40,7 @@ pub mod conversation_search;
 pub mod auth;
 pub mod client_tools;
 pub mod conversation_ctx;
+pub mod episode_use;
 pub mod knowledge_delete;
 pub mod negative_memory;
 pub mod notify;

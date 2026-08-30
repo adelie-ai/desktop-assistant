@@ -273,6 +273,10 @@ const MIGRATIONS: &[Migration] = &[
     // per turn, scoped to the person rather than to the conversation, so a
     // past turn is reachable by relevance from anywhere in the account.
     migration!("062_turn_digests.sql"),
+    // #1350: the episode use log - what the `[Recall]` block's past-turns arm
+    // offered and what the model opened, so the arm ranks by activation rather
+    // than by semantic distance alone and can be measured at all.
+    migration!("063_episode_use_log.sql"),
 ];
 
 /// Second half of the advisory-lock key: the schema the migrations write to.

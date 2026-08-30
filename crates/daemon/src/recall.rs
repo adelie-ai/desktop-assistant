@@ -1,10 +1,25 @@
-//! Adapter behind the pre-prompt recall port (#1100, #1101, #1154).
+//! Adapter behind the pre-prompt recall port (#1100, #1101, #1154, #1350).
 //!
-//! One user prompt, one embedding, three indexes. The knowledge base answers
+//! One user prompt, one embedding, four indexes. The knowledge base answers
 //! with the entries nearest the prompt and how near each is; this
-//! conversation's scratchpad answers the same way about its own notes; and the
-//! skill catalog answers with the approved procedures nearest the prompt. The
-//! core decides what clears the bar and how the `[Recall]` block reads.
+//! conversation's scratchpad answers the same way about its own notes; the
+//! skill catalog answers with the approved procedures nearest the prompt; and
+//! the episodic turn index answers with the person's own past turns, from every
+//! conversation they own. The core decides what clears the bar and how the
+//! `[Recall]` block reads.
+//!
+//! ## The episode arm answers with digests, not with lines
+//!
+//! An episode candidate is built by
+//! [`RecallEpisode::from_digest`](desktop_assistant_core::ports::recall::RecallEpisode::from_digest),
+//! which is what holds an offered line to the user's own half of a turn. This
+//! adapter hands it whole digests and never a rendered string, so the rule
+//! lives in the type and not in this file - see that type for why an
+//! unprompted, cross-conversation line may carry nothing the turn derived.
+//!
+//! The arm has no degraded read: `turn_digests` carries a vector and no
+//! `tsvector`, so there is no lexical index to fall back to, and it stays
+//! silent on a turn whose embedding failed.
 //!
 //! ## The skill arm is optional, and absent is not an error
 //!
@@ -49,9 +64,10 @@
 //! against one. A degradation is logged once, here, rather than once per arm.
 //!
 //! An arm that fails outright is a narrower loss than a lookup that fails. The
-//! scratchpad arm and the skill arm each read a different table from the
-//! knowledge arm, so either can fail on its own, and when one does it costs its
-//! own lines and nothing else - see [`notes_or_none`] and [`skills_or_none`].
+//! scratchpad arm, the skill arm and the episode arm each read a different
+//! table from the knowledge arm, so any of them can fail on its own, and when
+//! one does it costs its own lines and nothing else - see [`notes_or_none`],
+//! [`skills_or_none`] and [`episodes_or_none`].
 //! The measurement carries its own ceiling for the same reason. If a degraded
 //! read fails as well, the error travels to the caller, which drops the block
 //! and runs the turn.
@@ -72,17 +88,20 @@ use desktop_assistant_core::domain::knowledge::{Disposition, KnowledgeEntry};
 use desktop_assistant_core::domain::knowledge_use::KnowledgeUseRecord;
 use desktop_assistant_core::domain::situation::{SituationCue, SituationRecord};
 use desktop_assistant_core::ports::embedding::{EMBED_TIMEOUT, EmbedFn};
+use desktop_assistant_core::ports::episode_use::EpisodeUseLog;
 use desktop_assistant_core::ports::knowledge_use::{
     KnowledgeUseLog, SituationSignal, current_situation,
 };
+use desktop_assistant_core::ports::recall::RecallEpisode;
 use desktop_assistant_core::ports::recall::{
     RecallCandidates, RecallDispersion, RecallEntry, RecallNote, RecallRelevance, RecallRequest,
     RecallSearchFn, RecallSkill,
 };
 use desktop_assistant_core::ports::skill_use::SkillUseLog;
+use desktop_assistant_core::ports::turn_digest::TurnDigest;
 use desktop_assistant_storage::{
-    NearestSkill, PgKnowledgeBaseStore, PgKnowledgeUseLog, PgPool, PgScratchpadStore,
-    PgSkillIndexStore, PgSkillUseLog,
+    NearestSkill, PgEpisodeUseLog, PgKnowledgeBaseStore, PgKnowledgeUseLog, PgPool,
+    PgScratchpadStore, PgSkillIndexStore, PgSkillUseLog, PgTurnDigestStore,
 };
 
 /// How long one whole recall lookup may take before the turn gives up on it.
@@ -133,27 +152,36 @@ pub fn build_recall_search(
     embed: EmbedFn,
     embedding_model: String,
 ) -> RecallSearchFn {
-    // The pad adapter and the two use logs are handles on the same pool, built
-    // once here rather than threaded in: nothing else in the daemon holds the
-    // pad one, and the reads behind these arms are inherent to them.
+    // The pad adapter, the episodic store and the three use logs are handles on
+    // the same pool, built once here rather than threaded in: nothing else in
+    // the daemon holds the pad one, and the reads behind these arms are
+    // inherent to them.
     let pad = Arc::new(PgScratchpadStore::new(pool.clone()));
+    let digests = Arc::new(PgTurnDigestStore::new(pool.clone()));
     let uses = Arc::new(PgKnowledgeUseLog::new(pool.clone()));
     let skill_uses = Arc::new(PgSkillUseLog::new(pool.clone()));
+    let episode_uses = Arc::new(PgEpisodeUseLog::new(pool.clone()));
     Arc::new(move |request: RecallRequest| {
         let kb_store = Arc::clone(&kb_store);
         let skill_store = skill_store.clone();
         let pad = Arc::clone(&pad);
+        let digests = Arc::clone(&digests);
         let uses = Arc::clone(&uses);
         let skill_uses = Arc::clone(&skill_uses);
+        let episode_uses = Arc::clone(&episode_uses);
         let embed = Arc::clone(&embed);
         let embedding_model = embedding_model.clone();
         Box::pin(async move {
             within_ceiling(lookup(
-                &kb_store,
-                skill_store.as_deref(),
-                &pad,
-                &uses,
-                &skill_uses,
+                &Sources {
+                    kb_store: &kb_store,
+                    skill_store: skill_store.as_deref(),
+                    pad: &pad,
+                    digests: &digests,
+                    uses: &uses,
+                    skill_uses: &skill_uses,
+                    episode_uses: &episode_uses,
+                },
                 &embed,
                 &embedding_model,
                 request,
@@ -161,6 +189,19 @@ pub fn build_recall_search(
             .await
         })
     })
+}
+
+/// The stores and logs one lookup reads, gathered into one value so [`lookup`]
+/// takes an argument per concern rather than one per handle.
+#[derive(Clone, Copy)]
+struct Sources<'a> {
+    kb_store: &'a PgKnowledgeBaseStore,
+    skill_store: Option<&'a PgSkillIndexStore>,
+    pad: &'a PgScratchpadStore,
+    digests: &'a PgTurnDigestStore,
+    uses: &'a PgKnowledgeUseLog,
+    skill_uses: &'a PgSkillUseLog,
+    episode_uses: &'a PgEpisodeUseLog,
 }
 
 /// What the skill arm answers with: the candidates, the catalog's own spread,
@@ -187,6 +228,15 @@ type KnowledgeArm = (
 /// The same, for the scratchpad arm, which keeps no situation record of its
 /// own.
 type NoteArm = (Vec<RecallNote>, Option<RecallDispersion>);
+
+/// The same, for the episode arm, which keeps no situation record of its own
+/// either (#1350), plus the count of rows its scan returned.
+///
+/// That third part is not `candidates.len()`: a digest with no question yields
+/// no candidate, and the block's "and N more" hedge is a statement about what
+/// the scan READ - see
+/// [`RecallCandidates::episodes_scanned`](desktop_assistant_core::ports::recall::RecallCandidates::episodes_scanned).
+type EpisodeArm = (Vec<RecallEpisode>, Option<RecallDispersion>, usize);
 
 /// Whether the knowledge arm may offer this entry at all (#893).
 ///
@@ -232,17 +282,21 @@ async fn within_ceiling(
 }
 
 /// One lookup: embed once, then ask every index.
-#[allow(clippy::too_many_arguments)]
 async fn lookup(
-    kb_store: &PgKnowledgeBaseStore,
-    skill_store: Option<&PgSkillIndexStore>,
-    pad: &PgScratchpadStore,
-    uses: &PgKnowledgeUseLog,
-    skill_uses: &PgSkillUseLog,
+    sources: &Sources<'_>,
     embed: &EmbedFn,
     embedding_model: &str,
     request: RecallRequest,
 ) -> Result<RecallCandidates, CoreError> {
+    let Sources {
+        kb_store,
+        skill_store,
+        pad,
+        digests,
+        uses,
+        skill_uses,
+        episode_uses,
+    } = *sources;
     let Some(vector) = embed_prompt(embed, &request.prompt).await else {
         // Degraded: full-text for every arm, and no dispersion. A full-text row
         // carries no distance, so there is nothing to read against a spread.
@@ -308,6 +362,14 @@ async fn lookup(
                     None,
                 ))
             },
+            // The episode arm has no degraded read, and that is a property of
+            // the store rather than a gap here. `turn_digests` carries a vector
+            // and no `tsvector`, so there is no lexical index to fall back to,
+            // and a scan of every digest's text on the turn where the embedder
+            // is already failing is the wrong thing to spend a turn on. The arm
+            // is silent for that turn and the rest of the block renders, which
+            // is the same absence a deployment with no digests produces.
+            async { Ok((Vec::new(), None, 0)) },
         )
         .await;
     };
@@ -315,6 +377,7 @@ async fn lookup(
     // Every arm shares the one vector, and none depends on another.
     let vector_for_notes = vector.clone();
     let vector_for_skills = vector.clone();
+    let vector_for_episodes = vector.clone();
     // The situation this turn arrived in, read once for the whole lookup. It is
     // derived from the clock and what the client reported, so it costs no model
     // call and no extra work on the write path - see
@@ -487,8 +550,71 @@ async fn lookup(
                 cue,
             ))
         },
+        async {
+            let found = digests
+                .nearest_by_embedding(vector_for_episodes, embedding_model, request.episode_limit)
+                .await?;
+            // One batched read after the scan, on the same terms and for the
+            // same reasons as the knowledge arm's above: a slow or broken log
+            // costs the order of the episode lines and never the lines.
+            //
+            // No situation read beside it. Nothing records the situation an
+            // episode was opened in, so there is no table to grade a cue
+            // against and the term is `NO_SITUATION` for every candidate - see
+            // `RecallEpisode::situation_coverage`. A read here would be a query
+            // whose answer nothing reads.
+            let ids: Vec<String> = found.digests.iter().map(|(d, _)| d.id.clone()).collect();
+            let mut records = if ids.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                use_records(episode_uses.records(ids)).await
+            };
+            // Counted before the map is consumed below, so the log line
+            // reports what the log answered rather than what is left of it.
+            let with_use_record = records.len();
+            let episodes: Vec<RecallEpisode> = found
+                .digests
+                .iter()
+                .filter_map(|(digest, distance)| {
+                    // A digest with no user half is skipped here rather than
+                    // rendered empty: `RecallEpisode` cannot be built from one,
+                    // which is what keeps the answer half off the line.
+                    let mut episode =
+                        RecallEpisode::from_digest(digest, RecallRelevance::Distance(*distance))?;
+                    episode = episode.with_use_record(records.remove(&digest.id));
+                    Some(episode)
+                })
+                .collect();
+            let scanned = found.digests.len();
+            unrenderable_digests(&found.digests, episodes.len());
+            tracing::debug!(
+                candidates = episodes.len(),
+                with_use_record,
+                "recall: how many episode candidates the use log had something to say about"
+            );
+            Ok((episodes, found.dispersion, scanned))
+        },
     )
     .await
+}
+
+/// Say when the store answered with digests the arm could not build a line
+/// from.
+///
+/// A digest with no `Asked:` half is a row written by something that is not
+/// `crate::turn_capture` - a hand-inserted row, or a format that moved without
+/// its reader. It is dropped silently by construction, so an operator would
+/// otherwise see an arm that reads rows and offers nothing with no clue why.
+/// A count and nothing of what any row holds: this runs on every turn.
+fn unrenderable_digests(scanned: &[(TurnDigest, f64)], built: usize) {
+    let unrenderable = scanned.len().saturating_sub(built);
+    if unrenderable > 0 {
+        tracing::warn!(
+            unrenderable,
+            scanned = scanned.len(),
+            "recall: some digests carry no question to offer, so the episode arm skipped them"
+        );
+    }
 }
 
 /// One scanned skill as a recall candidate.
@@ -603,7 +729,7 @@ async fn situation_signal(
     (signal.records.into_iter().collect(), signal.cue)
 }
 
-/// Run the three arms together and fold what they answered into one candidate
+/// Run the four arms together and fold what they answered into one candidate
 /// set.
 ///
 /// Generic over the futures, and separate from [`lookup`], so everything it
@@ -613,13 +739,13 @@ async fn situation_signal(
 /// **`join!`, never `try_join!`.** The arms do not depend on each other, and one
 /// arm's error must not cancel one that was answering.
 ///
-/// **The pad arm's and the skill arm's errors are absorbed; the knowledge arm's
+/// **The pad, skill and episode arms' errors are absorbed; the knowledge arm's
 /// propagates.** A knowledge arm that cannot read is the block's whole point
 /// failing, and the caller drops the block and runs the turn anyway; losing the
-/// pad lines or the skill lines is the smaller loss, so it is taken here rather
-/// than passed on. The absorbed arms resolve first, so their failures are
-/// logged even on the turn where the knowledge arm's error is about to end the
-/// lookup.
+/// pad lines, the skill lines or the episode lines is the smaller loss, so it
+/// is taken here rather than passed on. The absorbed arms resolve first, so
+/// their failures are logged even on the turn where the knowledge arm's error
+/// is about to end the lookup.
 ///
 /// Every arm answers with its own source's spread beside its candidates,
 /// because one scan states both (#1167). A source that cannot measure one
@@ -628,10 +754,12 @@ async fn gather(
     entries: impl Future<Output = Result<KnowledgeArm, CoreError>>,
     notes: impl Future<Output = Result<NoteArm, CoreError>>,
     skills: impl Future<Output = Result<SkillArm, CoreError>>,
+    episodes: impl Future<Output = Result<EpisodeArm, CoreError>>,
 ) -> Result<RecallCandidates, CoreError> {
-    let (entries, notes, skills) = tokio::join!(entries, notes, skills);
+    let (entries, notes, skills, episodes) = tokio::join!(entries, notes, skills, episodes);
     let (notes, note_dispersion) = notes_or_none(notes);
     let (skills, skill_dispersion, skill_situation_cue) = skills_or_none(skills);
+    let (episodes, episode_dispersion, episodes_scanned) = episodes_or_none(episodes);
     let (entries, entry_dispersion, situation_cue) = entries?;
     // Which sources stated their own geometry, and which the block will read by
     // a stated estimate. Without this an operator meeting a block that is
@@ -642,17 +770,21 @@ async fn gather(
         knowledge = how_the_distances_are_read(entry_dispersion),
         scratchpad = how_the_distances_are_read(note_dispersion),
         skills = how_the_distances_are_read(skill_dispersion),
+        episodes = how_the_distances_are_read(episode_dispersion),
         "recall: how each source's distances are read"
     );
     Ok(RecallCandidates {
         entries,
         notes,
         skills,
+        episodes,
         entry_dispersion,
         note_dispersion,
         situation_cue,
         skill_dispersion,
         skill_situation_cue,
+        episode_dispersion,
+        episodes_scanned,
     })
 }
 
@@ -727,6 +859,29 @@ fn skills_or_none(found: Result<SkillArm, CoreError>) -> SkillArm {
                 "recall: the skill arm failed; the other arms still render"
             );
             (Vec::new(), None, None)
+        }
+    }
+}
+
+/// The episode arm's rows and its spread, or neither (#1350).
+///
+/// The same treatment [`notes_or_none`] gives the pad, and for the same reason:
+/// the arm reads its own table, so it fails on its own, and losing the episode
+/// lines is a smaller loss than losing the block. The spread goes with the
+/// rows, because a spread with no candidates to grade is nothing and must not
+/// be left standing as though the store had been measured.
+fn episodes_or_none(found: Result<EpisodeArm, CoreError>) -> EpisodeArm {
+    match found {
+        Ok(answer) => answer,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "recall: the episode arm failed; the other arms still render"
+            );
+            // A scan that failed read nothing, so the count it contributes is
+            // zero rather than the limit: reporting the arm as capped would put
+            // an "or more" hedge on a count of no rows at all.
+            (Vec::new(), None, 0)
         }
     }
 }
@@ -961,9 +1116,44 @@ mod tests {
     }
 
     /// The skill arm answering with nothing, for a test whose subject is one of
-    /// the other two.
+    /// the others.
     async fn no_skills() -> Result<SkillArm, CoreError> {
         Ok((Vec::new(), None, None))
+    }
+
+    /// The episode arm answering with nothing, on the same terms.
+    async fn no_episodes() -> Result<EpisodeArm, CoreError> {
+        Ok((Vec::new(), None, 0))
+    }
+
+    /// One stored digest as a candidate, built the only way a candidate can be
+    /// built - from a digest, through the construction that keeps the answer
+    /// half off the line.
+    fn an_episode(id: &str, asked: &str) -> RecallEpisode {
+        RecallEpisode::from_digest(
+            &a_digest(
+                id,
+                &format!("Asked: {asked}\n\nAnswered: it is on the storage host."),
+            ),
+            RecallRelevance::Distance(0.12),
+        )
+        .expect("a digest with a question has a candidate")
+    }
+
+    /// A stored digest with `content` as its text.
+    fn a_digest(id: &str, content: &str) -> TurnDigest {
+        TurnDigest {
+            id: id.to_string(),
+            conversation_id: "c-earlier".to_string(),
+            opening_message_id: "m-1".to_string(),
+            content: content.to_string(),
+            after_outside_read: false,
+            disposition: Disposition::Active,
+            disposition_reason: None,
+            superseded_by: None,
+            created_at: "2026-08-01 09:00:00".to_string(),
+            updated_at: "2026-08-01 09:00:00".to_string(),
+        }
     }
 
     fn a_note() -> RecallNote {
@@ -986,6 +1176,7 @@ mod tests {
             async { Ok((vec![an_entry()], Some(a_dispersion()), None)) },
             async { Err(CoreError::Storage("the pad read failed".into())) },
             no_skills(),
+            no_episodes(),
         )
         .await
         .expect("a failed pad read must not fail the lookup");
@@ -1007,6 +1198,7 @@ mod tests {
             async { Ok((vec![], Some(a_dispersion()), None)) },
             async { Ok((vec![a_note()], None)) },
             no_skills(),
+            no_episodes(),
         )
         .await
         .expect("an arm that answers is not a failure");
@@ -1040,6 +1232,7 @@ mod tests {
             async { Ok((vec![an_entry()], Some(a_dispersion()), None)) },
             async { Ok((vec![], None)) },
             no_skills(),
+            no_episodes(),
         )
         .await
         .expect("every arm answered");
@@ -1060,6 +1253,7 @@ mod tests {
             async { Ok((vec![], Some(a_dispersion()), None)) },
             async { Ok((vec![a_note()], Some(a_pad_dispersion()))) },
             no_skills(),
+            no_episodes(),
         )
         .await
         .expect("every arm answered");
@@ -1080,6 +1274,7 @@ mod tests {
             async { Ok((vec![], Some(a_dispersion()), None)) },
             async { Ok((vec![a_note()], None)) },
             no_skills(),
+            no_episodes(),
         )
         .await
         .expect("every arm answered");
@@ -1097,6 +1292,7 @@ mod tests {
             async { Ok((vec![an_entry()], None, None)) },
             async { Ok((vec![], None)) },
             no_skills(),
+            no_episodes(),
         )
         .await
         .expect("a measurement is not what the lookup is for");
@@ -1114,6 +1310,7 @@ mod tests {
             async { Err(CoreError::Storage("the store is down".into())) },
             async { Ok((vec![a_note()], None)) },
             no_skills(),
+            no_episodes(),
         )
         .await;
 
@@ -1141,13 +1338,21 @@ mod tests {
                 tokio::time::sleep(hold).await;
                 Ok((vec![a_skill()], Some(a_dispersion()), None))
             },
+            async move {
+                tokio::time::sleep(hold).await;
+                Ok((
+                    vec![an_episode("ep-1", "where does the registry live?")],
+                    None,
+                    1,
+                ))
+            },
         )
         .await
         .expect("every arm answered");
 
         assert!(
             started.elapsed() < hold * 2,
-            "three reads took {:?}, which is serial rather than concurrent",
+            "four reads took {:?}, which is serial rather than concurrent",
             started.elapsed()
         );
     }

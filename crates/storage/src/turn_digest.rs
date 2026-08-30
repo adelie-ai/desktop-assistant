@@ -25,6 +25,7 @@
 use desktop_assistant_core::CoreError;
 use desktop_assistant_core::domain::Disposition;
 use desktop_assistant_core::ports::auth::current_user_id;
+use desktop_assistant_core::ports::recall::RecallDispersion;
 use desktop_assistant_core::ports::turn_digest::{NewTurnDigest, TurnDigest, TurnDigestStore};
 use pgvector::Vector;
 use sqlx::PgPool;
@@ -106,6 +107,67 @@ const GET_SQL: &str = "\
       FROM turn_digests \
      WHERE user_id = $1 AND id = $2 AND deleted_at IS NULL";
 
+/// The person's episodes nearest one prompt vector, with the store's own
+/// spread (#1350).
+///
+/// One scan, three uses, the shape every sibling arm's read already has. `d`
+/// reduces each row's chunks to its nearest, `m` and `s` take the median and
+/// the median absolute deviation of that whole scan, and the outer select
+/// joins the rows back and repeats the spread on each. Measured over the whole
+/// store rather than over the rows returned, because the near tail is exactly
+/// the part a cued prompt moves - see
+/// [`RecallDispersion`](desktop_assistant_core::ports::recall::RecallDispersion).
+///
+/// The disposition rule is `RECENT_SQL`'s: `obsolete` is left out and every
+/// other value is admitted, so a refuted episode stays findable when the
+/// prompt is about its subject and comes back carrying its marker. Which of
+/// those the block then offers is the core's decision, not this query's.
+///
+/// Only rows embedded by the same model take part, matched on the digest half
+/// of the `<name>@<digest>` stamp wherever both sides carry one: a comparison
+/// across models is a comparison across vector dimensions, which the database
+/// answers with an error rather than a miss.
+///
+/// Ties break on `id`, which is unique, so two identical reads return the same
+/// page.
+const NEAREST_DIGESTS_BY_EMBEDDING_SQL: &str = "\
+    WITH d AS (
+         SELECT id, MIN(chunk <=> $1) AS distance
+         FROM turn_digests, unnest(embedding) AS chunk
+         WHERE user_id = $2
+           AND deleted_at IS NULL
+           AND disposition <> 'obsolete'
+           AND embedding IS NOT NULL
+           AND embedding_model IS NOT NULL
+           AND (embedding_model = $3
+                OR (split_part($3, '@', 2) <> ''
+                    AND split_part(embedding_model, '@', 2)
+                        = split_part($3, '@', 2)))
+         GROUP BY id
+     ),
+     m AS (
+         SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY distance) AS median,
+                count(*) AS rows_read
+         FROM d
+     ),
+     s AS (
+         SELECT m.median,
+                m.rows_read,
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY abs(d.distance - m.median))
+                    AS deviation
+         FROM d CROSS JOIN m
+         GROUP BY m.median, m.rows_read
+     )
+     SELECT td.id, td.conversation_id, td.opening_message_id, td.content, \
+            td.after_outside_read, td.disposition, td.disposition_reason, td.superseded_by, \
+            td.created_at, td.updated_at, \
+            d.distance, s.median, s.rows_read, s.deviation
+     FROM d
+     JOIN turn_digests td ON td.id = d.id AND td.user_id = $2
+     CROSS JOIN s
+     ORDER BY d.distance, td.id DESC
+     LIMIT $4";
+
 /// Record what a digest is judged to be.
 const SET_DISPOSITION_SQL: &str = "\
     UPDATE turn_digests \
@@ -124,6 +186,26 @@ const DIGEST_ROW_QUERIES: &[(&str, &str)] = &[
     ("GET_SQL", GET_SQL),
 ];
 
+/// What [`NearestRow`] reads on top of [`DIGEST_COLUMNS`]: the distance that
+/// ranked one row, and the three figures every row of the answer repeats.
+///
+/// Test-only, for the reason [`DIGEST_COLUMNS`] is.
+#[cfg(test)]
+const NEAREST_MEASUREMENT_COLUMNS: &[&str] = &["distance", "median", "rows_read", "deviation"];
+
+/// Every query in this adapter that answers [`NearestRow`], held to
+/// [`DIGEST_COLUMNS`] plus [`NEAREST_MEASUREMENT_COLUMNS`].
+///
+/// A separate list from [`DIGEST_ROW_QUERIES`] rather than a looser check over
+/// one: these queries project strictly more, and admitting the measurement
+/// columns everywhere would stop the plain reads being held to an exact
+/// projection at all.
+#[cfg(test)]
+const DIGEST_NEAREST_ROW_QUERIES: &[(&str, &str)] = &[(
+    "NEAREST_DIGESTS_BY_EMBEDDING_SQL",
+    NEAREST_DIGESTS_BY_EMBEDDING_SQL,
+)];
+
 /// Stable code for the one refusal this adapter raises: a disposition that
 /// resolves through a successor was given without one.
 pub const DISPOSITION_NEEDS_A_SUCCESSOR_CODE: &str = "turn_digest_disposition_needs_successor";
@@ -131,12 +213,131 @@ pub const DISPOSITION_NEEDS_A_SUCCESSOR_CODE: &str = "turn_digest_disposition_ne
 /// Postgres adapter for the episodic turn index.
 pub struct PgTurnDigestStore {
     pool: PgPool,
+    scan_ceiling: std::time::Duration,
 }
 
 impl PgTurnDigestStore {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            scan_ceiling: crate::RECALL_SCAN_STATEMENT_TIMEOUT,
+        }
     }
+
+    /// The same store, whose full scans the database gives up on after
+    /// `ceiling` instead of after
+    /// [`RECALL_SCAN_STATEMENT_TIMEOUT`](crate::RECALL_SCAN_STATEMENT_TIMEOUT).
+    ///
+    /// Exists so the bound can be proven on the path a deployment actually
+    /// runs, the same way [`PgScratchpadStore::with_scan_ceiling`] does.
+    ///
+    /// [`PgScratchpadStore::with_scan_ceiling`]: crate::PgScratchpadStore::with_scan_ceiling
+    #[must_use]
+    pub fn with_scan_ceiling(mut self, ceiling: std::time::Duration) -> Self {
+        self.scan_ceiling = ceiling;
+        self
+    }
+
+    /// The person's episodes nearest `query_embedding`, nearest first, with the
+    /// store's own spread (#1350).
+    ///
+    /// The read behind the `[Recall]` block's past-turns arm, and the first
+    /// production read of this store. It answers across every conversation the
+    /// person owns, which is the whole point of the store being user-scoped: a
+    /// turn in one conversation is what answers "when did I last deal with
+    /// this" in another.
+    ///
+    /// `embedding_model` identifies the model that produced `query_embedding`,
+    /// and only rows embedded by that model take part, matched on the digest
+    /// half of the `<name>@<digest>` stamp wherever both sides carry one: a
+    /// comparison across models is a comparison across vector dimensions, which
+    /// the database answers with an error rather than a miss.
+    ///
+    /// The disposition rule is the one every read of this store keeps:
+    /// `obsolete` is left out and every other value comes back carrying its
+    /// marker.
+    ///
+    /// An empty `query_embedding` yields no rows and no spread: the vector
+    /// operator raises on a zero-dimension vector, and a caller with no
+    /// embedding has no lexical arm to fall back to here, so it contributes
+    /// nothing to the block rather than failing it.
+    ///
+    /// The scan carries
+    /// [`RECALL_SCAN_STATEMENT_TIMEOUT`](crate::RECALL_SCAN_STATEMENT_TIMEOUT),
+    /// so the database stops working when the caller stops waiting.
+    pub async fn nearest_by_embedding(
+        &self,
+        query_embedding: Vec<f32>,
+        embedding_model: &str,
+        limit: usize,
+    ) -> Result<NearestDigests, CoreError> {
+        if query_embedding.is_empty() {
+            return Ok(NearestDigests::default());
+        }
+        let user_id = current_user_id();
+        let mut scan = crate::scan_bound::begin_bounded(&self.pool, self.scan_ceiling).await?;
+        let rows: Vec<NearestRow> = sqlx::query_as(NEAREST_DIGESTS_BY_EMBEDDING_SQL)
+            .bind(Vector::from(query_embedding))
+            .bind(user_id.as_str())
+            .bind(embedding_model)
+            .bind(limit as i64)
+            .fetch_all(&mut *scan)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        scan.commit()
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))?;
+
+        // Every row carries the same spread, so the first one states it.
+        let dispersion = rows.first().and_then(NearestRow::dispersion);
+        Ok(NearestDigests {
+            digests: rows
+                .into_iter()
+                .map(|row| {
+                    let distance = row.distance;
+                    (row.row.into_digest(), distance)
+                })
+                .collect(),
+            dispersion,
+        })
+    }
+}
+
+/// A [`DigestRow`] plus the cosine distance that ranked it and the spread every
+/// row of the answer repeats, for [`PgTurnDigestStore::nearest_by_embedding`].
+#[derive(sqlx::FromRow)]
+struct NearestRow {
+    #[sqlx(flatten)]
+    row: DigestRow,
+    distance: f64,
+    median: Option<f64>,
+    rows_read: i64,
+    deviation: Option<f64>,
+}
+
+impl NearestRow {
+    /// What this row says the store's spread is, where it says one that can be
+    /// trusted - see [`RecallDispersion::measured`].
+    fn dispersion(&self) -> Option<RecallDispersion> {
+        RecallDispersion::measured(
+            self.median?,
+            self.deviation?,
+            self.rows_read.max(0) as usize,
+        )
+    }
+}
+
+/// What [`PgTurnDigestStore::nearest_by_embedding`] answers with: the episodes
+/// the block may show, and what a distance from this store is worth.
+#[derive(Debug, Default)]
+pub struct NearestDigests {
+    /// The nearest digests, each with the cosine distance that ranked it,
+    /// nearest first.
+    pub digests: Vec<(TurnDigest, f64)>,
+    /// The spread of this query's distances over the whole store, or `None`
+    /// where it holds too little to measure one. The caller then reads the
+    /// source by a stated estimate.
+    pub dispersion: Option<RecallDispersion>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -329,7 +530,9 @@ impl TurnDigestStore for PgTurnDigestStore {
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{DIGEST_COLUMNS, DIGEST_ROW_QUERIES};
+    use super::{
+        DIGEST_COLUMNS, DIGEST_NEAREST_ROW_QUERIES, DIGEST_ROW_QUERIES, NEAREST_MEASUREMENT_COLUMNS,
+    };
 
     /// The columns `sql` actually projects, as whole names.
     ///
@@ -341,12 +544,11 @@ mod tests {
     /// is missing the very column it claims to be checking.
     ///
     /// The LAST `SELECT`, not the first, because a CTE's inner select comes
-    /// first in the text and the row is built from the outer one. No query
-    /// here is a CTE yet; the recall read that #1350 adds will be, since every
-    /// sibling adapter writes a vector or hybrid query that way. Reading the
-    /// inner list would then pass a query whose outer list drops a column,
-    /// which is exactly the runtime failure this check exists to catch, and it
-    /// would pass silently.
+    /// first in the text and the row is built from the outer one.
+    /// [`NEAREST_DIGESTS_BY_EMBEDDING_SQL`] is such a query, as every sibling
+    /// adapter's vector read is. Reading the inner list would pass a query
+    /// whose outer list drops a column, which is exactly the runtime failure
+    /// this check exists to catch, and it would pass silently.
     ///
     /// Other shapes fail loudly through the `extra` assertion rather than
     /// silently: lowercase ` as `, `coalesce(a, b) AS x`,
@@ -382,19 +584,30 @@ mod tests {
     /// ordinary gate green (#1277).
     #[test]
     fn every_digest_query_selects_every_column_the_row_reads() {
-        let expected: BTreeSet<String> = DIGEST_COLUMNS.iter().map(|c| (*c).to_string()).collect();
-        for (name, sql) in DIGEST_ROW_QUERIES {
-            let projected = projected_columns(sql);
-            let missing: Vec<&String> = expected.difference(&projected).collect();
-            assert!(
-                missing.is_empty(),
-                "{name} does not project {missing:?}, which DigestRow reads"
-            );
-            let extra: Vec<&String> = projected.difference(&expected).collect();
-            assert!(
-                extra.is_empty(),
-                "{name} projects {extra:?}, which DigestRow does not read"
-            );
+        let plain: BTreeSet<String> = DIGEST_COLUMNS.iter().map(|c| (*c).to_string()).collect();
+        let nearest: BTreeSet<String> = plain
+            .iter()
+            .cloned()
+            .chain(NEAREST_MEASUREMENT_COLUMNS.iter().map(|c| (*c).to_string()))
+            .collect();
+        let lists = [
+            (DIGEST_ROW_QUERIES, &plain, "DigestRow"),
+            (DIGEST_NEAREST_ROW_QUERIES, &nearest, "NearestRow"),
+        ];
+        for (queries, expected, row) in lists {
+            for (name, sql) in queries {
+                let projected = projected_columns(sql);
+                let missing: Vec<&String> = expected.difference(&projected).collect();
+                assert!(
+                    missing.is_empty(),
+                    "{name} does not project {missing:?}, which {row} reads"
+                );
+                let extra: Vec<&String> = projected.difference(expected).collect();
+                assert!(
+                    extra.is_empty(),
+                    "{name} projects {extra:?}, which {row} does not read"
+                );
+            }
         }
     }
 

@@ -1484,6 +1484,22 @@ async fn main() -> Result<()> {
         .as_ref()
         .map(|pool| Arc::new(desktop_assistant_storage::PgSkillUseLog::new(pool.clone())));
 
+    // The episodic turn index and its use log (#1349, #1350): the store the
+    // `[Recall]` block's past-turns arm reads and its fetch path opens, and the
+    // record of what that arm offered and what the model opened. Its own tables
+    // again, because an episode is deleted with its conversation and its use
+    // rows have to go with it.
+    let turn_digest_store = pg_pool.as_ref().map(|pool| {
+        Arc::new(desktop_assistant_storage::PgTurnDigestStore::new(
+            pool.clone(),
+        ))
+    });
+    let episode_use_log = pg_pool.as_ref().map(|pool| {
+        Arc::new(desktop_assistant_storage::PgEpisodeUseLog::new(
+            pool.clone(),
+        ))
+    });
+
     // Index on-disk skills at startup (#573): scan the configured roots and
     // reconcile each scope against the catalog (#639) -- skills accrete, and one
     // a scan no longer sees is marked absent rather than deleted. Capability-off
@@ -1811,6 +1827,28 @@ async fn main() -> Result<()> {
                 Box::pin(async move { log.record_opened(conversation_id, names, situation).await })
             },
         ));
+    }
+
+    // The episode fetch behind `builtin_episode_get` (#1350): the read that
+    // makes a past-turns line actionable, and the log that records a taken-up
+    // offer. The offer half is written by the turn itself, not here - see the
+    // handler's `with_episode_offer_log`.
+    if let Some(store) = &turn_digest_store {
+        use desktop_assistant_core::ports::turn_digest::TurnDigestStore;
+        let read = Arc::clone(store);
+        builtin_tools = builtin_tools.with_episode_get(Arc::new(move |id: String| {
+            let store = Arc::clone(&read);
+            Box::pin(async move { store.get(&id).await })
+        }));
+    }
+    if let Some(log) = &episode_use_log {
+        use desktop_assistant_core::ports::episode_use::EpisodeUseLog;
+        let opened = Arc::clone(log);
+        builtin_tools =
+            builtin_tools.with_episode_open_log(Arc::new(move |conversation_id, ids| {
+                let log = Arc::clone(&opened);
+                Box::pin(async move { log.record_opened(conversation_id, ids).await })
+            }));
     }
 
     // Desktop notifications (builtin_notify). Capability-gated: only wired when
@@ -3419,6 +3457,17 @@ async fn main() -> Result<()> {
         handler = handler.with_skill_offer_log(Arc::new(move |scope, names| {
             let log = Arc::clone(&log);
             Box::pin(async move { log.record_offered(scope, names).await })
+        }));
+    }
+    // #1350: the same for the past turns the block offered, against the episode
+    // use log. Gated on a database only, like the two above: a deployment with
+    // no digests simply has no ids to record.
+    if let Some(log) = &episode_use_log {
+        use desktop_assistant_core::ports::episode_use::EpisodeUseLog;
+        let log = Arc::clone(log);
+        handler = handler.with_episode_offer_log(Arc::new(move |scope, ids| {
+            let log = Arc::clone(&log);
+            Box::pin(async move { log.record_offered(scope, ids).await })
         }));
     }
     // #1126: negative memory. All three closures together - a read without a

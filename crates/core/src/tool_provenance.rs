@@ -532,6 +532,19 @@ pub const CLASSIFIED_SOURCES: &[ClassifiedSource] = &[
                 Read,
                 Declared(ExternalContentMarker),
             ),
+            // The episodic turn index holds the assistant's closing text of
+            // every turn, and a turn that read a page routinely quotes it. The
+            // digest carries the writing turn's stamp, and this read marks the
+            // text when that stamp is set - the same shape, and the same
+            // reason, as the pad read above. The `[Recall]` block's episode
+            // line does not go this way: it carries the user's own half alone,
+            // because a block makes no tool call and nothing would fold its
+            // provenance into the turn.
+            tool(
+                crate::ports::turn_digest::TURN_DIGEST_GET_TOOL,
+                Read,
+                Declared(ExternalContentMarker),
+            ),
             tool("builtin_scratchpad_delete", Mutate, Trusted),
             // A pinned note is re-injected verbatim into every round of
             // every later turn, which makes it the strongest place injected
@@ -1435,6 +1448,7 @@ mod tests {
             Read,
             Declared(ExternalContentMarker),
         ),
+        ("builtin_episode_get", Read, Declared(ExternalContentMarker)),
         ("say_this", Present, Trusted),
         ("request_voice", Present, Trusted),
         ("stop_voice", Present, Trusted),

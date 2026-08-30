@@ -70,6 +70,7 @@ use crate::domain::knowledge_use::KnowledgeUseRecord;
 use crate::domain::salience::{SalienceReading, SalienceSource};
 use crate::domain::situation::{SituationCue, SituationRecord};
 use crate::domain::skill::TrustTier;
+use crate::ports::turn_digest::TurnDigest;
 
 /// How near a candidate is to the prompt, and in which sense.
 ///
@@ -526,6 +527,137 @@ impl Activatable for RecallSkill {
     }
 }
 
+/// One past turn offered as a recall candidate (#1350): the episodic record,
+/// cued by the prompt rather than searched for.
+///
+/// **The line carries the user's own words and never the assistant's, and the
+/// type is what holds that.** [`Self::from_digest`] is the only way to build
+/// one, and it reads [`TurnDigest::asked_text`], so the answer half is not
+/// dropped at render time - it never reaches this type at all. That is the
+/// difference between a rule a format string keeps and a rule the construction
+/// keeps, and the second is what this arm needs: the line renders unprompted,
+/// ahead of the prompt, with every tool tier open, and the block makes no tool
+/// call, so nothing folds an offered line's provenance into the reading turn.
+/// A digest's answer half can quote a page an outside party controls, and this
+/// store is offered across every conversation the person owns - so rendering
+/// that half here would widen one conversation's exposure to the whole account.
+///
+/// **The assistant's half stays reachable, through the fetch.** A title is only
+/// actionable if its body opens, and the body opens by a read of the digest,
+/// which marks the reading turn's provenance. See
+/// [`crate::ports::turn_digest`].
+#[derive(Debug, Clone)]
+pub struct RecallEpisode {
+    /// The digest's row id, which is the handle the episode is fetched by.
+    pub id: String,
+    /// The user's own words, and nothing else of the turn.
+    ///
+    /// Private, and read through [`Self::asked`]. A public field is a second
+    /// way in: a caller could write the whole digest into it, and the type
+    /// would then be carrying the half it exists to keep out.
+    asked: String,
+    /// Whether the turn that produced this digest had already read content
+    /// from outside the trust boundary (#1247).
+    ///
+    /// **Carried and not read.** No rule in [`crate::recall`] consults it, and
+    /// that is the decision rather than an omission: the pad arm drops a note
+    /// with this stamp because the note's text is what the stamped turn wrote,
+    /// where an episode line carries the user's own prompt and nothing the turn
+    /// derived. `crate::turn_capture` keeps that half even under the operator
+    /// setting that destroys everything else in a digest, so dropping on the
+    /// stamp would withhold the one part of the record that was never at risk.
+    ///
+    /// It travels anyway, for the reason [`RecallNote::after_outside_read`]
+    /// travels: what to do about a stamp depends on the level the READING turn
+    /// runs at, which the adapter does not know, so a later rule that needs it
+    /// finds it here rather than needing a second read of the store.
+    pub after_outside_read: bool,
+    /// What a person or the consolidation machinery has judged this episode to
+    /// be (#893).
+    ///
+    /// It is not rendered onto the line - see [`TurnDigest::asked_text`] for
+    /// why a judgement on the record does not belong beside the question
+    /// alone - so this field is the whole of what the judgement does here: the
+    /// activation score's disposition term, which only ever subtracts, so a
+    /// dispositioned turn is offered less often than a live one.
+    pub disposition: Disposition,
+    pub relevance: RecallRelevance,
+    /// What the use log knows about this episode (#698, #1350), on the terms
+    /// [`RecallEntry::use_record`] states: the reinforcement half of its
+    /// activation.
+    pub use_record: Option<KnowledgeUseRecord>,
+}
+
+impl RecallEpisode {
+    /// The candidate one stored digest offers, or `None` where the digest has
+    /// no user half to show.
+    ///
+    /// **The only constructor.** See the type's own documentation for why.
+    #[must_use]
+    pub fn from_digest(digest: &TurnDigest, relevance: RecallRelevance) -> Option<Self> {
+        Some(Self {
+            id: digest.id.clone(),
+            asked: digest.asked_text()?.to_string(),
+            after_outside_read: digest.after_outside_read,
+            disposition: digest.disposition,
+            relevance,
+            use_record: None,
+        })
+    }
+
+    /// The user's own words, as the line will carry them.
+    #[must_use]
+    pub fn asked(&self) -> &str {
+        &self.asked
+    }
+
+    /// The same candidate, carrying what the log knows about it.
+    #[must_use]
+    pub fn with_use_record(mut self, record: Option<KnowledgeUseRecord>) -> Self {
+        self.use_record = record;
+        self
+    }
+}
+
+impl Activatable for RecallEpisode {
+    fn relevance(&self) -> RecallRelevance {
+        self.relevance
+    }
+
+    fn use_record(&self) -> Option<&KnowledgeUseRecord> {
+        self.use_record.as_ref()
+    }
+
+    /// An episode carries no situation record (#1125). The situation a turn
+    /// happened in is not recorded against its digest, and no table holds one,
+    /// so [`NO_SITUATION`] is the honest answer and the term costs an episode
+    /// exactly nothing - which is how every candidate scored before the cue
+    /// existed. A situation for an episode is a schema change and a writer,
+    /// together, not a term answered with a guess.
+    fn situation_coverage(&self, _cue: Option<&SituationCue>) -> f64 {
+        NO_SITUATION
+    }
+
+    /// An episode carries no salience reading (#1127). Every signal is read
+    /// from a knowledge entry's own body, summary, tags and provenance; a
+    /// digest is the harness's record of a turn, written with no model call and
+    /// with nobody promoting it, so there is nothing for a detector to read.
+    fn salience_share(&self) -> f64 {
+        NO_SALIENCE
+    }
+
+    /// An episode candidate carries no lexical rank, on exactly the terms
+    /// [`RecallEntry::lexical`] states.
+    fn lexical(&self) -> LexicalMatch {
+        LexicalMatch::NONE
+    }
+
+    /// The digest's own stored disposition (#893, #1349).
+    fn disposition(&self) -> Disposition {
+        self.disposition
+    }
+}
+
 /// What a candidate contributes to its activation score
 /// ([`crate::domain::activation`]).
 ///
@@ -809,6 +941,10 @@ pub struct RecallRequest {
     pub note_limit: usize,
     /// Ceiling on skill catalog rows read.
     pub skill_limit: usize,
+    /// Ceiling on episodic turn-digest rows read (#1350). The store is scoped
+    /// to the person and spans every conversation they own, so this arm needs
+    /// no scope beyond the caller's own identity.
+    pub episode_limit: usize,
 }
 
 /// What one recall lookup found, each list nearest-first, and how spread out
@@ -824,6 +960,18 @@ pub struct RecallCandidates {
     pub notes: Vec<RecallNote>,
     /// The skills nearest the prompt, nearest first (#1154).
     pub skills: Vec<RecallSkill>,
+    /// The past turns nearest the prompt, nearest first (#1350).
+    pub episodes: Vec<RecallEpisode>,
+    /// How many rows the episode scan returned, which is not always how many
+    /// candidates came out of it.
+    ///
+    /// A digest with no question yields no candidate at all - see
+    /// [`RecallEpisode::from_digest`] - so this is at or above
+    /// `episodes.len()`. The block reads it to decide whether its "and N more"
+    /// count is exact or a lower bound, and that decision is about what the
+    /// scan READ: a scan that filled up knows only "at least this many",
+    /// whether or not every row it read could be rendered.
+    pub episodes_scanned: usize,
     /// The knowledge source's own dispersion, measured over the whole source.
     /// `None` where the adapter could not measure one, which leaves the block on
     /// its stated estimate.
@@ -872,6 +1020,15 @@ pub struct RecallCandidates {
     /// makes it visible: it is small, and its rows are shaped unlike anything
     /// else the block reads.
     pub skill_dispersion: Option<RecallDispersion>,
+    /// The episodic store's own dispersion, on the same terms (#1350).
+    ///
+    /// Its own, and never another arm's. A digest embeds a whole turn - the
+    /// user's words, the assistant's answer and an account of the tool calls -
+    /// which is far more text than a fact, a note or a "when to use" line, so
+    /// the store puts its distances somewhere else again. It is also the arm
+    /// most likely to measure one: the store grows with use, one row per turn,
+    /// where a knowledge base grows with judgement.
+    pub episode_dispersion: Option<RecallDispersion>,
 }
 
 /// Boxed async closure that runs one recall lookup.
