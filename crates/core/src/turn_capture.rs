@@ -559,6 +559,109 @@ pub fn asked_half(content: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one function the `[Recall]` episode arm's whole constraint rests on
+    /// (#1350), over every branch its documentation claims.
+    ///
+    /// Every fixture spells the section openers out by hand rather than reading
+    /// them from the constants above. A case built from the same constant the
+    /// reader splits on proves only that the two agree, and the format this has
+    /// to parse is the one already sitting in the store.
+    ///
+    /// The three fail-closed branches are the point. `asked_half` is what
+    /// stands between a digest and a line offered unprompted across
+    /// conversations, so what it does with text it does not recognise decides
+    /// whether that line can carry the assistant's half.
+    #[test]
+    fn asked_half_takes_the_user_half_and_fails_closed_on_anything_else() {
+        let cases: &[(&str, Option<&str>, &str)] = &[
+            (
+                "Asked: where does the registry live?\n\nAnswered: on the storage host.",
+                Some("where does the registry live?"),
+                "the ordinary digest: the question, and none of the answer",
+            ),
+            (
+                "Asked: where does the registry live?\n\nRan:\n- a_tool -> answered",
+                Some("where does the registry live?"),
+                "a turn with tool traffic and no answer half still yields its question",
+            ),
+            (
+                "Asked: where does the registry live?",
+                Some("where does the registry live?"),
+                "a digest with nothing after the question is the whole question",
+            ),
+            (
+                "Asked: paste of a log\n\nAnswered: line one\n\nAnswered: line two",
+                Some("paste of a log"),
+                "the cut is at the FIRST opener, so a second one inside the answer \
+                 cannot reopen the user half",
+            ),
+            (
+                "Asked: I pasted this\n\nAnswered: real answer\n\nRan:\n- t -> answered",
+                Some("I pasted this"),
+                "the earliest opener wins whichever kind it is",
+            ),
+            (
+                "Asked: a question that carries\n\nAnswered: its own opener, and the \
+                 rest is the model's\n\nAnswered: the real one",
+                Some("a question that carries"),
+                "a prompt carrying an opener cuts short, which loses the user's own \
+                 words and never carries the other half",
+            ),
+            (
+                "Answered: somebody stored this without a question",
+                None,
+                "text that does not open with the question section has no user half \
+                 to show, and is not read as one",
+            ),
+            ("", None, "empty content carries no question"),
+            (
+                "Asked: \n\nAnswered: on the storage host.",
+                None,
+                "a blank user half is nothing to offer, and must not fall back to \
+                 the answer",
+            ),
+            (
+                "Asked:    \t \n\nAnswered: on the storage host.",
+                None,
+                "nor does a user half of whitespace",
+            ),
+            (
+                "Asked: what did the page say\n\n[withheld by security policy]",
+                Some("what did the page say"),
+                "the withholding placeholder is a section opener like any other",
+            ),
+            (
+                "Asked: what ran\n[the rest of this turn's tool calls did not fit]",
+                Some("what ran"),
+                "so is the truncation notice",
+            ),
+            (
+                "Asked: what broke\n\n[this turn ended before it was answered; the \
+                 assistant's half is the failure, not a reply, and is not kept]",
+                Some("what broke"),
+                "and so is the no-answer notice",
+            ),
+        ];
+
+        for (content, expected, why) in cases {
+            assert_eq!(asked_half(content), *expected, "{why}: {content:?}");
+        }
+    }
+
+    /// The section openers this module writes are the ones `asked_half` cuts
+    /// at, stated as literals on both sides.
+    ///
+    /// Without this the two could drift apart silently: a writer that renamed
+    /// its opener would keep passing the cases above, which are written against
+    /// the wording rather than against the constants, while every digest
+    /// already in the store still carried the old one.
+    #[test]
+    fn the_digest_sections_are_written_under_the_wording_the_reader_cuts_at() {
+        assert_eq!(ASKED_SECTION, "Asked: ");
+        assert_eq!(ANSWERED_SECTION, "\n\nAnswered: ");
+        assert_eq!(RAN_SECTION, "\n\nRan:");
+    }
     use crate::domain::ToolCall;
 
     fn user(text: &str) -> Message {

@@ -230,8 +230,13 @@ type KnowledgeArm = (
 type NoteArm = (Vec<RecallNote>, Option<RecallDispersion>);
 
 /// The same, for the episode arm, which keeps no situation record of its own
-/// either (#1350).
-type EpisodeArm = (Vec<RecallEpisode>, Option<RecallDispersion>);
+/// either (#1350), plus the count of rows its scan returned.
+///
+/// That third part is not `candidates.len()`: a digest with no question yields
+/// no candidate, and the block's "and N more" hedge is a statement about what
+/// the scan READ - see
+/// [`RecallCandidates::episodes_scanned`](desktop_assistant_core::ports::recall::RecallCandidates::episodes_scanned).
+type EpisodeArm = (Vec<RecallEpisode>, Option<RecallDispersion>, usize);
 
 /// Whether the knowledge arm may offer this entry at all (#893).
 ///
@@ -364,7 +369,7 @@ async fn lookup(
             // is already failing is the wrong thing to spend a turn on. The arm
             // is silent for that turn and the rest of the block renders, which
             // is the same absence a deployment with no digests produces.
-            async { Ok((Vec::new(), None)) },
+            async { Ok((Vec::new(), None, 0)) },
         )
         .await;
     };
@@ -580,13 +585,14 @@ async fn lookup(
                     Some(episode)
                 })
                 .collect();
+            let scanned = found.digests.len();
             unrenderable_digests(&found.digests, episodes.len());
             tracing::debug!(
                 candidates = episodes.len(),
                 with_use_record,
                 "recall: how many episode candidates the use log had something to say about"
             );
-            Ok((episodes, found.dispersion))
+            Ok((episodes, found.dispersion, scanned))
         },
     )
     .await
@@ -753,7 +759,7 @@ async fn gather(
     let (entries, notes, skills, episodes) = tokio::join!(entries, notes, skills, episodes);
     let (notes, note_dispersion) = notes_or_none(notes);
     let (skills, skill_dispersion, skill_situation_cue) = skills_or_none(skills);
-    let (episodes, episode_dispersion) = episodes_or_none(episodes);
+    let (episodes, episode_dispersion, episodes_scanned) = episodes_or_none(episodes);
     let (entries, entry_dispersion, situation_cue) = entries?;
     // Which sources stated their own geometry, and which the block will read by
     // a stated estimate. Without this an operator meeting a block that is
@@ -778,6 +784,7 @@ async fn gather(
         skill_dispersion,
         skill_situation_cue,
         episode_dispersion,
+        episodes_scanned,
     })
 }
 
@@ -871,7 +878,10 @@ fn episodes_or_none(found: Result<EpisodeArm, CoreError>) -> EpisodeArm {
                 error = %e,
                 "recall: the episode arm failed; the other arms still render"
             );
-            (Vec::new(), None)
+            // A scan that failed read nothing, so the count it contributes is
+            // zero rather than the limit: reporting the arm as capped would put
+            // an "or more" hedge on a count of no rows at all.
+            (Vec::new(), None, 0)
         }
     }
 }
@@ -1113,7 +1123,7 @@ mod tests {
 
     /// The episode arm answering with nothing, on the same terms.
     async fn no_episodes() -> Result<EpisodeArm, CoreError> {
-        Ok((Vec::new(), None))
+        Ok((Vec::new(), None, 0))
     }
 
     /// One stored digest as a candidate, built the only way a candidate can be
@@ -1333,6 +1343,7 @@ mod tests {
                 Ok((
                     vec![an_episode("ep-1", "where does the registry live?")],
                     None,
+                    1,
                 ))
             },
         )

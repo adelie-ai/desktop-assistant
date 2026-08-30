@@ -64,7 +64,7 @@ fn embedded(opening_message_id: &str, content: &str, vector: Vec<f32>) -> NewTur
 /// the same read with the same query vector, so a store with no scoping at all
 /// would fail here rather than pass.
 #[tokio::test]
-async fn an_episode_from_another_conversation_is_offered_when_it_is_relevant() {
+async fn an_episode_line_from_another_conversation_is_offered_when_it_is_relevant() {
     let Some(fx) = DbFixture::try_new("tdr_scope").await else {
         return;
     };

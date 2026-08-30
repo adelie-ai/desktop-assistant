@@ -532,8 +532,8 @@ impl Activatable for RecallSkill {
 ///
 /// **The line carries the user's own words and never the assistant's, and the
 /// type is what holds that.** [`Self::from_digest`] is the only way to build
-/// one, and it reads [`TurnDigest::marked_asked_text`], so the answer half is
-/// not dropped at render time - it never reaches this type at all. That is the
+/// one, and it reads [`TurnDigest::asked_text`], so the answer half is not
+/// dropped at render time - it never reaches this type at all. That is the
 /// difference between a rule a format string keeps and a rule the construction
 /// keeps, and the second is what this arm needs: the line renders unprompted,
 /// ahead of the prompt, with every tool tier open, and the block makes no tool
@@ -550,7 +550,7 @@ impl Activatable for RecallSkill {
 pub struct RecallEpisode {
     /// The digest's row id, which is the handle the episode is fetched by.
     pub id: String,
-    /// The user's own words, carrying this episode's disposition marker.
+    /// The user's own words, and nothing else of the turn.
     ///
     /// Private, and read through [`Self::asked`]. A public field is a second
     /// way in: a caller could write the whole digest into it, and the type
@@ -559,16 +559,27 @@ pub struct RecallEpisode {
     /// Whether the turn that produced this digest had already read content
     /// from outside the trust boundary (#1247).
     ///
-    /// It travels rather than the adapter deciding, for the reason
-    /// [`RecallNote::after_outside_read`] travels: what to do about it depends
-    /// on the level the READING turn runs at, which the adapter does not know.
-    /// The stamp describes the whole digest, and this line carries only the
-    /// user's half of it, which is never outside content - so the block reads
-    /// it as a fact about what a fetch of this episode would deliver.
+    /// **Carried and not read.** No rule in [`crate::recall`] consults it, and
+    /// that is the decision rather than an omission: the pad arm drops a note
+    /// with this stamp because the note's text is what the stamped turn wrote,
+    /// where an episode line carries the user's own prompt and nothing the turn
+    /// derived. `crate::turn_capture` keeps that half even under the operator
+    /// setting that destroys everything else in a digest, so dropping on the
+    /// stamp would withhold the one part of the record that was never at risk.
+    ///
+    /// It travels anyway, for the reason [`RecallNote::after_outside_read`]
+    /// travels: what to do about a stamp depends on the level the READING turn
+    /// runs at, which the adapter does not know, so a later rule that needs it
+    /// finds it here rather than needing a second read of the store.
     pub after_outside_read: bool,
     /// What a person or the consolidation machinery has judged this episode to
-    /// be (#893). Already rendered into [`Self::asked`] as a marker; kept here
-    /// because the activation score reads it as a term of its own.
+    /// be (#893).
+    ///
+    /// It is not rendered onto the line - see [`TurnDigest::asked_text`] for
+    /// why a judgement on the record does not belong beside the question
+    /// alone - so this field is the whole of what the judgement does here: the
+    /// activation score's disposition term, which only ever subtracts, so a
+    /// dispositioned turn is offered less often than a live one.
     pub disposition: Disposition,
     pub relevance: RecallRelevance,
     /// What the use log knows about this episode (#698, #1350), on the terms
@@ -586,7 +597,7 @@ impl RecallEpisode {
     pub fn from_digest(digest: &TurnDigest, relevance: RecallRelevance) -> Option<Self> {
         Some(Self {
             id: digest.id.clone(),
-            asked: digest.marked_asked_text()?,
+            asked: digest.asked_text()?.to_string(),
             after_outside_read: digest.after_outside_read,
             disposition: digest.disposition,
             relevance,
@@ -951,6 +962,16 @@ pub struct RecallCandidates {
     pub skills: Vec<RecallSkill>,
     /// The past turns nearest the prompt, nearest first (#1350).
     pub episodes: Vec<RecallEpisode>,
+    /// How many rows the episode scan returned, which is not always how many
+    /// candidates came out of it.
+    ///
+    /// A digest with no question yields no candidate at all - see
+    /// [`RecallEpisode::from_digest`] - so this is at or above
+    /// `episodes.len()`. The block reads it to decide whether its "and N more"
+    /// count is exact or a lower bound, and that decision is about what the
+    /// scan READ: a scan that filled up knows only "at least this many",
+    /// whether or not every row it read could be rendered.
+    pub episodes_scanned: usize,
     /// The knowledge source's own dispersion, measured over the whole source.
     /// `None` where the adapter could not measure one, which leaves the block on
     /// its stated estimate.

@@ -24,11 +24,10 @@
 //! Two paths, and they show different halves of a digest on purpose (#1350).
 //!
 //! The past-turns arm of `[Recall]` offers episodes unprompted, ahead of the
-//! prompt, and its line carries [`TurnDigest::marked_asked_text`] - the user's
-//! own words and the disposition marker, never the assistant's half. The block
-//! makes no tool call, so nothing folds an offered line's provenance into the
-//! reading turn, and the assistant's half of a turn can quote a page an outside
-//! party controls.
+//! prompt, and its line carries [`TurnDigest::asked_text`] - the user's own
+//! words, never the assistant's half. The block makes no tool call, so nothing
+//! folds an offered line's provenance into the reading turn, and the
+//! assistant's half of a turn can quote a page an outside party controls.
 //!
 //! The fetch path is a read of the digest itself, by [`TurnDigestStore::get`],
 //! which carries the whole of [`TurnDigest::marked_text`] and MARKS the reading
@@ -178,8 +177,8 @@ impl TurnDigest {
         format!("{}{}", self.disposition.marker(), self.content)
     }
 
-    /// The user's own half of this digest, carrying this digest's own
-    /// [`Disposition::marker`], and `None` where there is no such half (#1350).
+    /// The user's own half of this digest, and `None` where there is no such
+    /// half (#1350).
     ///
     /// **What an unprompted render may show, and the whole of it.** The line
     /// the `[Recall]` episode arm offers is built from this and from nothing
@@ -188,15 +187,27 @@ impl TurnDigest {
     /// [`crate::ports::recall::RecallEpisode`] for the type that has no other
     /// way to be built.
     ///
-    /// The marker is joined here rather than through [`Self::marked_text`]
-    /// because that method marks the whole content, and this line is half of
-    /// it: marking through it would put the answer half on the line, which is
-    /// the one thing this path must not do. Both methods read one field and
-    /// one marker, so a disposition added to the vocabulary reaches both.
+    /// **No disposition marker, and this is the one render path that carries
+    /// none.** [`Self::content`]'s doc asks a render path to use
+    /// [`Self::marked_text`], and every path that shows the record does. This
+    /// one shows a strict subset of it: the question the person asked, with the
+    /// answer and the tool account deliberately absent. A disposition judges
+    /// the record, and the record is mostly the half that is not here - so
+    /// "recorded, later refuted: where does the registry live?" would read as a
+    /// judgement on the asking, which nothing has judged and which happened
+    /// whatever became of the answer.
+    ///
+    /// The judgement is not lost. It still subtracts from the episode's
+    /// activation score
+    /// ([`crate::ports::recall::RecallEpisode::disposition`]), so a
+    /// dispositioned turn ranks below a live one and is offered less; and the
+    /// fetch answers with [`Self::marked_text`], so the marker arrives with the
+    /// record it is about.
+    ///
+    /// [`crate::ports::recall::RecallEpisode::disposition`]: crate::ports::recall::RecallEpisode
     #[must_use]
-    pub fn marked_asked_text(&self) -> Option<String> {
+    pub fn asked_text(&self) -> Option<&str> {
         crate::turn_capture::asked_half(&self.content)
-            .map(|asked| format!("{}{}", self.disposition.marker(), asked))
     }
 }
 

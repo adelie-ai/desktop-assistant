@@ -182,9 +182,11 @@ const RECALL_DROPPED_LINE_MAX_BYTES: usize = 1 + 7 + 20 + 8 + 1 + 7 + 14;
 /// What the block costs before its first knowledge line, worst case: the
 /// prefix, the header and its entry hint, the entry arm's "did not fit" line,
 /// the pad label with [`MAX_RECALL_NOTES`] lines and its own "did not fit"
-/// line, the tag label with a full tag line, and the skill label - carrying
+/// line, the tag label with a full tag line, the skill label - carrying
 /// [`RECALL_SKILL_INSTALLED_NOTE`], which a block with a marked line does -
-/// with [`MAX_RECALL_SKILLS`] lines and its own "did not fit" line.
+/// with [`MAX_RECALL_SKILLS`] lines and its own "did not fit" line, and the
+/// episode label with [`MAX_RECALL_EPISODES`] lines and its own "did not fit"
+/// line.
 const RECALL_FIXED_MAX_BYTES: usize = RECALL_BLOCK_PREFIX_BYTES
     + RECALL_HEADER.len()
     + 1
@@ -492,11 +494,28 @@ pub const RECALL_EPISODE_SCAN_LIMIT: usize = 25;
 /// the recurrence signal, which is derived from extraction-time matching over
 /// the episodes themselves; it is not persisted, and no score reads it.
 ///
-/// Read as a Jaccard index over each line's distinct lowercase word tokens.
-/// Four in every five distinct words shared is the same question asked twice;
-/// below that they are two questions about one subject, and the block shows
-/// both.
-pub const RECALL_EPISODE_COLLAPSE_SIMILARITY: f64 = 0.8;
+/// Read as a Jaccard index over each QUESTION's distinct lowercase word
+/// tokens. The stored question, never the line it was cut down to: two long
+/// prompts sharing an opening are byte-identical once the width bound has taken
+/// them, and a fold over lines would collapse them on that preamble.
+///
+/// **The value is set by what must NOT fold, not by what must.** A duplicate
+/// line costs a line; a folded line shows no id, so the turn behind it cannot
+/// be fetched at all, and the memory is simply gone. Measured over pairs of the
+/// kind this store actually holds:
+///
+/// | pair | index | folds |
+/// |---|---|---|
+/// | "when is the next deploy window?" / "When is the next deploy window" | 1.000 | yes |
+/// | "...on the storage host" / "...on the storage host again" | 0.909 | yes |
+/// | "...merge PR 1234 into main **before** the release" / "**after**" | 0.818 | no |
+/// | "did the nightly deploy to **staging** succeed" / "**production**" | 0.800 | no |
+///
+/// One word changed in a nine-word question is the ordinary register here -
+/// staging against production, before against after - and those two are the
+/// pairs the threshold sits above. What still folds is a repeat: the same
+/// question retyped, or one filler word added to a long one.
+pub const RECALL_EPISODE_COLLAPSE_SIMILARITY: f64 = 0.85;
 
 /// What a collapsed episode line ends in, and the widest it can be.
 ///
@@ -1037,7 +1056,13 @@ fn render_recall_with_width(surface: &RecallSurface<'_>, max_entries: usize) -> 
                 .clears_bar(admission_dispersion(episode_dispersion), RECALL_BAR)
         })
         .collect();
-    let episodes_capped = candidates.episodes.len() >= surface.episode_scan_limit
+    // Read against the rows the SCAN returned, not against the candidates that
+    // survived it. A digest with no question yields no candidate (see
+    // `RecallEpisode::from_digest`), so one such row in a scan that filled up
+    // leaves one candidate fewer than the limit - and comparing the candidates
+    // would then report a read that genuinely hit its ceiling as uncapped, and
+    // drop the "or more" hedge from a count that is a lower bound.
+    let episodes_capped = candidates.episodes_scanned >= surface.episode_scan_limit
         && episodes_above_bar.len() == candidates.episodes.len();
     // No situation cue: an episode carries no situation record, so the term is
     // `NO_SITUATION` for every candidate and a cue would grade nothing - see
@@ -1231,10 +1256,16 @@ fn render_recall_with_width(surface: &RecallSurface<'_>, max_entries: usize) -> 
             block.push_str(&episode_line(episode, asked, *repeats));
             episode_ids.push(episode.id.clone());
         }
-        // Over the collapsed groups, not over the rows behind them: a repeat is
-        // already shown, on the line it was folded into, so counting it here
-        // would promise the reader something it has already been given.
-        let dropped_episodes = collapsed_episodes.len().saturating_sub(MAX_RECALL_EPISODES);
+        // Over the TURNS behind the groups the width dropped, not over the
+        // groups. A group that did not render hides its repeats with it, so
+        // counting the group alone would say "1 more turn" where four turns did
+        // not render. A repeat inside a group that DID render is already shown,
+        // on that group's own line, so it is not counted here.
+        let dropped_episodes: usize = collapsed_episodes
+            .iter()
+            .skip(MAX_RECALL_EPISODES)
+            .map(|(_, _, repeats)| 1 + repeats)
+            .sum();
         if let Some(line) = dropped_line(dropped_episodes, episodes_capped, "turns") {
             block.push('\n');
             block.push_str(&line);
@@ -1348,7 +1379,12 @@ fn build_context_plan(pass: &RecallPass<'_>) -> ContextPlan {
                 // read - see `RecallEpisode::situation_coverage`.
                 situation_cue_present: false,
                 scan_limit: pass.surface.episode_scan_limit,
-                rows_returned: pass.candidates.episodes.len(),
+                // The rows the scan returned, which is what `capped` is read
+                // against - so a plan that says "capped" beside a row count
+                // under the limit is not contradicting itself. The candidate
+                // list below can be shorter: a digest with no question yields
+                // no candidate.
+                rows_returned: pass.candidates.episodes_scanned,
                 capped: pass.episodes_capped,
             },
         },
@@ -1961,14 +1997,18 @@ fn episode_line(episode: &RecallEpisode, asked: &str, repeats: usize) -> String 
 /// group's strongest candidate and the groups stay in the order their
 /// strongest members ranked.
 ///
-/// Quadratic in the admitted set, which [`RECALL_EPISODE_SCAN_LIMIT`] bounds,
-/// over token sets each holding at most [`RECALL_EPISODE_MAX_CHARS`] of text.
+/// **The comparison reads each episode's whole question, never the line.** The
+/// line has already passed [`RECALL_EPISODE_MAX_CHARS`], and two long prompts
+/// that open the same way are byte-identical after that cut - so folding on the
+/// line would fold two unrelated questions on their shared preamble.
+///
+/// Quadratic in the admitted set, which [`RECALL_EPISODE_SCAN_LIMIT`] bounds.
 fn collapse_near_duplicates<'a>(
     lines: &[(&'a RecallEpisode, String)],
 ) -> Vec<(&'a RecallEpisode, String, usize)> {
     let mut groups: Vec<(&RecallEpisode, String, usize, HashSet<String>)> = Vec::new();
     for (episode, asked) in lines {
-        let tokens = asked_tokens(asked);
+        let tokens = asked_tokens(episode.asked());
         match groups
             .iter_mut()
             .find(|(_, _, _, kept)| similarity(kept, &tokens) >= RECALL_EPISODE_COLLAPSE_SIMILARITY)
@@ -1983,7 +2023,8 @@ fn collapse_near_duplicates<'a>(
         .collect()
 }
 
-/// The distinct words of one episode line, lowercased, for [`similarity`].
+/// The distinct words of one episode's whole question, lowercased, for
+/// [`similarity`].
 ///
 /// Split on anything that is not alphanumeric, so punctuation, casing and
 /// spacing do not make one question look like two: "restart the daemon" and
@@ -2835,13 +2876,20 @@ mod tests {
     /// what this must catch.
     #[test]
     fn an_offered_episode_line_never_contains_the_answer_half() {
+        // A real section opener, inside the answer half, plus a nonce. The
+        // opener is what the ticket asks for: an answer that itself looks like
+        // structure must not persuade the cut to reopen, and a fixture whose
+        // answer is inert prose could not tell that apart from a cut that
+        // happened to land in the right place. The nonce catches any leak of
+        // the answer at all.
         const ANSWER_MARKER: &str = "ANSWER-HALF-MUST-NOT-RENDER-b7f2";
+        let answered = format!("On the storage host.\n\nAsked: {ANSWER_MARKER}");
 
         let candidates = RecallCandidates {
             episodes: vec![episode(
                 "ep-1",
                 "where does the registry live?",
-                &format!("On the storage host. {ANSWER_MARKER}"),
+                &answered,
                 0.10,
             )],
             ..RecallCandidates::default()
@@ -2862,6 +2910,11 @@ mod tests {
             !block.contains(ANSWER_MARKER),
             "the assistant's half of the turn reached a line offered unprompted: {block}"
         );
+        assert!(
+            !block.contains("storage host"),
+            "an answer half that opens a section of its own must not reopen the user \
+             half: {block}"
+        );
     }
 
     /// Acceptance (#1350): the same holds for every other place the answer half
@@ -2873,13 +2926,20 @@ mod tests {
     /// shape the type-level enforcement exists to replace.
     #[test]
     fn nothing_the_episode_arm_reports_carries_the_answer_half() {
+        // A real section opener, inside the answer half, plus a nonce. The
+        // opener is what the ticket asks for: an answer that itself looks like
+        // structure must not persuade the cut to reopen, and a fixture whose
+        // answer is inert prose could not tell that apart from a cut that
+        // happened to land in the right place. The nonce catches any leak of
+        // the answer at all.
         const ANSWER_MARKER: &str = "ANSWER-HALF-MUST-NOT-RENDER-b7f2";
+        let answered = format!("On the storage host.\n\nAsked: {ANSWER_MARKER}");
 
         let candidates = RecallCandidates {
             episodes: vec![episode(
                 "ep-1",
                 "where does the registry live?",
-                &format!("On the storage host. {ANSWER_MARKER}"),
+                &answered,
                 0.10,
             )],
             ..RecallCandidates::default()
@@ -2911,17 +2971,20 @@ mod tests {
         }
     }
 
-    /// Acceptance (#1350): a turn from another conversation is offered when it
-    /// stands near the prompt.
+    /// The render carries an episode through whatever conversation it came
+    /// from, and in activation order.
     ///
-    /// The render half of that property: nothing in this block filters an
-    /// episode on which conversation it came from, so a digest of a different
-    /// conversation renders exactly as one of this conversation's does. The
-    /// scope the read actually applies is the store's - this person's turns and
-    /// nobody else's - and `crates/storage/tests/turn_digest_recall.rs` pins it
-    /// against a database, with its refusal.
+    /// **Not the acceptance test for "a turn from another conversation is
+    /// offered".** Nothing in this module reads an episode's conversation, so
+    /// this could not fail for that reason; what it holds is that the arm
+    /// renders the candidates it is handed and keeps their order. The criterion
+    /// itself is enforced by the store, which is where a conversation could be
+    /// filtered on and where a person's own scope is applied - see
+    /// `an_episode_line_from_another_conversation_is_offered_when_it_is_relevant`
+    /// in `crates/storage/tests/turn_digest_recall.rs`, which pins it against a
+    /// database with its refusal.
     #[test]
-    fn an_episode_line_from_another_conversation_is_offered_when_it_is_relevant() {
+    fn an_episode_renders_whatever_conversation_it_came_from() {
         let mut elsewhere = digest(
             "ep-elsewhere",
             "how do I cut a release?",
@@ -2994,6 +3057,176 @@ mod tests {
         );
     }
 
+    /// The fold's refusal half, at the two shapes that measured nearest the
+    /// threshold: one word changed in a question about the same subject.
+    ///
+    /// A folded turn shows no id, so nothing can fetch it - the memory is not
+    /// merely deduplicated, it is gone. These two pairs are the ordinary
+    /// register of this store, so they are what the threshold is set above, and
+    /// they are stated here as questions rather than as numbers so a change to
+    /// the tokenizer fails this as well as a change to the constant.
+    #[test]
+    fn episodes_that_differ_by_one_word_are_not_folded() {
+        for (a, b) in [
+            (
+                "did the nightly deploy to staging succeed last night",
+                "did the nightly deploy to production succeed last night",
+            ),
+            (
+                "should I merge PR 1234 into main before the release",
+                "should I merge PR 1234 into main after the release",
+            ),
+        ] {
+            let candidates = RecallCandidates {
+                episodes: vec![
+                    episode("ep-1", a, "an answer", 0.10),
+                    episode("ep-2", b, "an answer", 0.11),
+                ],
+                ..RecallCandidates::default()
+            };
+
+            let block = render(&candidates).expect("cued episodes render");
+            let lines = episode_lines(&block);
+
+            assert_eq!(
+                lines.len(),
+                2,
+                "these are two questions, and folding one away hides a turn nothing can \
+                 then fetch: {block}"
+            );
+            assert!(lines.iter().all(|l| !l.contains("more like it")), "{block}");
+        }
+    }
+
+    /// The fold compares the whole question, not the line the width bound cut
+    /// it down to.
+    ///
+    /// Two long prompts that open the same way are byte-identical once
+    /// `RECALL_EPISODE_MAX_CHARS` has taken them, so a fold over rendered lines
+    /// would collapse them on their shared preamble however different their
+    /// substance. The two questions here share an opening well past that bound
+    /// and differ only after it.
+    #[test]
+    fn two_long_questions_that_share_an_opening_are_not_folded() {
+        let preamble = "here is the full text of the deployment runbook that I keep pasting \
+                        in because it is the only way to get the context across and it goes \
+                        on for a while before I get to the actual question which is this "
+            .repeat(3);
+        assert!(
+            preamble.len() > RECALL_EPISODE_MAX_CHARS,
+            "the shared opening has to outlast the width bound, or this proves nothing"
+        );
+
+        let candidates = RecallCandidates {
+            episodes: vec![
+                episode(
+                    "ep-1",
+                    &format!("{preamble} which node holds the registry"),
+                    "an answer",
+                    0.10,
+                ),
+                episode(
+                    "ep-2",
+                    &format!("{preamble} who approves a production rollback"),
+                    "an answer",
+                    0.11,
+                ),
+            ],
+            ..RecallCandidates::default()
+        };
+
+        let block = render(&candidates).expect("cued episodes render");
+
+        assert_eq!(
+            episode_lines(&block).len(),
+            2,
+            "the questions differ past the width bound, so the fold must read the \
+             question and not the line: {block}"
+        );
+    }
+
+    /// Acceptance (#1350), the count's own half: what did not fit is counted in
+    /// TURNS, not in groups.
+    ///
+    /// A group the width dropped takes its repeats down with it, so counting
+    /// the group alone would say "1 more turn" where four turns did not render.
+    /// The arm's standard is a count rather than a guess.
+    #[test]
+    fn the_episode_did_not_fit_line_counts_turns_and_not_groups() {
+        // Four groups. The first three render; the fourth is dropped by the
+        // width and carries two repeats with it, so three turns did not render.
+        let mut episodes = Vec::new();
+        for (i, asked) in [
+            "when is the next deploy window",
+            "who approves a production rollback",
+            "where does the registry live",
+        ]
+        .iter()
+        .enumerate()
+        {
+            episodes.push(episode(&format!("ep-{i}"), asked, "an answer", 0.10));
+        }
+        for copy in 0..3 {
+            episodes.push(episode(
+                &format!("ep-dropped-{copy}"),
+                "how do I roll the signing key",
+                "an answer",
+                0.20,
+            ));
+        }
+
+        let candidates = RecallCandidates {
+            episodes,
+            ..RecallCandidates::default()
+        };
+        let block = render(&candidates).expect("cued episodes render");
+
+        assert_eq!(episode_lines(&block).len(), MAX_RECALL_EPISODES, "{block}");
+        assert!(
+            block.contains("...and 3 more turns also matched."),
+            "one dropped group standing for three turns is three turns that did not \
+             render: {block}"
+        );
+    }
+
+    /// A scan that filled its ceiling hedges its count, even when one of the
+    /// rows it read could not become a candidate.
+    ///
+    /// The arm's candidates are built by a construction that answers `None` for
+    /// a digest with no question, so a full scan can hand the block one
+    /// candidate fewer than the limit. Reading the candidates rather than the
+    /// rows would report that read as uncapped and drop the "or more" hedge
+    /// from a count that is a lower bound.
+    ///
+    /// Paired with its refusal in the same test: a scan that did NOT fill up
+    /// reports an exact count, so this cannot pass against an arm that hedges
+    /// everything.
+    #[test]
+    fn a_capped_episode_scan_hedges_its_count_even_when_a_row_was_unrenderable() {
+        let asked = |i: usize| format!("question number {i} about subject {i}");
+        let candidates = |scanned: usize| RecallCandidates {
+            episodes: (0..MAX_RECALL_EPISODES + 2)
+                .map(|i| episode(&format!("ep-{i}"), &asked(i), "an answer", 0.10))
+                .collect(),
+            // One row of the scan carried no question, so it became no
+            // candidate: the scan filled up and the candidate list did not.
+            episodes_scanned: scanned,
+            ..RecallCandidates::default()
+        };
+
+        let capped = render(&candidates(RECALL_EPISODE_SCAN_LIMIT)).expect("a block");
+        assert!(
+            capped.contains("...and 2 or more turns also matched."),
+            "a scan at its ceiling knows only \"at least this many\": {capped}"
+        );
+
+        let exact = render(&candidates(MAX_RECALL_EPISODES + 2)).expect("a block");
+        assert!(
+            exact.contains("...and 2 more turns also matched."),
+            "a scan that read past the bar states an exact count: {exact}"
+        );
+    }
+
     /// The count is a display detail: it names the turns folded into a line and
     /// nothing else, and the block reports only the line's own id as offered.
     ///
@@ -3053,6 +3286,48 @@ mod tests {
             0.5,
             "two shared of four distinct is a half"
         );
+        // The two pairs the threshold is set above, as measured. Written out
+        // rather than compared against the constant, so a change to either the
+        // number or the tokenizer has to be stated here.
+        assert!(
+            (similarity(
+                &tokens("did the nightly deploy to staging succeed last night"),
+                &tokens("did the nightly deploy to production succeed last night"),
+            ) - 0.8)
+                .abs()
+                < 1e-9,
+            "eight shared of ten distinct is four fifths"
+        );
+        assert!(
+            (similarity(
+                &tokens("should I merge PR 1234 into main before the release"),
+                &tokens("should I merge PR 1234 into main after the release"),
+            ) - 9.0 / 11.0)
+                .abs()
+                < 1e-9,
+            "nine shared of eleven distinct"
+        );
+        // Both measured pairs sit below the threshold, read through the same
+        // comparison the fold makes rather than against the literals above, so
+        // a change to either the tokenizer or the constant is caught here.
+        for (a, b) in [
+            (
+                "did the nightly deploy to staging succeed last night",
+                "did the nightly deploy to production succeed last night",
+            ),
+            (
+                "should I merge PR 1234 into main before the release",
+                "should I merge PR 1234 into main after the release",
+            ),
+        ] {
+            let index = similarity(&tokens(a), &tokens(b));
+            assert!(
+                index < RECALL_EPISODE_COLLAPSE_SIMILARITY,
+                "\"{a}\" and \"{b}\" measure {index}, at or above the \
+                 {RECALL_EPISODE_COLLAPSE_SIMILARITY} threshold - one word changed would \
+                 hide a turn nothing can then fetch"
+            );
+        }
         assert_eq!(
             similarity(&tokens("\u{1F600}"), &tokens("\u{1F601}")),
             0.0,
@@ -3508,7 +3783,7 @@ mod tests {
         // The constant carries the line's own newline, so the text itself has
         // one character less to spend.
         let bound = RECALL_DROPPED_LINE_MAX_BYTES - 1;
-        for noun in ["entries", "notes", "skills"] {
+        for noun in ["entries", "notes", "skills", "turns"] {
             let line = dropped_line(usize::MAX, true, noun).expect("a count that dropped rows");
             assert!(
                 line.chars().count() <= bound,
@@ -3531,6 +3806,7 @@ mod tests {
             RECALL_TAG_LABEL,
             RECALL_SKILL_LABEL,
             RECALL_SKILL_ABSENT_MARKER,
+            RECALL_EPISODE_LABEL,
         ] {
             assert!(
                 !text.contains('\n'),

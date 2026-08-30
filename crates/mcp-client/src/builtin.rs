@@ -2855,7 +2855,16 @@ impl BuiltinToolService {
     /// turn and closes its tool gate exactly as reading a stamped note does.
     ///
     /// The text is [`TurnDigest::marked_text`], so a dispositioned episode
-    /// never reads as a current record of what happened.
+    /// never reads as a current record of what happened. This is the path that
+    /// carries the marker: the offered line shows the question alone, and a
+    /// judgement on the record does not belong beside half of it.
+    ///
+    /// **A digest names message ids the reader may not be able to open.** The
+    /// capture records, per tool call, the message its whole result sits at, to
+    /// be read with `builtin_transcript_get` - and that read is scoped to the
+    /// active conversation. A turn from another conversation therefore arrives
+    /// carrying pointers that will decline, so the response says which case it
+    /// is in `from_this_conversation`.
     ///
     /// An id that resolves to nothing is a normal outcome and not a failure
     /// (AGENTS.md 8.2), and every way an id fails to resolve gives the same
@@ -2898,8 +2907,25 @@ impl BuiltinToolService {
         // nothing - the log decides that, not this call site.
         self.record_episode_open(digest.id.clone());
 
-        tracing::info!(found = true, "episode get");
-        Ok(serde_json::json!({
+        // Whether the message ids inside `text` can be acted on from here.
+        //
+        // A digest names, for each tool call it records, the message the whole
+        // result is one `builtin_transcript_get` away at. That read is scoped
+        // to the ACTIVE conversation and fails closed, so those ids resolve
+        // only while the turn being read is this conversation's - and this
+        // store is offered across every conversation the person owns, so the
+        // ordinary case for a line the block surfaced is that they do not. The
+        // payload says so rather than leaving the model to spend a round
+        // finding out.
+        //
+        // No scope at all reads as "not this conversation": the claim being
+        // made is that a read WILL work, and that claim needs a conversation to
+        // rest on.
+        let from_this_conversation =
+            current_conversation_id().is_some_and(|here| here.0 == digest.conversation_id);
+
+        tracing::info!(found = true, from_this_conversation, "episode get");
+        let mut response = serde_json::json!({
             "ok": true,
             "found": true,
             "id": digest.id,
@@ -2910,8 +2936,17 @@ impl BuiltinToolService {
             "disposition_reason": digest.disposition_reason,
             "superseded_by": digest.superseded_by,
             "recorded_at": digest.created_at,
-        })
-        .to_string())
+            "from_this_conversation": from_this_conversation,
+        });
+        if !from_this_conversation {
+            response["message"] = serde_json::json!(format!(
+                "This turn happened in another conversation. The message ids in `text` are \
+                 that conversation's, and {TOOL_TRANSCRIPT_GET} only reads the one you are \
+                 in, so they will not resolve here - the digest is the whole of what you can \
+                 read of this turn."
+            ));
+        }
+        Ok(response.to_string())
     }
 
     /// Mark entries useful or not (`builtin_knowledge_base_mark`).
@@ -5701,8 +5736,57 @@ mod tests {
         );
     }
 
-    /// An id that resolves to nothing is a normal outcome, not a failure, and
-    /// it is not recorded as an open.
+    /// Acceptance (#1350): a turn from another conversation says so, because
+    /// the message ids inside its text cannot be read from here.
+    ///
+    /// The digest records, per tool call, the message its result sits at, to be
+    /// read with `builtin_transcript_get` - and that read is scoped to the
+    /// active conversation and fails closed. A line the `[Recall]` block
+    /// surfaced is usually another conversation's, so the ordinary case is
+    /// pointers that decline, and the payload has to say which case it is
+    /// rather than letting the model spend a round finding out.
+    ///
+    /// Both directions in one test: the same conversation keeps the pointers
+    /// usable and says nothing, so this cannot pass against a tool that warns
+    /// unconditionally.
+    #[tokio::test]
+    async fn an_episode_from_another_conversation_says_its_transcript_ids_are_unreadable() {
+        use desktop_assistant_core::ports::auth::{UserId, with_user_id};
+        use desktop_assistant_core::ports::conversation_ctx::with_conversation_id;
+
+        let read_from = async |conversation: &str| -> serde_json::Value {
+            let out = with_user_id(UserId::new("u"), async {
+                with_conversation_id(ConversationId::from(conversation), async {
+                    a_service_holding(a_stored_digest(false))
+                        .execute_tool(TOOL_EPISODE_GET, serde_json::json!({"id": "ep-1"}))
+                        .await
+                        .expect("the read answers")
+                })
+                .await
+            })
+            .await;
+            serde_json::from_str(&out).expect("a json payload")
+        };
+
+        // The digest above was recorded in `c-earlier`.
+        let elsewhere = read_from("c-now").await;
+        assert_eq!(elsewhere["from_this_conversation"], false, "{elsewhere}");
+        let message = elsewhere["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(TOOL_TRANSCRIPT_GET),
+            "the model is told which read will not resolve, by name: {elsewhere}"
+        );
+
+        let here = read_from("c-earlier").await;
+        assert_eq!(here["from_this_conversation"], true, "{here}");
+        assert!(
+            here.get("message").is_none(),
+            "a turn of this conversation's carries pointers that work, so there is \
+             nothing to warn about: {here}"
+        );
+    }
+
+    /// An id that resolves to nothing is a normal outcome, not a failure.
     #[tokio::test]
     async fn an_episode_id_that_resolves_to_nothing_is_a_normal_outcome() {
         let out = a_service_holding(a_stored_digest(false))
