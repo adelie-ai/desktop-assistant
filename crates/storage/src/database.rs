@@ -168,6 +168,11 @@ const PERSONAL_DATA_TABLES: &[&str] = &[
     // every conversation they own. Unscoped, one tenant would read another's
     // turns through this tool.
     "turn_digests",
+    // 063 - the episode use log. Both tables key on (user_id, episode_id) and
+    // hold which past turns one person's assistant was offered and which it
+    // opened, which says as much about the person as the turns do.
+    "episode_use_stats",
+    "episode_offers",
 ];
 
 /// The canonical set of personal-data tables (see `PERSONAL_DATA_TABLES`).

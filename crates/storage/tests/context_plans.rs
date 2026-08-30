@@ -199,6 +199,7 @@ fn rich_plan(request_id: &str, conversation_id: &str) -> ContextPlan {
             entries: arm(12.0, 3.0, true, true, 50, 9, false),
             notes: arm(6.0, 1.5, false, false, 25, 3, true),
             skills: arm(4.0, 2.0, true, false, 25, 2, false),
+            episodes: arm(9.0, 2.5, false, true, 25, 5, false),
         },
         candidates: rich_candidates(),
         // Deliberately larger than `candidates.len()` (8), so the round trip

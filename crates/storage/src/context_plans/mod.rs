@@ -253,6 +253,7 @@ fn arm_label(arm: RecallArm) -> &'static str {
         RecallArm::Entry => "entry",
         RecallArm::Note => "note",
         RecallArm::Skill => "skill",
+        RecallArm::Episode => "episode",
     }
 }
 
@@ -261,11 +262,12 @@ fn arm_from_label(label: &str) -> Option<RecallArm> {
         "entry" => Some(RecallArm::Entry),
         "note" => Some(RecallArm::Note),
         "skill" => Some(RecallArm::Skill),
+        "episode" => Some(RecallArm::Episode),
         _ => None,
     }
 }
 
-/// The stable label each of the six [`PlannedDropReason`] variants is stored
+/// The stable label each of the seven [`PlannedDropReason`] variants is stored
 /// under. Every variant the type declares is covered here; a variant added to
 /// the enum and not to this match fails to compile, which is what a `match`
 /// with no wildcard arm buys.
@@ -277,6 +279,7 @@ fn drop_reason_label(reason: PlannedDropReason) -> &'static str {
         PlannedDropReason::IdUnrenderable => "id_unrenderable",
         PlannedDropReason::EmptyContent => "empty_content",
         PlannedDropReason::ExternalContent => "external_content",
+        PlannedDropReason::NearDuplicate => "near_duplicate",
     }
 }
 
@@ -288,6 +291,7 @@ fn drop_reason_from_label(label: &str) -> Option<PlannedDropReason> {
         "id_unrenderable" => Some(PlannedDropReason::IdUnrenderable),
         "empty_content" => Some(PlannedDropReason::EmptyContent),
         "external_content" => Some(PlannedDropReason::ExternalContent),
+        "near_duplicate" => Some(PlannedDropReason::NearDuplicate),
         _ => None,
     }
 }
@@ -405,6 +409,7 @@ fn arms_to_json(arms: &ArmSummaries) -> Value {
         "entries": arm_summary_to_json(&arms.entries),
         "notes": arm_summary_to_json(&arms.notes),
         "skills": arm_summary_to_json(&arms.skills),
+        "episodes": arm_summary_to_json(&arms.episodes),
     })
 }
 
@@ -420,6 +425,12 @@ fn arms_from_json(stored: &Value) -> ArmSummaries {
             .unwrap_or(ArmSummary::empty(0)),
         skills: stored
             .get("skills")
+            .map(arm_summary_from_json)
+            .unwrap_or(ArmSummary::empty(0)),
+        // Absent from every plan written before the episode arm existed, and
+        // read as an arm that never ran - which is what it was.
+        episodes: stored
+            .get("episodes")
             .map(arm_summary_from_json)
             .unwrap_or(ArmSummary::empty(0)),
     }
@@ -635,6 +646,7 @@ mod tests {
             PlannedDropReason::IdUnrenderable,
             PlannedDropReason::EmptyContent,
             PlannedDropReason::ExternalContent,
+            PlannedDropReason::NearDuplicate,
         ] {
             let label = drop_reason_label(reason);
             assert_eq!(
@@ -647,7 +659,12 @@ mod tests {
 
     #[test]
     fn every_recall_arm_survives_its_own_label_round_trip() {
-        for arm in [RecallArm::Entry, RecallArm::Note, RecallArm::Skill] {
+        for arm in [
+            RecallArm::Entry,
+            RecallArm::Note,
+            RecallArm::Skill,
+            RecallArm::Episode,
+        ] {
             assert_eq!(arm_from_label(arm_label(arm)), Some(arm));
         }
     }

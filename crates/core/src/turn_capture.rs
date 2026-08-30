@@ -159,6 +159,22 @@ pub fn excluded_from_the_shared_store(tags: &[String]) -> bool {
     tags.iter().any(|tag| tag == RESERVED_SUBAGENT_TAG)
 }
 
+/// What every digest opens with, and the whole of what an unprompted render
+/// may show (#1350).
+///
+/// One constant, read by [`capture_turn`] below and by [`asked_half`], so the
+/// reader cannot come to parse a construction the writer no longer produces.
+pub const ASKED_SECTION: &str = "Asked: ";
+
+/// What opens the assistant's half of a digest.
+///
+/// A section opener rather than decoration: [`asked_half`] cuts here, so the
+/// text past it never reaches a line that renders unprompted.
+pub const ANSWERED_SECTION: &str = "\n\nAnswered: ";
+
+/// What opens the digest's account of the tool calls the turn made.
+pub const RAN_SECTION: &str = "\n\nRan:";
+
 /// Most bytes of the user's words that reach the digest.
 const ASKED_BYTES: usize = 2000;
 
@@ -371,7 +387,7 @@ pub fn capture_turn(
     let opening = turn.iter().find(|m| m.role == Role::User)?;
 
     let mut content = String::new();
-    content.push_str("Asked: ");
+    content.push_str(ASKED_SECTION);
     content.push_str(&truncate_on_char_boundary(&opening.content, ASKED_BYTES));
 
     // The tool calls, with their arguments and their outcomes, whether or not
@@ -460,11 +476,11 @@ pub fn capture_turn(
         content.push_str(WITHHELD_STEP_TEXT);
     } else {
         if let Some(answered) = answered {
-            content.push_str("\n\nAnswered: ");
+            content.push_str(ANSWERED_SECTION);
             content.push_str(&answered);
         }
         if calls > 0 || orphans > 0 {
-            content.push_str("\n\nRan:");
+            content.push_str(RAN_SECTION);
             content.push_str(&ran);
         }
     }
@@ -495,6 +511,49 @@ pub fn capture_turn(
         // it - see the module header.
         after_outside_read,
     })
+}
+
+/// The user's own words out of a stored digest, and never anything the turn
+/// derived from them (#1350).
+///
+/// **This is where the `[Recall]` block's episode arm is held to the user's
+/// half.** That arm's line renders unprompted, ahead of the prompt, with every
+/// tool tier open, and the block makes no tool call, so nothing folds an
+/// offered line's provenance into the reading turn. The assistant's half of a
+/// digest can quote a page an outside party controls, and rendering it across
+/// conversations would widen one conversation's exposure to the whole account.
+/// So the arm never receives that half at all: it reads through this function,
+/// and [`crate::ports::recall::RecallEpisode`] has no other way to be built.
+///
+/// The cut is at the first section the writer above can open after the user's
+/// words - the answer, the tool account, the no-answer notice, the withholding
+/// placeholder, or the truncation notice. Every one of them opens with a fixed
+/// string this module owns, so writer and reader move together.
+///
+/// **A prompt that carries one of those strings itself cuts short, and that is
+/// the safe direction.** The result is then a prefix of the user's own words:
+/// a shorter line, never a line carrying the other half.
+///
+/// `None` for text that does not open with [`ASKED_SECTION`], and for one whose
+/// user half is blank. Both fail closed - there is no half to show, so the
+/// episode is not offered - rather than falling back to the whole content,
+/// which is the one answer this function must never give.
+#[must_use]
+pub fn asked_half(content: &str) -> Option<&str> {
+    let rest = content.strip_prefix(ASKED_SECTION)?;
+    let end = [
+        ANSWERED_SECTION,
+        RAN_SECTION,
+        NO_ANSWER_NOTICE,
+        WITHHELD_STEP_TEXT,
+        TRUNCATION_NOTICE,
+    ]
+    .iter()
+    .filter_map(|section| rest.find(section))
+    .min()
+    .unwrap_or(rest.len());
+    let asked = rest[..end].trim();
+    (!asked.is_empty()).then_some(asked)
 }
 
 #[cfg(test)]

@@ -22,6 +22,7 @@ use crate::ports::client_tools::current_client_tools;
 use crate::ports::context_breakdown::{ContextBreakdown, ContextBreakdownRecordFn};
 use crate::ports::context_plan::{ContextPlan, ContextPlanOpenedFn, ContextPlanRecordFn};
 use crate::ports::conversation_ctx::with_conversation_id;
+use crate::ports::episode_use::EpisodeOfferedFn;
 use crate::ports::inbound::ConversationService;
 use crate::ports::knowledge::KnowledgeGetManyFn;
 use crate::ports::knowledge_use::current_situation;
@@ -674,6 +675,10 @@ pub struct ConversationHandler<S, L, T = NoopToolExecutor> {
     /// slot rather than the one above, because a skill is keyed by name in its
     /// own log - see [`crate::ports::skill_use`].
     skill_offered: Option<SkillOfferedFn>,
+    /// The same, for the past turns the `[Recall]` block offered (#1350). Its
+    /// own slot for the same reason: an episode is keyed by digest id in its
+    /// own log - see [`crate::ports::episode_use`].
+    episode_offered: Option<EpisodeOfferedFn>,
     /// Optional read of this user's live negative memories (#1126). Set means
     /// the turn reads what it has been burned by once, before its first round,
     /// and checks each tool call against it before the call runs. `None`
@@ -801,6 +806,7 @@ impl<S, L> ConversationHandler<S, L, NoopToolExecutor> {
             recall_search: None,
             knowledge_offered: None,
             skill_offered: None,
+            episode_offered: None,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_stored_tool_result_bytes: DEFAULT_MAX_STORED_TOOL_RESULT_BYTES,
             host: DEFAULT_HOST_LABEL.to_string(),
@@ -857,6 +863,7 @@ struct RecallLookup {
     entry_scan_limit: usize,
     note_scan_limit: usize,
     skill_scan_limit: usize,
+    episode_scan_limit: usize,
     /// When the lookup answered, and so the instant every use record it carries
     /// is a statement about (#1123). Captured once here rather than read again
     /// at render time, because the block renders on every round of the turn and
@@ -1030,6 +1037,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             recall_search: None,
             knowledge_offered: None,
             skill_offered: None,
+            episode_offered: None,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_stored_tool_result_bytes: DEFAULT_MAX_STORED_TOOL_RESULT_BYTES,
             host: DEFAULT_HOST_LABEL.to_string(),
@@ -1390,6 +1398,17 @@ impl<S, L, T> ConversationHandler<S, L, T> {
     /// offers to record and no skill offers.
     pub fn with_skill_offer_log(mut self, offered: SkillOfferedFn) -> Self {
         self.skill_offered = Some(offered);
+        self
+    }
+
+    /// Wire the episode use log's record of what the `[Recall]` block offered
+    /// (#1350).
+    ///
+    /// Separate from the two above for the reason they are separate from each
+    /// other: the three write to different tables under different keys, and any
+    /// of them may be present without the others.
+    pub fn with_episode_offer_log(mut self, offered: EpisodeOfferedFn) -> Self {
+        self.episode_offered = Some(offered);
         self
     }
 
@@ -2543,10 +2562,12 @@ impl<S, L, T> ConversationHandler<S, L, T> {
             entry_limit: crate::recall::RECALL_ENTRY_SCAN_LIMIT,
             note_limit: crate::recall::RECALL_NOTE_SCAN_LIMIT,
             skill_limit: crate::recall::RECALL_SKILL_SCAN_LIMIT,
+            episode_limit: crate::recall::RECALL_EPISODE_SCAN_LIMIT,
         };
         let entry_scan_limit = request.entry_limit;
         let note_scan_limit = request.note_limit;
         let skill_scan_limit = request.skill_limit;
+        let episode_scan_limit = request.episode_limit;
         match lookup(request).await {
             // Read after the lookup, not before it: the lookup may spend its
             // whole ceiling, and what the use records are a statement about is
@@ -2556,6 +2577,7 @@ impl<S, L, T> ConversationHandler<S, L, T> {
                 entry_scan_limit,
                 note_scan_limit,
                 skill_scan_limit,
+                episode_scan_limit,
                 looked_up_at: chrono::Utc::now(),
             }),
             Err(e) => {
@@ -3836,6 +3858,7 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                     found.entry_scan_limit,
                     found.note_scan_limit,
                     found.skill_scan_limit,
+                    found.episode_scan_limit,
                     found.looked_up_at,
                 )
                 .already_in_view(
@@ -4048,6 +4071,21 @@ impl<S: ConversationStore, L: LlmClient, T: ToolExecutor> ConversationHandler<S,
                 let scope = OfferScope::recall(conversation_id.0.clone());
                 let offered = assembled.recalled_skill_names;
                 record_in_background("recall_skills_offered", async move {
+                    record(scope, offered).await
+                });
+            }
+            // The same for the past turns the block offered (#1350), against
+            // the episode use log. An empty list on the first round is recorded
+            // for the same reason it is above: the write is what ends the
+            // previous turn's standing episode offers, so an open on a later
+            // turn cannot be credited to a block that no longer names the turn.
+            if tool_rounds_since_anchor == 0
+                && let Some(record) = &self.episode_offered
+            {
+                let record = Arc::clone(record);
+                let scope = OfferScope::recall(conversation_id.0.clone());
+                let offered = assembled.recalled_episode_ids;
+                record_in_background("recall_episodes_offered", async move {
                     record(scope, offered).await
                 });
             }

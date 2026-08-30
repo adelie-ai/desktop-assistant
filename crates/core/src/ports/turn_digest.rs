@@ -19,18 +19,24 @@
 //! The store holds the home conversation's turns too, so a later read has the
 //! material for within-conversation recall as well as cross-conversation.
 //!
-//! ## This store is written and not yet read
+//! ## How a digest is read back, and what each read may show
 //!
-//! Nothing reads a digest back today. [`TurnDigestStore::recent`],
-//! [`TurnDigestStore::get`] and [`TurnDigestStore::set_disposition`] exist and
-//! are tested, and no production caller reaches them: the past-turns arm of
-//! `[Recall]` is #1350, and it is what makes a digest reachable by a turn.
+//! Two paths, and they show different halves of a digest on purpose (#1350).
 //!
-//! So this change moves the digest OUT of the scratchpad's read paths and does
-//! not yet put it into another one. Until #1350 lands, a turn's record is
-//! reachable through the transcript, the `[Earlier turns]` index and the
-//! rolling summary, and not by relevance. That is a deliberate gap of one
-//! ticket, not a capability this module already has.
+//! The past-turns arm of `[Recall]` offers episodes unprompted, ahead of the
+//! prompt, and its line carries [`TurnDigest::marked_asked_text`] - the user's
+//! own words and the disposition marker, never the assistant's half. The block
+//! makes no tool call, so nothing folds an offered line's provenance into the
+//! reading turn, and the assistant's half of a turn can quote a page an outside
+//! party controls.
+//!
+//! The fetch path is a read of the digest itself, by [`TurnDigestStore::get`],
+//! which carries the whole of [`TurnDigest::marked_text`] and MARKS the reading
+//! turn's provenance where [`TurnDigest::after_outside_read`] says the writing
+//! turn had read outside content. It is the digest that opens and never the
+//! transcript: a transcript read is scoped to the active conversation and fails
+//! closed, so a transcript pointer in a cross-conversation line would name a
+//! body that cannot be opened from where it was offered.
 //!
 //! ## Disposition, and what it is for
 //!
@@ -57,6 +63,14 @@ use std::sync::Arc;
 use crate::CoreError;
 use crate::domain::Disposition;
 use crate::ports::embedding::{ChunkEmbeddable, ChunkedEmbedding};
+
+/// The tool that reads one digest back (#1350).
+///
+/// Owned here rather than declared in the adapter, the way
+/// [`crate::ports::transcript::TRANSCRIPT_GET_TOOL`] is: the name is what
+/// [`crate::tool_provenance`] classifies and what the standing instruction
+/// names, so it is stated once.
+pub const TURN_DIGEST_GET_TOOL: &str = "builtin_episode_get";
 
 /// Maximum byte length of one digest's content.
 ///
@@ -163,6 +177,27 @@ impl TurnDigest {
     pub fn marked_text(&self) -> String {
         format!("{}{}", self.disposition.marker(), self.content)
     }
+
+    /// The user's own half of this digest, carrying this digest's own
+    /// [`Disposition::marker`], and `None` where there is no such half (#1350).
+    ///
+    /// **What an unprompted render may show, and the whole of it.** The line
+    /// the `[Recall]` episode arm offers is built from this and from nothing
+    /// else - see [`crate::turn_capture::asked_half`] for why the assistant's
+    /// half may not cross a conversation unasked, and
+    /// [`crate::ports::recall::RecallEpisode`] for the type that has no other
+    /// way to be built.
+    ///
+    /// The marker is joined here rather than through [`Self::marked_text`]
+    /// because that method marks the whole content, and this line is half of
+    /// it: marking through it would put the answer half on the line, which is
+    /// the one thing this path must not do. Both methods read one field and
+    /// one marker, so a disposition added to the vocabulary reaches both.
+    #[must_use]
+    pub fn marked_asked_text(&self) -> Option<String> {
+        crate::turn_capture::asked_half(&self.content)
+            .map(|asked| format!("{}{}", self.disposition.marker(), asked))
+    }
 }
 
 /// The episodic turn index, scoped to the person.
@@ -210,6 +245,20 @@ pub trait TurnDigestStore: Send + Sync {
         superseded_by: Option<&str>,
     ) -> Result<bool, CoreError>;
 }
+
+/// Boxed async closure for reading one digest back by its row id, for wiring
+/// the fetch path through non-generic boundaries (#1350).
+///
+/// One id rather than a batch, unlike the knowledge base's. A digest runs to
+/// [`MAX_DIGEST_BYTES`], the `[Recall]` block offers at most a handful of
+/// episode lines a turn, and a batch of whole turns would fill a response
+/// budget with material the model has not decided it wants - which is the
+/// economy the whole index rests on.
+pub type TurnDigestGetFn = Arc<
+    dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<Option<TurnDigest>, CoreError>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Boxed async closure for writing digests through non-generic boundaries.
 pub type TurnDigestWriteFn = Arc<

@@ -120,11 +120,17 @@ pub const DISCOVERY_TOOL: &str = "builtin_tool_search";
 
 /// How many built-ins the daemon ships as its always-advertised core.
 ///
-/// Counted against the fully-wired service, not the bare one: four of the set
+/// Counted against the fully-wired service, not the bare one: five of the set
 /// are capability-gated on a wired closure and are absent until it is present,
-/// so a figure taken from `BuiltinToolService::new()` describes a core four
+/// so a figure taken from `BuiltinToolService::new()` describes a core five
 /// smaller than the one a turn actually carries.
-pub const CORE_TOOL_COUNT: usize = 20;
+///
+/// It moved from twenty to twenty-one when the `[Recall]` block gained its
+/// past-turns arm (#1350). That arm's line carries the user's half of a turn
+/// and an id, and a line whose body cannot be opened is decoration - so the
+/// fetch that opens it is core by this module's own rule: the model needs it to
+/// keep what the rest of the turn depends on.
+pub const CORE_TOOL_COUNT: usize = 21;
 
 /// The most tools the always-advertised built-in core may hold.
 ///

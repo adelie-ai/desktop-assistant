@@ -79,6 +79,8 @@ pub enum RecallArm {
     Note,
     /// The skill catalog.
     Skill,
+    /// The episodic turn index (#1350).
+    Episode,
 }
 
 /// Why an admitted candidate did not render, when it did not.
@@ -108,6 +110,11 @@ pub enum PlannedDropReason {
     /// this turn withholds from the model (#1247), or is tainted by a marker
     /// this block cannot fold into the turn's own provenance.
     ExternalContent,
+    /// The candidate's line was near enough to a better-ranked one that the
+    /// two render as one line and a count (#1350). It is shown, on somebody
+    /// else's line, rather than absent - which is a different fact about the
+    /// turn from running out of width, so the plan states it separately.
+    NearDuplicate,
 }
 
 /// What the use log knew about a candidate at score time (#698), so
@@ -217,12 +224,14 @@ impl ArmSummary {
     }
 }
 
-/// The three arms' summaries: entry, note, skill.
+/// The four arms' summaries: entry, note, skill, episode.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ArmSummaries {
     pub entries: ArmSummary,
     pub notes: ArmSummary,
     pub skills: ArmSummary,
+    /// The episodic turn index (#1350).
+    pub episodes: ArmSummary,
 }
 
 /// One turn's context plan (#1327): what the `[Recall]` lookup considered,
@@ -294,6 +303,7 @@ impl ContextPlan {
                 entries: ArmSummary::empty(0),
                 notes: ArmSummary::empty(0),
                 skills: ArmSummary::empty(0),
+                episodes: ArmSummary::empty(0),
             },
             candidates: Vec::new(),
             considered_count: 0,

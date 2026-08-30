@@ -582,6 +582,13 @@ pub(crate) struct AssembledTurn {
     /// the order it rendered them (#1154). Reported for the same reason, and
     /// recorded against the skill use log rather than the knowledge one.
     pub recalled_skill_names: Vec<String>,
+    /// The past turns the `[Recall]` block put in front of the model, by digest
+    /// id, in the order it rendered them (#1350). Reported for the same reason,
+    /// and recorded against the episode use log.
+    ///
+    /// A near-duplicate the block folded into another line is absent: it shows
+    /// no id, so nothing can open it, so it was not offered.
+    pub recalled_episode_ids: Vec<String>,
     /// What the recall lookup considered this turn, and how each candidate
     /// scored (#1327). `None` on any round but a turn's first, and also on a
     /// first round that ran no lookup at all - the service layer is what
@@ -666,6 +673,7 @@ pub(crate) fn assemble_turn_within_budget(
         window_from: window_start(conversation.messages, max),
         recalled_entry_ids: pass.recalled_entry_ids,
         recalled_skill_names: pass.recalled_skill_names,
+        recalled_episode_ids: pass.recalled_episode_ids,
         context_plan: pass.context_plan,
         breakdown: pass.breakdown,
     };
@@ -1308,6 +1316,7 @@ fn assemble_turn(
         messages,
         recalled_entry_ids: surfaced.recalled_entry_ids,
         recalled_skill_names: surfaced.recalled_skill_names,
+        recalled_episode_ids: surfaced.recalled_episode_ids,
         context_plan: surfaced.context_plan,
         breakdown,
     }
@@ -1324,6 +1333,8 @@ struct TurnMessages {
     recalled_entry_ids: Vec<String>,
     /// See [`AssembledTurn::recalled_skill_names`].
     recalled_skill_names: Vec<String>,
+    /// See [`AssembledTurn::recalled_episode_ids`].
+    recalled_episode_ids: Vec<String>,
     /// See [`AssembledTurn::context_plan`].
     context_plan: Option<crate::ports::context_plan::ContextPlan>,
     /// See [`AssembledTurn::breakdown`]. Carries every part but the tool
@@ -1419,6 +1430,8 @@ struct SurfacedBlocks {
     recalled_entry_ids: Vec<String>,
     /// See [`AssembledTurn::recalled_skill_names`].
     recalled_skill_names: Vec<String>,
+    /// See [`AssembledTurn::recalled_episode_ids`].
+    recalled_episode_ids: Vec<String>,
     /// See [`AssembledTurn::context_plan`].
     context_plan: Option<crate::ports::context_plan::ContextPlan>,
 }
@@ -1468,6 +1481,7 @@ fn surfaced_blocks(
     let mut blocks = Vec::new();
     let mut recalled_entry_ids = Vec::new();
     let mut recalled_skill_names = Vec::new();
+    let mut recalled_episode_ids = Vec::new();
     let mut context_plan = None;
 
     // Ambient "now": a tiny, always-present line giving the assistant a sense of
@@ -1635,6 +1649,7 @@ fn surfaced_blocks(
             ));
             recalled_entry_ids = recall.entry_ids;
             recalled_skill_names = recall.skill_names;
+            recalled_episode_ids = recall.episode_ids;
         }
         context_plan = Some(outcome.plan);
     }
@@ -1644,6 +1659,7 @@ fn surfaced_blocks(
         context_plan,
         recalled_entry_ids,
         recalled_skill_names,
+        recalled_episode_ids,
     }
 }
 
@@ -5502,6 +5518,7 @@ mod tests {
             crate::recall::RECALL_ENTRY_SCAN_LIMIT,
             crate::recall::RECALL_NOTE_SCAN_LIMIT,
             crate::recall::RECALL_SKILL_SCAN_LIMIT,
+            crate::recall::RECALL_EPISODE_SCAN_LIMIT,
             chrono::Utc::now(),
         )
         .already_in_view(indexed_keys, planned_keys, &[])
