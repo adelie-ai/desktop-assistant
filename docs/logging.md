@@ -515,6 +515,11 @@ metrics::increment("llm.requests", &[Label::new("provider", "example")]);
 metrics::record_duration("dreaming.scan.duration", elapsed, &[]);
 ```
 
+Two histogram shapes exist. `record_duration` is duration-only, in milliseconds, over a
+shared set of bucket boundaries. `record_value` is the same in-process-plus-OTLP shape for
+a measurement that is not a duration - the per-request token-usage histogram below is the
+one call site that uses it, with its own unit and its own boundaries.
+
 **Label values are names, not content.** A prompt or a tool argument used as a
 label would be both a disclosure and an unbounded memory leak in a process that
 runs for weeks. One metric may carry 64 distinct label sets; past that, further
@@ -546,8 +551,7 @@ report a user files.
 | `turn.round.duration` | histogram | `outcome` |
 | `llm.call.duration` | histogram | `provider`, `model`, `purpose`, and `outcome` for a round's own call |
 | `tool.call.duration` | histogram | `tool`, `outcome` |
-| `llm.tokens.input` | counter | `provider`, `model` |
-| `llm.tokens.output` | counter | `provider`, `model` |
+| `gen_ai.client.token.usage` | histogram | `gen_ai.token.type`, `gen_ai.provider.name`, `gen_ai.request.model`, `purpose` |
 | `llm.tokens.cache_write` | counter | `provider`, `model` |
 | `llm.tokens.cache_read` | counter | `provider`, `model` |
 | `llm.tokens.unreported` | counter | `provider`, `count` |
@@ -561,21 +565,30 @@ report a user files.
 | `dreaming.facts.written` | counter | none |
 | `consolidation.scan.duration` | histogram | `outcome` |
 
-Tokens are recorded **per round**, not per turn, and the turn's total is the
-sum of its rounds. The useful question is not what a turn cost but which round
-blew up: a turn that re-sends a growing transcript ten times has a very
-different shape from one that answers immediately, and only per-round numbers
-show it.
+`gen_ai.client.token.usage` follows the OpenTelemetry GenAI semantic conventions: one
+record per model call per token type the provider reported, in `{token}`. `gen_ai.token.type`
+is `input`, `output`, `cache_read` or `cache_creation` - the last two extend the
+convention's own vocabulary the same way the `gen_ai.usage.cache_*` span attributes above
+do. `purpose` is recorded for every provider call a turn makes, not only its rounds: a
+round, a title, a compaction, a categorization pass or a wind-down, which is what lets a
+query ask which purpose is expensive rather than only how expensive one turn was. Because
+it is a histogram rather than a running-sum counter, both the total (its sum and count)
+and the per-request distribution - the average, the p95, the fraction of calls over a
+given input size - come from the same series.
 
-All four counts are recorded separately. The two cache counts are the whole
-cost story on a caching provider, where a cache read costs a fraction of a
-fresh input token, so reporting input alone makes a well-cached turn look
-identical to a cold one.
+The two cache counters remain running sums: a cache read costs a fraction of a fresh
+input token, so reporting input alone makes a well-cached turn look identical to a cold
+one, and their totals are still useful on their own. `llm.tokens.input` and
+`llm.tokens.output` were the same shape until `gen_ai.client.token.usage` replaced them:
+its sum and count already give the same totals and rates, so a separate running sum for
+those two would be one number computed twice.
 
-**A count the provider did not report is not zero.** It is skipped, and
-`llm.tokens.unreported` is incremented instead with a `count` label naming
-which one. So a total that looks low can be checked against how many calls said
-nothing, which a silent `0` would make impossible.
+**A count the provider did not report is not zero.** For a turn's rounds - not the calls
+outside them - it is also skipped from `llm.tokens.unreported`, incremented instead with a
+`count` label naming which count was missing. So a total that looks low can be checked
+against how many calls said nothing, which a silent `0` would make impossible. The
+histogram holds to the same rule on its own: an unreported type produces no record at all,
+never a record of `0`.
 
 The three `llm.prompt.*` counters are the breakdown above, over time. `part` is
 one of ten names from a closed set, and no conversation, user, model or
@@ -595,11 +608,11 @@ conversation id. It is recorded **per round**, so a set that grows within a turn
 shows the growth; `llm.prompt.round.tools` and `llm.prompt.round.measured` are
 its count and its denominator on the same per-round basis.
 
-They are counters rather than histograms because the facade's only histogram is
-a *duration* histogram - fixed millisecond buckets, a millisecond sum, and an
-export that names its values `ms`. Token counts put through it would be
-labelled as milliseconds everywhere they surfaced, so they accumulate the way
-`llm.tokens.input` already does instead.
+They are counters rather than a histogram on a narrower reason than the unit mismatch that
+used to rule one out: the facade now offers `record_value` for a non-duration histogram as
+well as `record_duration`, so that option exists. A per-part breakdown answers "where did
+the input for one turn go", which is a mean over the turn's own parts, not a distribution
+across many turns, so they accumulate as counters the way `llm.tokens.cache_write` does.
 
 Every `outcome` and `purpose` label is an enum rendering to a `&'static str`,
 so an unbounded value cannot be passed: it has the wrong lifetime. `provider`
