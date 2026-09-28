@@ -209,6 +209,64 @@ fn histogram_delta(before: &Summary, after: &Summary, name: &str, label_contains
     delta
 }
 
+/// Value-histogram totals by (name, sorted labels): how many measurements, and their sum.
+fn value_histograms(summary: &Summary) -> HashMap<(String, String), (u64, f64)> {
+    summary
+        .value_histograms
+        .iter()
+        .map(|h| {
+            (
+                (h.name.to_string(), render_labels(&h.labels)),
+                (h.total.count, h.total.sum),
+            )
+        })
+        .collect()
+}
+
+/// How many measurements one value histogram (`gen_ai.client.token.usage`) gained across a
+/// turn.
+fn value_histogram_delta(
+    before: &Summary,
+    after: &Summary,
+    name: &str,
+    label_contains: &[&str],
+) -> u64 {
+    let before = value_histograms(before);
+    let mut delta = 0;
+    for ((series, labels), (count, _sum)) in value_histograms(after) {
+        if series != name {
+            continue;
+        }
+        if !label_contains.iter().all(|f| labels.contains(f)) {
+            continue;
+        }
+        delta += count - before.get(&(series, labels)).map_or(0, |(c, _)| *c);
+    }
+    delta
+}
+
+/// How much one value histogram's sum rose across a turn - the same figure a running-sum
+/// counter would have reported for the same series.
+fn value_histogram_sum_delta(
+    before: &Summary,
+    after: &Summary,
+    name: &str,
+    label_contains: &[&str],
+) -> f64 {
+    let before = value_histograms(before);
+    let mut delta = 0.0;
+    for ((series, labels), (_count, sum)) in value_histograms(after) {
+        if series != name {
+            continue;
+        }
+        if !label_contains.iter().all(|f| labels.contains(f)) {
+            continue;
+        }
+        delta += sum - before.get(&(series, labels)).map_or(0.0, |(_, s)| *s);
+    }
+    delta
+}
+
 /// Every label value recorded during the window that just closed.
 ///
 /// Read from the *window* rather than the total, so a value another test in
@@ -224,8 +282,14 @@ fn label_values_in_window(summary: &Summary) -> Vec<String> {
         .iter()
         .filter(|h| h.window.count > 0)
         .flat_map(|h| h.labels.iter());
+    let value_histograms = summary
+        .value_histograms
+        .iter()
+        .filter(|h| h.window.count > 0)
+        .flat_map(|h| h.labels.iter());
     counters
         .chain(histograms)
+        .chain(value_histograms)
         .map(|l| l.value().to_string())
         .collect()
 }
@@ -447,6 +511,14 @@ impl Captured {
 
     fn histogram_delta(&self, name: &str, label_contains: &[&str]) -> u64 {
         histogram_delta(&self.before, &self.after, name, label_contains)
+    }
+
+    fn value_histogram_delta(&self, name: &str, label_contains: &[&str]) -> u64 {
+        value_histogram_delta(&self.before, &self.after, name, label_contains)
+    }
+
+    fn value_histogram_sum_delta(&self, name: &str, label_contains: &[&str]) -> f64 {
+        value_histogram_sum_delta(&self.before, &self.after, name, label_contains)
     }
 }
 
@@ -1225,14 +1297,74 @@ fn token_usage_reaches_the_metrics_facade() {
     let captured = run(Level::INFO, two_round_script(), ScriptedTools::ok());
 
     assert_eq!(
-        captured.counter_delta("llm.tokens.input", &[]),
-        300,
+        captured
+            .value_histogram_sum_delta("gen_ai.client.token.usage", &["gen_ai.token.type=input"]),
+        300.0,
         "both rounds' input tokens must reach the facade"
     );
     assert_eq!(
-        captured.counter_delta("llm.tokens.output", &[]),
-        30,
+        captured
+            .value_histogram_sum_delta("gen_ai.client.token.usage", &["gen_ai.token.type=output"]),
+        30.0,
         "both rounds' output tokens must reach the facade"
+    );
+    assert_eq!(
+        captured.value_histogram_delta("gen_ai.client.token.usage", &["gen_ai.token.type=input"]),
+        2,
+        "one histogram record per round, not one total for the turn"
+    );
+}
+
+/// A real aux call - not a direct call to `record_token_histogram` - reaches the
+/// histogram under its own purpose.
+///
+/// `one_turn` always sends the first message of a fresh conversation, so the service's
+/// own title-generation path (`generate_conversation_title`, `LlmPurpose::Title`) fires
+/// after the round answers, through `measured_aux_call`. The round's own reply is the
+/// first scripted response; the title call consumes the second, distinct one, so the two
+/// purposes are told apart by which usage figures land where.
+///
+/// Named for the review finding on desktop-assistant#1359: deleting the
+/// `record_token_histogram` call inside `measured_aux_call` left every existing test
+/// green, because none of them scripted a second response for the aux call the harness
+/// already drives on every run.
+#[test]
+fn a_real_title_call_records_its_own_purpose_in_the_token_histogram() {
+    let _serialised = serialised();
+    let script = vec![
+        LlmResponse::text(REPLY_SENTINEL)
+            .with_usage(usage(50, 5))
+            .into(),
+        LlmResponse::text("Generated Title")
+            .with_usage(usage(777, 8))
+            .into(),
+    ];
+    let captured = run(Level::INFO, script, ScriptedTools::ok());
+
+    assert_eq!(
+        captured.value_histogram_sum_delta(
+            "gen_ai.client.token.usage",
+            &["gen_ai.token.type=input", "purpose=title"]
+        ),
+        777.0,
+        "the title call's own input tokens must reach the histogram under purpose=title"
+    );
+    assert_eq!(
+        captured.value_histogram_sum_delta(
+            "gen_ai.client.token.usage",
+            &["gen_ai.token.type=output", "purpose=title"]
+        ),
+        8.0,
+        "and its output tokens, under the same purpose"
+    );
+    assert_eq!(
+        captured.value_histogram_sum_delta(
+            "gen_ai.client.token.usage",
+            &["gen_ai.token.type=input", "purpose=turn"]
+        ),
+        50.0,
+        "the round's own call must still be recorded under purpose=turn, distinct from \
+         the title call that follows it"
     );
 }
 
@@ -1270,14 +1402,15 @@ fn missing_token_counts_are_not_recorded_as_zero() {
     let captured = run(Level::INFO, script, ScriptedTools::ok());
 
     assert_eq!(
-        captured.counter_delta("llm.tokens.input", &[]),
-        100,
+        captured
+            .value_histogram_sum_delta("gen_ai.client.token.usage", &["gen_ai.token.type=input"]),
+        100.0,
         "the count that was reported must still be recorded"
     );
     assert_eq!(
-        captured.counter_delta("llm.tokens.output", &[]),
+        captured.value_histogram_delta("gen_ai.client.token.usage", &["gen_ai.token.type=output"]),
         0,
-        "a count the connector did not report contributes nothing to the total"
+        "a count the connector did not report produces no histogram record at all"
     );
     assert_eq!(
         captured.counter_delta("llm.tokens.unreported", &["count=output"]),
@@ -1399,8 +1532,9 @@ fn a_failed_round_still_records_what_it_knows() {
     let captured = run(Level::INFO, two_round_script(), ScriptedTools::failing());
 
     assert_eq!(
-        captured.counter_delta("llm.tokens.input", &[]),
-        300,
+        captured
+            .value_histogram_sum_delta("gen_ai.client.token.usage", &["gen_ai.token.type=input"]),
+        300.0,
         "a round that fails after the model responded still consumed tokens"
     );
     let round = captured.spans_named("turn.round")[0];
@@ -2502,10 +2636,10 @@ fn a_conversation_id_cannot_forge_a_log_line() {
 // ---------------------------------------------------------------------------
 // What filled the input (#1203).
 //
-// `llm.tokens.input` says a round cost 40k and cannot say whether that was the
-// transcript, the pinned notes or eighty tool schemas, and each of those has a
-// different fix. These tests are the promise that the breakdown is separable
-// in the way an operator would act on it.
+// `gen_ai.client.token.usage` says a round cost 40k input tokens and cannot say whether
+// that was the transcript, the pinned notes or eighty tool schemas, and each of those has
+// a different fix. These tests are the promise that the breakdown is separable in the way
+// an operator would act on it.
 //
 // Every name below is spelled out rather than imported from the crate under
 // test, so a rename at the recording site fails these tests instead of

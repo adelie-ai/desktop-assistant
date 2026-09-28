@@ -29,6 +29,12 @@ pub mod turn_capture;
 pub(crate) mod turn_index;
 pub mod verbatim_window;
 
+/// The unit and bucket boundaries the per-request token-usage histogram needs registered
+/// with `adelie_telemetry::Config::with_histogram_view` at `init`. See
+/// [`telemetry::TOKEN_USAGE_HISTOGRAM_VIEW`] for what it is and why a binary that exports
+/// over OTLP registers it.
+pub use telemetry::TOKEN_USAGE_HISTOGRAM_VIEW;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]

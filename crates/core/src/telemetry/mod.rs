@@ -86,7 +86,8 @@ mod tokens;
 
 pub(crate) use prompt::{PromptBreakdown, PromptPart, record_round_tool_cost};
 pub(crate) use tokens::{
-    Count, TokenTotals, record_genai_tokens_on_span, record_token_usage, record_tokens_on_span,
+    Count, TokenTotals, record_genai_tokens_on_span, record_token_histogram, record_token_usage,
+    record_tokens_on_span,
 };
 
 use std::time::Duration;
@@ -113,6 +114,18 @@ pub(crate) const ROUND_DURATION: &str = "turn.round.duration";
 
 /// How long one provider call took, by provider, model and outcome.
 pub(crate) const LLM_CALL_DURATION: &str = "llm.call.duration";
+
+/// The unit and bucket boundaries the per-request token-usage histogram
+/// (`tokens::TOKEN_USAGE_HISTOGRAM`, the OTel GenAI `gen_ai.client.token.usage` metric)
+/// needs registered with `adelie_telemetry::Config::with_histogram_view` at `init`, so the
+/// OTLP export uses the same boundaries the in-process registry does.
+///
+/// A binary that never registers this still gets the histogram in its local metrics
+/// summary and in an in-process test - the boundaries just default to the SDK's own until
+/// a binary that exports over OTLP registers them. The daemon does, in
+/// `crates/daemon/src/telemetry.rs`.
+pub const TOKEN_USAGE_HISTOGRAM_VIEW: (&str, &[f64]) =
+    (tokens::TOKEN_USAGE_UNIT, tokens::TOKEN_USAGE_BUCKETS);
 
 /// How long one tool dispatch took, by tool name and outcome.
 ///
@@ -368,6 +381,14 @@ impl LlmPurpose {
 /// contextual rather than named. Unlike a round's call they have no round to
 /// hang from - they are the turn's own overheads.
 ///
+/// No `round` field, unlike [`llm_span`]: none of the four purposes this
+/// covers happens inside one round of the tool loop. A title is asked before
+/// round one; a categorization pass is its own one-off ladder step;
+/// compaction and wind-down can each run either before round one or after
+/// the round budget is spent, and compaction's own call site measures across
+/// several rounds' accumulated transcript rather than any single one. There
+/// is no round number in scope at any of the four call sites to put here.
+///
 /// The token attributes are declared empty for the reason [`llm_span`] gives.
 pub(crate) fn aux_llm_span(purpose: LlmPurpose) -> tracing::Span {
     let route = crate::ports::turn_telemetry::current_turn_route();
@@ -410,9 +431,15 @@ where
     let span = aux_llm_span(purpose);
     let started = std::time::Instant::now();
     let outcome = call.instrument(span.clone()).await;
-    if let Ok(response) = &outcome
-        && let Some(usage) = &response.usage
-    {
+    // `None` when the call itself failed, not only when the provider reported
+    // nothing - `record_token_histogram` below treats the two the same way a
+    // round does: every type comes back unreported rather than the call going
+    // unmeasured.
+    let usage = outcome
+        .as_ref()
+        .ok()
+        .and_then(|response| response.usage.clone());
+    if let Some(usage) = &usage {
         record_genai_tokens_on_span(&span, usage);
     }
     // Closed here, by name. Left alone this handle would live to the end of the
@@ -430,6 +457,7 @@ where
         started.elapsed(),
         &[provider, model, Label::new("purpose", purpose.as_label())],
     );
+    record_token_histogram(usage.as_ref(), &route, purpose);
     outcome
 }
 
@@ -883,6 +911,7 @@ impl Drop for RoundGuard {
         record_round(elapsed, self.outcome);
         if self.llm_called {
             record_token_usage(self.usage.as_ref(), &self.route);
+            record_token_histogram(self.usage.as_ref(), &self.route, LlmPurpose::Turn);
         }
         let usage = self.usage.clone().unwrap_or_default();
         self.span.in_scope(|| {

@@ -124,6 +124,8 @@ pub const CARDINALITY_CAP: usize = 512;
 
 /// The daemon's telemetry configuration.
 pub fn config() -> Config {
+    let (token_usage_unit, token_usage_buckets) =
+        desktop_assistant_core::TOKEN_USAGE_HISTOGRAM_VIEW;
     Config::new(SERVICE_NAME)
         .with_default_filter(DEFAULT_FILTER)
         .with_cardinality_cap(CARDINALITY_CAP)
@@ -131,6 +133,11 @@ pub fn config() -> Config {
         // timing readable in `kubectl logs` or `journalctl`, where there is no
         // trace backend to open.
         .with_span_close_events(true)
+        // Gives the per-request token-usage histogram its own OTLP bucket
+        // boundaries, matching what the in-process registry already uses -
+        // core::telemetry::TOKEN_USAGE_HISTOGRAM_VIEW is the single source
+        // for both.
+        .with_histogram_view(token_usage_unit, token_usage_buckets)
 }
 
 #[cfg(test)]
@@ -454,6 +461,36 @@ mod tests {
             config().cardinality_cap() >= 256,
             "the daemon's label budget must hold a tool fleet; got {}",
             config().cardinality_cap()
+        );
+    }
+
+    /// Named for the review finding on desktop-assistant#1359: nothing tested that
+    /// `config()` actually registers the token-usage histogram's OTLP view - deleting the
+    /// `.with_histogram_view(...)` call left every test green, because it only changes
+    /// what the OTLP export does with a metric no other test here records.
+    #[test]
+    fn the_config_registers_the_token_usage_histogram_view_with_the_25000_boundary() {
+        let (unit, boundaries) = desktop_assistant_core::TOKEN_USAGE_HISTOGRAM_VIEW;
+        let config = config();
+        let views = config.histogram_views();
+
+        let registered = views
+            .iter()
+            .find(|view| view.unit == unit)
+            .unwrap_or_else(|| {
+                panic!("no histogram view registered for unit {unit:?}; got {views:?}")
+            });
+
+        assert_eq!(
+            registered.boundaries, boundaries,
+            "the daemon must register the same boundaries \
+             desktop_assistant_core::TOKEN_USAGE_HISTOGRAM_VIEW carries, so the OTLP \
+             export and the in-process registry agree"
+        );
+        assert!(
+            registered.boundaries.contains(&25_000.0),
+            "the token-usage histogram view must include the 25000 boundary; got {:?}",
+            registered.boundaries
         );
     }
 

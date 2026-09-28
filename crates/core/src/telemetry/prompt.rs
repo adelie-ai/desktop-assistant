@@ -2,8 +2,8 @@
 //!
 //! ## The question this answers
 //!
-//! `llm.tokens.input` says a round cost 40k. It cannot say whether that was
-//! the transcript, the pinned notes or eighty tool schemas, and each of those
+//! `gen_ai.client.token.usage` says a round cost 40k input tokens. It cannot say whether
+//! that was the transcript, the pinned notes or eighty tool schemas, and each of those
 //! has a different fix: compact the transcript, prune the notes, drop a
 //! server's tools, narrow the recall. So the breakdown is the number an
 //! operator acts on, and the parts have to be separable in the way the fix is,
@@ -40,15 +40,16 @@
 //! absent field here could only mean the part went unmeasured - which is the
 //! one thing a reader must be able to tell apart from an empty block.
 //!
-//! ## Counters, not histograms
+//! ## Counters, not a histogram
 //!
-//! The metrics facade offers one histogram and it is a *duration*
-//! histogram: fixed millisecond buckets, a millisecond sum, and an OTLP export
-//! that names its values `ms`. Token counts put through it would be labelled
-//! as milliseconds everywhere they surfaced, which is exactly the units claim
-//! this module exists to keep. So the per-part figures accumulate as counters,
-//! the way `llm.tokens.input` already does, and [`PROMPT_MEASURED`] is the
-//! denominator that turns them back into a per-turn mean.
+//! The metrics facade now offers a generic value histogram as well as the duration one
+//! (`metrics::record_value`, alongside `record_duration`), so a per-part distribution is no
+//! longer blocked on the unit mismatch that used to rule one out here. This module still
+//! uses counters, on a narrower reason: a per-part breakdown answers "where did the input
+//! for one turn go", which is a mean over the turn's own parts, not a distribution across
+//! many turns - [`PROMPT_MEASURED`] is the denominator that turns the counters back into
+//! that per-turn mean. A histogram per part would answer a question nobody has asked yet.
+//! Revisit if that changes.
 //!
 //! ## Label bounding
 //!
