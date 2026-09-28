@@ -57,13 +57,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # re-exports it as its own `otel` feature. A default build resolves no
 # opentelemetry crate at all, which `scripts/no-opentelemetry.sh` holds the
 # line on.
-#
-# TEMPORARY: pinned to adelie-ai/adelie-telemetry#20 (branch
-# issue-19-value-histogram), which adds the generic value-histogram facade
-# this change's token-usage metric depends on. Move this rev back to a
-# commit on adelie-telemetry's main once that PR merges, before this PR
-# merges - see adelie-ai/desktop-assistant#1359.
-adelie-telemetry = { git = "https://github.com/adelie-ai/adelie-telemetry", rev = "4ef9f9ce76ae08811b17d3e42218be5a27dd4c74" }
+adelie-telemetry = { git = "https://github.com/adelie-ai/adelie-telemetry", rev = "e6fc14e552ee182efb9061bd87da9a27cdaa1252" }
 serde = { version = "1", features = ["derive"] }
 
 desktop-assistant-protocol = { path = "crates/protocol" }
