@@ -124,6 +124,8 @@ pub const CARDINALITY_CAP: usize = 512;
 
 /// The daemon's telemetry configuration.
 pub fn config() -> Config {
+    let (token_usage_unit, token_usage_buckets) =
+        desktop_assistant_core::TOKEN_USAGE_HISTOGRAM_VIEW;
     Config::new(SERVICE_NAME)
         .with_default_filter(DEFAULT_FILTER)
         .with_cardinality_cap(CARDINALITY_CAP)
@@ -131,6 +133,11 @@ pub fn config() -> Config {
         // timing readable in `kubectl logs` or `journalctl`, where there is no
         // trace backend to open.
         .with_span_close_events(true)
+        // Gives the per-request token-usage histogram its own OTLP bucket
+        // boundaries, matching what the in-process registry already uses -
+        // core::telemetry::TOKEN_USAGE_HISTOGRAM_VIEW is the single source
+        // for both.
+        .with_histogram_view(token_usage_unit, token_usage_buckets)
 }
 
 #[cfg(test)]
