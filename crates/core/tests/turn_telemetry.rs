@@ -1315,6 +1315,59 @@ fn token_usage_reaches_the_metrics_facade() {
     );
 }
 
+/// A real aux call - not a direct call to `record_token_histogram` - reaches the
+/// histogram under its own purpose.
+///
+/// `one_turn` always sends the first message of a fresh conversation, so the service's
+/// own title-generation path (`generate_conversation_title`, `LlmPurpose::Title`) fires
+/// after the round answers, through `measured_aux_call`. The round's own reply is the
+/// first scripted response; the title call consumes the second, distinct one, so the two
+/// purposes are told apart by which usage figures land where.
+///
+/// Named for the review finding on desktop-assistant#1359: deleting the
+/// `record_token_histogram` call inside `measured_aux_call` left every existing test
+/// green, because none of them scripted a second response for the aux call the harness
+/// already drives on every run.
+#[test]
+fn a_real_title_call_records_its_own_purpose_in_the_token_histogram() {
+    let _serialised = serialised();
+    let script = vec![
+        LlmResponse::text(REPLY_SENTINEL)
+            .with_usage(usage(50, 5))
+            .into(),
+        LlmResponse::text("Generated Title")
+            .with_usage(usage(777, 8))
+            .into(),
+    ];
+    let captured = run(Level::INFO, script, ScriptedTools::ok());
+
+    assert_eq!(
+        captured.value_histogram_sum_delta(
+            "gen_ai.client.token.usage",
+            &["gen_ai.token.type=input", "purpose=title"]
+        ),
+        777.0,
+        "the title call's own input tokens must reach the histogram under purpose=title"
+    );
+    assert_eq!(
+        captured.value_histogram_sum_delta(
+            "gen_ai.client.token.usage",
+            &["gen_ai.token.type=output", "purpose=title"]
+        ),
+        8.0,
+        "and its output tokens, under the same purpose"
+    );
+    assert_eq!(
+        captured.value_histogram_sum_delta(
+            "gen_ai.client.token.usage",
+            &["gen_ai.token.type=input", "purpose=turn"]
+        ),
+        50.0,
+        "the round's own call must still be recorded under purpose=turn, distinct from \
+         the title call that follows it"
+    );
+}
+
 #[test]
 fn token_usage_is_recorded_per_round() {
     let _serialised = serialised();

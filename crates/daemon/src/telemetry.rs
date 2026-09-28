@@ -464,6 +464,36 @@ mod tests {
         );
     }
 
+    /// Named for the review finding on desktop-assistant#1359: nothing tested that
+    /// `config()` actually registers the token-usage histogram's OTLP view - deleting the
+    /// `.with_histogram_view(...)` call left every test green, because it only changes
+    /// what the OTLP export does with a metric no other test here records.
+    #[test]
+    fn the_config_registers_the_token_usage_histogram_view_with_the_25000_boundary() {
+        let (unit, boundaries) = desktop_assistant_core::TOKEN_USAGE_HISTOGRAM_VIEW;
+        let config = config();
+        let views = config.histogram_views();
+
+        let registered = views
+            .iter()
+            .find(|view| view.unit == unit)
+            .unwrap_or_else(|| {
+                panic!("no histogram view registered for unit {unit:?}; got {views:?}")
+            });
+
+        assert_eq!(
+            registered.boundaries, boundaries,
+            "the daemon must register the same boundaries \
+             desktop_assistant_core::TOKEN_USAGE_HISTOGRAM_VIEW carries, so the OTLP \
+             export and the in-process registry agree"
+        );
+        assert!(
+            registered.boundaries.contains(&25_000.0),
+            "the token-usage histogram view must include the 25000 boundary; got {:?}",
+            registered.boundaries
+        );
+    }
+
     #[test]
     fn the_default_filter_matches_the_previous_subscriber() {
         // `EnvFilter::from_default_env()`, which this replaced, falls back to
