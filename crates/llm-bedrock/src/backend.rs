@@ -49,9 +49,6 @@ pub(crate) mod invoke;
 /// It does not extend `LlmClient`. The connector implements `LlmClient` and
 /// the backends sit behind it, which keeps `core` unaware of Bedrock
 /// internals.
-// False positive: `async_trait` emits a bare `#[must_use]` on each generated
-// method, which clippy flags even though the return type is already must-use.
-#[allow(clippy::double_must_use)]
 #[async_trait]
 pub(crate) trait BedrockBackend: Send + Sync {
     /// Short API name, for logs, notices and model annotation.

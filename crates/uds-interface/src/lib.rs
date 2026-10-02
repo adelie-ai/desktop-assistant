@@ -99,9 +99,6 @@ impl UdsAuth {
 /// token is required and peer-cred is ignored. A daemon that trusts local peers
 /// (issue #407) overrides [`Self::authenticate`] to accept the peer identity
 /// without a token.
-// False positive: `async_trait` emits a bare `#[must_use]` on each generated
-// method, which clippy flags even though the return type is already must-use.
-#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait UdsAuthValidator: Send + Sync {
     /// Validate a bearer token. Returning `true` accepts it; `false` rejects.

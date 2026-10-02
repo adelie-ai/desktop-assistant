@@ -64,9 +64,6 @@ impl EventSink for NullEventSink {
 ///
 /// `wake` MUST return only once the turn has ended — that return is how the
 /// coordinator serialises, awaiting each wake before draining the next batch.
-// False positive: `async_trait` emits a bare `#[must_use]` on each generated
-// method, which clippy flags even though the return type is already must-use.
-#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait ParentWaker: Send + Sync {
     /// Inject `prompt` as a fresh turn on `conversation_id` for `user_id` and

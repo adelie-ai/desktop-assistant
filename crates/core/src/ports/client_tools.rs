@@ -45,9 +45,6 @@ use crate::domain::ToolDefinition;
 ///
 /// Uses [`async_trait::async_trait`] so it is dyn-compatible — the
 /// application installs a boxed adapter behind an `Arc<dyn ClientToolPort>`.
-// False positive: `async_trait` emits a bare `#[must_use]` on each generated
-// method, which clippy flags even though the return type is already must-use.
-#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait ClientToolPort: Send + Sync {
     /// Tool definitions registered as client-local for the current user.

@@ -38,9 +38,6 @@ pub fn merge_registrations(
 /// Where a client-tool result is delivered. Implemented for [`Connector`]; the
 /// trait exists so [`dispatch_client_tool_call`] is testable without a live
 /// daemon connection.
-// False positive: `async_trait` emits a bare `#[must_use]` on each generated
-// method, which clippy flags even though the return type is already must-use.
-#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait ClientToolResultSink {
     async fn submit_result(

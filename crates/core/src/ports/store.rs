@@ -144,9 +144,6 @@ pub struct TurnRow {
 /// concrete store. `async_trait` adds a small allocation per call;
 /// the call-rate (one create + one update per turn round + sweep on
 /// startup) is low enough that this is the right trade.
-// False positive: `async_trait` emits a bare `#[must_use]` on each generated
-// method, which clippy flags even though the return type is already must-use.
-#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait TurnStateStore: Send + Sync {
     /// Insert a new turn row. Implementations stamp `created_at` /
@@ -271,9 +268,6 @@ pub struct BackgroundTaskRow {
 /// can sweep abandoned tasks. Implementations enforce `(user_id, …)`
 /// scoping on every read/update except `scan_non_terminal`, which is a
 /// system-task hook that intentionally walks across users.
-// False positive: `async_trait` emits a bare `#[must_use]` on each generated
-// method, which clippy flags even though the return type is already must-use.
-#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait BackgroundTaskStore: Send + Sync {
     /// Insert a new task row. Implementations stamp `created_at` /
@@ -338,9 +332,6 @@ pub struct LearnedClassification {
 /// This store is **global, not per-user** — it holds connector knowledge
 /// (how to read an opaque provider error), not personal data, so unlike the
 /// other stores it deliberately does not scope by `current_user_id()`.
-// False positive: `async_trait` emits a bare `#[must_use]` on each generated
-// method, which clippy flags even though the return type is already must-use.
-#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait ErrorClassificationStore: Send + Sync {
     /// Find a learned classification whose signature occurs (case-insensitive)
@@ -391,9 +382,6 @@ pub struct LearnedWindow {
 ///
 /// The learned value is only ever applied as a `min()` CAP and only ratchets
 /// DOWN — raising a window is a deliberate config action (#342), never inferred.
-// False positive: `async_trait` emits a bare `#[must_use]` on each generated
-// method, which clippy flags even though the return type is already must-use.
-#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait LearnedWindowStore: Send + Sync {
     /// Return the learned observation for `(connector, model)`, or `Ok(None)` on
@@ -520,9 +508,6 @@ pub trait ConversationStore: Send + Sync {
 /// exist. Uses `async_trait` so the application layer can hold the store
 /// behind a `dyn IdempotencyKeyStore` (the call rate is one lookup + one
 /// record per turn).
-// False positive: `async_trait` emits a bare `#[must_use]` on each generated
-// method, which clippy flags even though the return type is already must-use.
-#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait IdempotencyKeyStore: Send + Sync {
     /// Return the stored reply for a previously completed turn with this

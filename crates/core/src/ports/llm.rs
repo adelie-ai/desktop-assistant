@@ -985,9 +985,6 @@ impl LlmResponse {
 ///
 /// Decorators implement this trait for themselves rather than handing back
 /// their inner client's object; see [`LlmClient::hosted_tool_search`].
-// False positive: `async_trait` emits a bare `#[must_use]` on each generated
-// method, which clippy flags even though the return type is already must-use.
-#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait HostedToolSearch: Send + Sync {
     /// Stream a completion with namespaced tool definitions.
@@ -1067,9 +1064,6 @@ pub async fn dispatch_namespaced(
 /// — required because the daemon registry stores clients as
 /// `Arc<dyn LlmClient>` (#44). The per-call heap allocation that
 /// async-trait introduces is negligible next to an LLM round-trip.
-// False positive: `async_trait` emits a bare `#[must_use]` on each generated
-// method, which clippy flags even though the return type is already must-use.
-#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait LlmClient: Send + Sync {
     /// Return the connector's built-in default model, if it has one.

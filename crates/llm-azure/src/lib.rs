@@ -118,9 +118,6 @@ impl std::str::FromStr for AuthMode {
 /// keyring machinery, gated on a CVE scan before first build) is a tracked
 /// follow-up -- until it lands, `auth_mode = entra` requires an injected
 /// provider via [`AzureClient::with_token_provider`].
-// False positive: `async_trait` emits a bare `#[must_use]` on each generated
-// method, which clippy flags even though the return type is already must-use.
-#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait TokenProvider: Send + Sync {
     /// Return a currently-valid bearer token, refreshing as needed. Errors map
