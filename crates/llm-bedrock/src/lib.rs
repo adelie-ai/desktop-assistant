@@ -2117,8 +2117,10 @@ async fn list_inference_profiles_of_type(
     profile_type: aws_sdk_bedrock::types::InferenceProfileType,
 ) -> Result<
     InferenceProfileListing,
-    aws_sdk_bedrock::error::SdkError<
-        aws_sdk_bedrock::operation::list_inference_profiles::ListInferenceProfilesError,
+    Box<
+        aws_sdk_bedrock::error::SdkError<
+            aws_sdk_bedrock::operation::list_inference_profiles::ListInferenceProfilesError,
+        >,
     >,
 > {
     let mut summaries = Vec::new();
@@ -2131,7 +2133,7 @@ async fn list_inference_profiles_of_type(
         if let Some(token) = next_token.take() {
             request = request.next_token(token);
         }
-        let response = request.send().await?;
+        let response = request.send().await.map_err(Box::new)?;
         summaries.extend(response.inference_profile_summaries().iter().cloned());
         pages += 1;
 

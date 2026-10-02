@@ -4311,7 +4311,7 @@ mod tests {
         assert_eq!(result.len() - history, MAX_CONTEXT_MESSAGES);
         assert_eq!(result[0].role, Role::System);
         assert_eq!(result[history].role, Role::User);
-        assert_eq!(result[history].content, format!("user-20"));
+        assert_eq!(result[history].content, "user-20");
     }
 
     #[test]
