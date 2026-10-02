@@ -248,6 +248,9 @@ impl From<UserId> for RequestContext {
 /// `RequestContext::default()`, which collapses to the schema
 /// sentinel `"default"`. Single-tenant deployments and tests that
 /// don't care about user identity continue to work unchanged (#105).
+// False positive: `async_trait` emits a bare `#[must_use]` on each generated
+// method, which clippy flags even though the return type is already must-use.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait AssistantApiHandler: Send + Sync {
     async fn handle_command(&self, cmd: api::Command) -> ApiResult<api::CommandResult>;
@@ -432,6 +435,9 @@ pub trait AssistantApiHandler: Send + Sync {
 /// Minimal sink for emitting canonical events.
 ///
 /// Implemented by protocol adapters to forward events to connected clients.
+// False positive: `async_trait` emits a bare `#[must_use]` on each generated
+// method, which clippy flags even though the return type is already must-use.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait EventSink: Send + Sync {
     /// Returns `false` when the sink is no longer available (e.g. disconnected client).

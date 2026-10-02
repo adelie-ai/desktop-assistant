@@ -110,6 +110,9 @@ impl Drop for SenderSession {
 /// can be unit-tested without a live daemon or bus: production
 /// ([`ConnectorSessionFactory`]) connects a real `Connector` and spawns the
 /// unicast forwarder; tests return a recording transport and a stub task.
+// False positive: `async_trait` emits a bare `#[must_use]` on each generated
+// method, which clippy flags even though the return type is already must-use.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait SessionFactory: Send + Sync {
     /// Create a session whose forwarder unicasts to `sender` (a unique bus name).

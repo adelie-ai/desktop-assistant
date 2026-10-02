@@ -10,6 +10,9 @@ use crate::CoreError;
 /// Uses [`async_trait::async_trait`] so the trait is dyn-compatible —
 /// the daemon stores the active embedding backend as
 /// `Option<Arc<dyn EmbeddingClient>>` (#44).
+// False positive: `async_trait` emits a bare `#[must_use]` on each generated
+// method, which clippy flags even though the return type is already must-use.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait EmbeddingClient: Send + Sync {
     /// Generate embeddings for a batch of texts.

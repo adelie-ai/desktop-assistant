@@ -66,6 +66,9 @@ pub struct WsServerState {
     login_throttle: Arc<LoginThrottle>,
 }
 
+// False positive: `async_trait` emits a bare `#[must_use]` on each generated
+// method, which clippy flags even though the return type is already must-use.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait WsAuthValidator: Send + Sync {
     async fn validate_bearer_token(&self, token: &str) -> bool;
@@ -107,6 +110,9 @@ pub trait WsAuthValidator: Send + Sync {
 
 /// Backs `POST /login`: validates HTTP Basic credentials and exchanges them for
 /// a bearer token the client then presents on `/ws`.
+// False positive: `async_trait` emits a bare `#[must_use]` on each generated
+// method, which clippy flags even though the return type is already must-use.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait WsLoginService: Send + Sync {
     /// Accept or reject a username/password pair. Implementations compare the
@@ -125,6 +131,9 @@ pub trait WsLoginService: Send + Sync {
 }
 
 /// Provides auth discovery information for `GET /auth/config`.
+// False positive: `async_trait` emits a bare `#[must_use]` on each generated
+// method, which clippy flags even though the return type is already must-use.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait WsAuthDiscovery: Send + Sync {
     /// Returns JSON-serializable auth discovery info.

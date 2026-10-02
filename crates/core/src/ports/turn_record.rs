@@ -221,6 +221,9 @@ pub struct StoredTurn {
 ///
 /// A failing write must not fail the turn. The caller logs it and carries on -
 /// a debugging record is worth less than the answer a person asked for.
+// False positive: `async_trait` emits a bare `#[must_use]` on each generated
+// method, which clippy flags even though the return type is already must-use.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait TurnRecorder: Send + Sync {
     /// Record that a turn started, and where it dispatched.

@@ -216,6 +216,9 @@ impl TurnDigest {
 /// Every method reads the caller's own user id from the ambient scope, the
 /// same way every other personal-data store does; nothing here takes a user as
 /// a parameter, and a read for one person never answers with another's rows.
+// False positive: `async_trait` emits a bare `#[must_use]` on each generated
+// method, which clippy flags even though the return type is already must-use.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait TurnDigestStore: Send + Sync {
     /// Upsert `digests` for `conversation_id`, returning the stored rows.

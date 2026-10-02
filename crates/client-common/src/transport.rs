@@ -12,6 +12,9 @@ use crate::types::{ConversationDetail, ConversationSummary};
 use crate::uds_client::UdsClient;
 use crate::ws_client::WsClient;
 
+// False positive: `async_trait` emits a bare `#[must_use]` on each generated
+// method, which clippy flags even though the return type is already must-use.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait AssistantClient: Send + Sync {
     async fn list_conversations(&self) -> Result<Vec<ConversationSummary>>;

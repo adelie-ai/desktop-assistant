@@ -44,6 +44,9 @@ fn form_encode(s: &str) -> String {
 
 /// Seam for acquiring a Vertex OAuth2 bearer token. Implementations must never
 /// log or otherwise leak the returned token.
+// False positive: `async_trait` emits a bare `#[must_use]` on each generated
+// method, which clippy flags even though the return type is already must-use.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait TokenProvider: Send + Sync {
     /// Return a currently-valid bearer token (without the `Bearer ` prefix).

@@ -79,6 +79,9 @@ pub enum BridgeTransportError {
 /// The seam the D-Bus adapters dispatch through. Returning [`api::CommandResult`]
 /// keeps adapters small — they pattern-match only the variant they expect. Event
 /// delivery is out of band (the event forwarder consumes the Connector stream).
+// False positive: `async_trait` emits a bare `#[must_use]` on each generated
+// method, which clippy flags even though the return type is already must-use.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait BridgeTransport: Send + Sync {
     /// Send `command` and await the daemon's [`api::CommandResult`].

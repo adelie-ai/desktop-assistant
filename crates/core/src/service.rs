@@ -17683,7 +17683,7 @@ mod tests {
             }
             let left = self
                 .rounds
-                .fetch_update(
+                .try_update(
                     std::sync::atomic::Ordering::Relaxed,
                     std::sync::atomic::Ordering::Relaxed,
                     |n| Some(n.saturating_sub(1)),

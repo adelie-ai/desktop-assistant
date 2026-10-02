@@ -154,6 +154,9 @@ impl TurnTrace {
     }
 }
 
+// False positive: `async_trait` emits a bare `#[must_use]` on each generated
+// method, which clippy flags even though the return type is already must-use.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait AssistantCommands: Send + Sync {
     /// Serialize `command` as a `WsRequest`, send it over the transport, and

@@ -216,6 +216,9 @@ pub trait AssistantService: Send + Sync {
 /// spawned future thin — the one heap allocation per call is negligible
 /// next to an LLM round-trip, the same trade-off
 /// [`crate::ports::llm::LlmClient`] already makes (#207).
+// False positive: `async_trait` emits a bare `#[must_use]` on each generated
+// method, which clippy flags even though the return type is already must-use.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait ConversationService: Send + Sync {
     async fn create_conversation(
@@ -992,6 +995,9 @@ pub trait KnowledgeService: Send + Sync {
 ///
 /// Object-safe (`async_trait`) so the API handler can hold it as an optional
 /// `Arc<dyn KnowledgeMaintenanceService>` rather than threading another generic.
+// False positive: `async_trait` emits a bare `#[must_use]` on each generated
+// method, which clippy flags even though the return type is already must-use.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait KnowledgeMaintenanceService: Send + Sync {
     /// Run one extraction pass (scan conversations for new facts + archival).

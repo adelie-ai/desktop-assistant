@@ -102,6 +102,9 @@ pub type SkillSetApprovalFn = Arc<
 /// The contract every implementation owes is executable, not prose:
 /// the `conformance` module runs it against any store, and each adapter's test suite
 /// invokes it.
+// False positive: `async_trait` emits a bare `#[must_use]` on each generated
+// method, which clippy flags even though the return type is already must-use.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait SkillIndexStore: Send + Sync {
     /// Insert or update one skill, keyed on `(name, owner_user_id)`.
